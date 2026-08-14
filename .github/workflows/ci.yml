@@ -6,21 +6,48 @@ on:
   pull_request:
     branches: [main]
 
+# The execution provider is a COMPILE-TIME feature, so "does it build" is a different question per
+# platform. The default feature is `dml` (DirectML), which exists only on Windows — building the
+# default set on ubuntu would fail for a reason that says nothing about the code. So: ubuntu builds
+# the CPU flavour (--no-default-features), windows builds the default DirectML one.
+#
+# cuda and migraphx are deliberately NOT built here. Both need a vendor toolchain the runner does
+# not have (CUDA Toolkit; ROCm plus an ONNX Runtime built from source with --use_migraphx), and a
+# job that cannot install them would only ever report a missing dependency.
 jobs:
   build-test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            features: "--no-default-features"
+            label: cpu
+          - os: windows-latest
+            features: ""
+            label: dml
     runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} (${{ matrix.label }})
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-${{ matrix.label }}-cargo-${{ hashFiles('Cargo.lock') }}
+
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked ${{ matrix.features }}
 
       - name: Test
-        run: cargo test --release --locked
+        run: cargo test --release --locked ${{ matrix.features }}
 
+      # Only this crate's own sources: vendor-fastembed is an upstream copy carried verbatim under
+      # its own Apache-2.0 licence, and reformatting it would make the fork's diff unreadable.
       - name: Format check
-        run: cargo fmt --check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --package bge-sidecar --check

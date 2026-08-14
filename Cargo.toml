@@ -1,15 +1,101 @@
 [package]
-name = "dew-flow-sidecar"
+name = "bge-sidecar"
 version = "0.1.0"
 edition = "2021"
-publish = false
-
-# The embedder sidecar. The real implementation (BGE-M3 dense+sparse embeddings, rerank,
-# /embed /rerank /health /tokenize /unload over HTTP) moves here from the product's
-# tools/bge-sidecar per the plan; this skeleton exists so CI is proven green on both
-# target platforms before any of it lands.
-#
-# Build flavours to come, mirroring the proven set:
-#   default = dml (Windows), cuda, migraphx (Linux/WSL, operator-assisted), cpu
+description = "ONNX embedding + rerank sidecar: BGE-M3 dense+sparse (FP32) and BGE-Reranker-v2-M3 over fastembed/ONNX Runtime"
 
 [dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# fastembed pins ort =2.0.0-rc.12; we depend on the same version directly only for the
+# ExecutionProvider types (feature-independent) so our EP dispatch unifies with fastembed's.
+# Cargo feature unification also means enabling `ort/<feature>` here lights it up inside
+# fastembed's sessions — fastembed needs no feature of its own for MIGraphX.
+fastembed = "5.17"
+ort = { version = "=2.0.0-rc.12", default-features = false }
+# Build provenance on /health: the SHA-256 of the RUNNING executable and of the provider libraries
+# beside it. RustCrypto rather than a hand-rolled digest, and computed in-process from current_exe()
+# rather than handed in by the launcher — an environment variable describes the binary somebody
+# INTENDED to start, which is exactly the mismatch these hashes exist to catch.
+sha2 = "0.10"
+# The BGE-M3 tokenizer, loaded straight from the model cache so /embed can report how many tokens each
+# text REALLY cost and whether the cap discarded its tail. fastembed owns a tokenizer internally but
+# never surfaces the count, and that count is the only thing that can turn "nothing was lost" from a
+# host-side estimate into a fact — the host cannot tokenize, so silent truncation is invisible to it.
+# Same version and features fastembed pins, so this shares its copy instead of adding a second one.
+tokenizers = { version = "0.22.2", features = ["onig"], default-features = false }
+# Startup preflight of ORT_DYLIB_PATH in the load-dynamic (migraphx) flavor only: ort rc.12's own
+# version check DEADLOCKS instead of erroring when the dylib is older than the crate requires (its
+# error path re-enters the API OnceLock it is initializing), so we probe the C ABI ourselves first.
+# Already in the dependency tree via ort — no new supply chain.
+libloading = { version = "0.9", optional = true }
+
+# DXGI adapter resolution (src/adapters.rs) is Windows-only; the Linux (WSL/ROCm) build must not
+# pull Windows bindings at all.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Graphics_Dxgi", "Win32_Foundation"] }
+
+# GPU execution providers are compile-time features. EVERY flavor here is an ONNX RUNTIME execution
+# provider, because ONNX Runtime is the only inference engine this sidecar uses: BGE-M3 (dense +
+# learned sparse) and BGE-Reranker-v2-M3 are ONNX models served through `ort`. Nothing here touches
+# Candle, so no flavor needs NVCC, a CUDA toolkit, or a particular host compiler.
+#
+# The binary is built per machine (like the other tools/ sidecars), so pick the flavor that matches
+# the hardware. Use the script rather than a bare cargo line — the CUDA EP needs provider DLLs staged
+# beside the exe, which cargo does not do:
+#   Windows, all flavors:         tools/bge-sidecar/scripts/build-cuda-windows.ps1
+#   AMD on Windows (DirectML, the default):  cargo build --release
+#   NVIDIA (CUDA only):           cargo build --release --no-default-features --features cuda
+#   DirectML + CUDA in one binary: cargo build --release --features cuda
+#       Both EPs come from the SAME Windows prebuilt package, so this works — but it also means a
+#       `--features cuda` build still links DirectML, and seeing `-l DirectML` in the build log is
+#       therefore no evidence about CUDA either way. Read the feature tree, not the link line.
+#   CPU only:                     cargo build --release --no-default-features
+#   AMD on Linux/WSL (ROCm via MIGraphX EP; build INSIDE WSL, separate target dir so the two OS
+#   flavors never clobber each other):
+#                                 cargo build --release --no-default-features --features migraphx \
+#                                     --target-dir target-wsl
+# At runtime ORT_PROVIDER / the request's provider hint selects among the compiled EPs
+# (auto = cuda -> migraphx -> dml -> cpu). An EP that is not compiled in fails registration; under
+# `auto` the chain falls through, but an EXPLICIT provider is honoured or refused, never downgraded
+# silently — see `ProviderState` in main.rs and the /health contract.
+[features]
+default = ["dml"]
+dml = ["fastembed/directml"]
+# ONNX Runtime's CUDA EP, and nothing else. Deliberately NOT `fastembed/cuda`: that name forwards to
+# `candle-core/cuda` + `candle-nn/cuda` — Candle's own tensor path for fastembed's Qwen3/Nomic models,
+# which this sidecar never loads. Pulling it in costs an NVCC compile of 11 PTX kernels, a CUDA
+# toolkit, and a host-compiler version that satisfies both NVCC and the prebuilt ORT's STL; it buys
+# this binary nothing. `dml` needs no `ort/...` pairing of its own only because fastembed's
+# `directml = ["ort/directml"]` already forwards it.
+#
+# Measured, 2026-08-08: without `ort/cuda` a binary built `--features cuda` registered no CUDA EP, so
+# with the provider pinned to `cuda` every /embed and /rerank answered HTTP 500 in ~4 ms with "the
+# execution provider could not be registered because its corresponding Cargo feature is not enabled",
+# while /health still said `provider: "cuda"` — because that field echoed the REQUEST. That is the
+# defect the requested/compiled/active split in the /health contract now makes impossible to hide.
+cuda = ["ort/cuda"]
+# No prebuilt ONNX Runtime ships the MIGraphX EP, so this flavor loads a machine-local
+# libonnxruntime.so (built with --use_migraphx) at runtime: run with
+# ORT_DYLIB_PATH=/path/to/libonnxruntime.so — see README "AMD on Linux/WSL (ROCm)".
+# The dylib MUST be at least ONNX Runtime 1.{ort::MINOR_VERSION} (1.24 for rc.12 with api-24);
+# main.rs preflights this at startup and exits with the required version on mismatch.
+migraphx = ["ort/migraphx", "ort/load-dynamic", "dep:libloading"]
+
+[profile.release]
+lto = true
+strip = true
+
+# fastembed 5.17.3 with ONE targeted fix (vendor-fastembed/src/sparse_text_embedding/impl.rs, marked
+# "VENDORED PATCH"): the BGEM3 sparse path picked the session output via keys().next(), which under
+# the MIGraphX EP selects the 2-D `sentence_embedding` instead of the 3-D `token_embeddings` — the
+# post-process then panicked (`assertion failed: index < dim`) on every sparse embed and poisoned the
+# engine. The patch selects the output by name/rank. Drop this patch when upstream fastembed selects
+# the BGEM3 output deterministically.
+[patch.crates-io]
+fastembed = { path = "vendor-fastembed" }
