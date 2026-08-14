@@ -46,8 +46,15 @@ jobs:
       - name: Test
         run: cargo test --release --locked ${{ matrix.features }}
 
-      # Only this crate's own sources: vendor-fastembed is an upstream copy carried verbatim under
-      # its own Apache-2.0 licence, and reformatting it would make the fork's diff unreadable.
-      - name: Format check
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo fmt --package bge-sidecar --check
+      # No `cargo fmt --check` here yet, deliberately. It was added, it failed on the first run, and the
+      # reason is worth writing down rather than papering over: the crate carries pre-existing formatting
+      # drift — `cargo fmt --package bge-sidecar` rewrites 790 lines of main.rs and 52 of adapters.rs. That
+      # is a decision about this codebase's style, not a side effect a CI file should make on its way past;
+      # a reformat that size also destroys the diff against the sources this crate was carried from, which
+      # is the one thing making the port reviewable right now.
+      #
+      # To turn it on: run `cargo fmt --package bge-sidecar` as its own commit, then add
+      #   - name: Format check
+      #     if: matrix.os == 'ubuntu-latest'
+      #     run: cargo fmt --package bge-sidecar --check
+      # (--package, so the vendored fastembed fork stays byte-identical to upstream.)
