@@ -1,0 +1,15 @@
+[package]
+name = "dew-flow-sidecar"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The embedder sidecar. The real implementation (BGE-M3 dense+sparse embeddings, rerank,
+# /embed /rerank /health /tokenize /unload over HTTP) moves here from the product's
+# tools/bge-sidecar per the plan; this skeleton exists so CI is proven green on both
+# target platforms before any of it lands.
+#
+# Build flavours to come, mirroring the proven set:
+#   default = dml (Windows), cuda, migraphx (Linux/WSL, operator-assisted), cpu
+
+[dependencies]
