@@ -147,8 +147,10 @@ The sidecar has no Serilog; it has `tracing`, and the CONTRACT is what is shared
 
 | Repository | Kind | Status |
 |---|---|---|
-| `ClaudeRag` (this one) | .NET | canonical copy |
-| `dew_flow_rag_qln` | .NET | mirrored |
+| `dew_flow_rag_qln` | .NET | **canonical copy** — change it here first |
 | `dew_flow_mcp` | .NET | mirrored |
 | `dew_flow_sidecar_rust` | Rust | mirrored (the Rust section governs) |
 | `dew_flow_benchmark` | .NET, no projects yet | mirrored — applies to the first host it gains |
+
+The previous-generation `ClaudeRag` repository is **frozen**: read it for reference, never write to it. It
+holds an older copy of this rule that will not be updated, so do not treat it as a source.
