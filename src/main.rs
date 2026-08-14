@@ -41,6 +41,32 @@ mod adapters;
 
 use anyhow::Context;
 use std::net::SocketAddr;
+
+/// UTC date and clock for the log path, from a unix timestamp.
+///
+/// Written out rather than pulled from `chrono`: this is the only place the crate needs a calendar date, and
+/// a dependency added for one format string is a dependency to audit, licence and keep current forever.
+/// The civil-from-days algorithm is Howard Hinnant's, valid for any date this product will see.
+fn day_and_clock(unix_seconds: u64) -> (String, String) {
+    let days = (unix_seconds / 86_400) as i64;
+    let secs = unix_seconds % 86_400;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    (
+        format!("{year:04}-{m:02}-{d:02}"),
+        format!("{:02}-{:02}-{:02}", secs / 3600, (secs % 3600) / 60, secs % 60),
+    )
+}
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -427,14 +453,25 @@ async fn main() {
     use tracing_subscriber::util::SubscriberInitExt;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,ort=warn".into());
+    // A folder per DAY and a file per RUN, matching every .NET host in this product family
+    // (.claude/rules/common/logging-serilog.md). Appending every run into one file was the previous shape,
+    // and the question actually asked is almost always "what did THAT run do" — with two sidecars on one
+    // machine and several restarts a day, one appended file makes that question unanswerable.
+    // The device id stays in the name: two sidecars started in the same second differ only by their card.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (day, clock) = day_and_clock(now);
+    let log_dir = format!("{}/{day}", env_str("SIDECAR_LOG_DIR", "logs"));
     let log_path = format!(
-        "{}/bge-sidecar-device{}.log",
-        env_str("SIDECAR_LOG_DIR", "logs"),
-        env_parse::<i32>("ORT_DEVICE_ID", 0)
+        "{log_dir}/bge-sidecar-device{}-{clock}-{}.log",
+        env_parse::<i32>("ORT_DEVICE_ID", 0),
+        std::process::id()
     );
-    let log_file = std::path::Path::new(&log_path)
-        .parent()
-        .map(|dir| std::fs::create_dir_all(dir).ok())
+    // Best-effort: an unwritable directory must never keep the sidecar from starting.
+    let log_file = std::fs::create_dir_all(&log_dir)
+        .ok()
         .and_then(|_| std::fs::OpenOptions::new().create(true).append(true).open(&log_path).ok());
     let file_layer = log_file.map(|file| {
         tracing_subscriber::fmt::layer()
@@ -443,10 +480,12 @@ async fn main() {
     });
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        // ANSI on, explicitly: the host captures this stream and renders it in a dashboard, and `tracing`
+        // disables colour on its own once stdout is not a terminal — which is that case exactly.
+        .with(tracing_subscriber::fmt::layer().with_ansi(true))
         .with(file_layer)
         .init();
-    tracing::info!("log file: {log_path} (append; SIDECAR_LOG_DIR overrides the directory)");
+    tracing::info!("log file: {log_path} (one per run; SIDECAR_LOG_DIR overrides the directory)");
 
     #[cfg(feature = "migraphx")]
     {

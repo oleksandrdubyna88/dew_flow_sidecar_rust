@@ -28,3 +28,6 @@ target-wsl/
 
 # model cache
 .model-cache/
+
+# Host logs: a folder per day, a file per run (.claude/rules/common/logging-serilog.md)
+logs/
