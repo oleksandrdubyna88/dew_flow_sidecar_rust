@@ -787,6 +787,11 @@ struct EmbedRequest {
     /// Optional per-request batch size (operator setting). 0/absent = the configured default.
     #[serde(default)]
     max_batch: usize,
+    /// Optional caller correlation id: echoed verbatim in the response and prefixed to this request's
+    /// pass log lines. Opaque here — without it, two concurrent requests are indistinguishable in
+    /// either place.
+    #[serde(default)]
+    request_id: String,
 }
 
 #[derive(Serialize)]
@@ -819,12 +824,35 @@ struct TokenUsage {
     token_accounting: bool,
 }
 
+/// Where a request's wall-clock went inside the sidecar, on the wire so the CALLER can attribute it.
+///
+/// Every number here used to die in this process's own log file, and the worst one was never measured
+/// at all: the pass timer starts only after the engine mutex is held, so a request that waited 8 s
+/// behind another caller's pass and then ran 0.4 s looked, to its caller, like a slow model. Queue
+/// wait and session build stay separate fields — both are infrastructure wait, but the remedies
+/// differ (concurrency vs warm-up), and a bucket that mixes two causes explains neither.
+#[derive(Serialize, Default, Clone, Copy)]
+struct PassTimings {
+    /// Waiting for the engine mutex behind another request — infrastructure wait, never model speed.
+    queue_wait_ms: u64,
+    /// Building + canary-checking the session; 0 on a warm engine.
+    session_build_ms: u64,
+    /// The forward pass(es), settling re-runs included — what this request's inference actually cost.
+    inference_ms: u64,
+    /// >0 = MIGraphX compiled this input shape during the pass. The EP saves its cache LAZILY, so
+    /// growth measured across the pass is the only moment a compile is observable.
+    compile_cache_grew_mb: u64,
+}
+
 #[derive(Serialize)]
 struct EmbedResponse {
     dense: Vec<Vec<f32>>,
     sparse: Vec<SparseVec>,
     #[serde(flatten)]
     usage: TokenUsage,
+    /// Echoed from the request; empty when the caller sent none.
+    request_id: String,
+    timings: PassTimings,
 }
 
 /// Ask what a text really costs, WITHOUT embedding it.
@@ -868,11 +896,17 @@ struct RerankRequest {
     /// envelope said 64: scoring 50 candidates cost 13 forward passes instead of one.
     #[serde(default)]
     max_batch: usize,
+    /// Optional caller correlation id, exactly as on `EmbedRequest`.
+    #[serde(default)]
+    request_id: String,
 }
 
 #[derive(Serialize)]
 struct RerankResponse {
     scores: Vec<f32>,
+    /// Echoed from the request; empty when the caller sent none.
+    request_id: String,
+    timings: PassTimings,
 }
 
 #[derive(Serialize)]
@@ -1128,16 +1162,23 @@ async fn embed(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<EmbedResponse>, ApiError> {
-    if req.texts.is_empty() {
-        return Ok(Json(EmbedResponse { dense: vec![], sparse: vec![], usage: TokenUsage::default() }));
+    let EmbedRequest { texts, kind, provider, max_length, max_batch, request_id } = req;
+    if texts.is_empty() {
+        return Ok(Json(EmbedResponse {
+            dense: vec![],
+            sparse: vec![],
+            usage: TokenUsage::default(),
+            request_id,
+            timings: PassTimings::default(),
+        }));
     }
 
-    let provider = req.provider.clone();
-    let kind = req.kind.clone();
-    let limits = Limits::resolve(&state.config, req.max_length, req.max_batch);
+    let limits = Limits::resolve(&state.config, max_length, max_batch);
     let shared = state.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || embed_blocking(&state, req.texts, &kind, &provider, limits)).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        embed_blocking(&state, texts, &kind, &provider, limits, &request_id)
+    })
+    .await;
     set_activity(&shared, "idle");
     let result = outcome
         .map_err(|e| internal_error(anyhow::anyhow!("embed task panicked: {}", join_error_text(e))))?
@@ -1179,15 +1220,19 @@ async fn rerank(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RerankRequest>,
 ) -> Result<Json<RerankResponse>, ApiError> {
-    if req.documents.is_empty() {
-        return Ok(Json(RerankResponse { scores: vec![] }));
+    let RerankRequest { query, documents, provider, max_batch, request_id } = req;
+    if documents.is_empty() {
+        return Ok(Json(RerankResponse {
+            scores: vec![],
+            request_id,
+            timings: PassTimings::default(),
+        }));
     }
 
-    let provider = req.provider.clone();
-    let max_batch = rerank_batch(&state.config, req.max_batch);
+    let max_batch = rerank_batch(&state.config, max_batch);
     let shared = state.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        rerank_blocking(&state, req.query, req.documents, &provider, max_batch)
+        rerank_blocking(&state, query, documents, &provider, max_batch, &request_id)
     })
     .await;
     set_activity(&shared, "idle");
@@ -1345,6 +1390,7 @@ fn embed_blocking(
     kind: &str,
     provider_hint: &str,
     limits: Limits,
+    request_id: &str,
 ) -> anyhow::Result<EmbedResponse> {
     // Read the current cap under its own lock and drop it before record_embed_max_length takes it again.
     let resident = state.loaded_embed_max_length.lock().ok().and_then(|loaded| *loaded);
@@ -1382,15 +1428,17 @@ fn embed_blocking(
             "embed request: {} text(s), pinned to {} row(s) of ({}, {}) for {provider}",
             texts.len(), expanded.len(), limits.max_batch, limits.max_length
         );
-        let padded = embed_natural(state, expanded, provider_hint, limits, retry_short)?;
+        let padded = embed_natural(state, expanded, provider_hint, limits, retry_short, request_id)?;
         return Ok(EmbedResponse {
             dense: unpin_rows(padded.dense, &positions)?,
             sparse: unpin_rows(padded.sparse, &positions)?,
             usage,
+            request_id: padded.request_id,
+            timings: padded.timings,
         });
     }
 
-    Ok(EmbedResponse { usage, ..embed_natural(state, texts, provider_hint, limits, retry_short)? })
+    Ok(EmbedResponse { usage, ..embed_natural(state, texts, provider_hint, limits, retry_short, request_id)? })
 }
 
 /// The unpinned path: hand the texts to fastembed as they are and let `BatchLongest` decide the
@@ -1406,6 +1454,7 @@ fn embed_natural(
     provider_hint: &str,
     limits: Limits,
     retry_short: bool,
+    request_id: &str,
 ) -> anyhow::Result<EmbedResponse> {
     let batch = Some(limits.max_batch);
 
@@ -1415,11 +1464,18 @@ fn embed_natural(
     // research/PLAN_bge_sidecar_unified_session.md. Still deliberately NOT the INT8-quantized
     // all-in-one Bgem3Embedding — retrieval quality over speed (locked decision).
     set_activity(state, "embed: waiting for the engine");
+    // Queue wait is measured around the MUTEX only — another request holding the engine is the
+    // caller's infrastructure wait, and it must never blend into the inference span below.
+    let waited = std::time::Instant::now();
     let mut guard = lock_healing(&state.engines.embed, "embed");
+    let queue_wait_ms = waited.elapsed().as_millis() as u64;
+    let mut session_build_ms = 0u64;
     if guard.get_mut(limits.max_length).is_none() {
         set_activity(state, "embed: building and canary-checking the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
+        let building = std::time::Instant::now();
         let built = load_validated_dual(state, provider_hint, limits, retry_short)?;
         remember_engine(&mut guard, "embed", limits.max_length, built);
+        session_build_ms = building.elapsed().as_millis() as u64;
     }
     set_activity(state, format!("embed: embedding {} row(s)", texts.len()));
     // The duration below includes any settling re-runs — that is honest: it is what the caller waited.
@@ -1428,10 +1484,13 @@ fn embed_natural(
     // Rows are (dense, sparse) ZIPPED per text, so the settling retry polices one length and a short
     // first run can never shorten one head without the other.
     let rows = embed_settling("embed", texts.len(), retry_short, || engine.embed(texts.clone(), batch))?;
+    let inference = pass.elapsed();
+    let compile_cache_grew_mb = mxr_cache_mb(&state.config.mxr_cache_base).saturating_sub(cache_before);
     tracing::info!("{}", pass_log_message(
+        request_id,
         &format!("embedded {} row(s), dense+sparse in one pass", rows.len()),
-        pass.elapsed().as_secs_f32(),
-        mxr_cache_mb(&state.config.mxr_cache_base).saturating_sub(cache_before),
+        inference.as_secs_f32(),
+        compile_cache_grew_mb,
     ));
 
     let (dense, sparse): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
@@ -1447,6 +1506,13 @@ fn embed_natural(
             })
             .collect(),
         usage: TokenUsage::default(),
+        request_id: request_id.to_string(),
+        timings: PassTimings {
+            queue_wait_ms,
+            session_build_ms,
+            inference_ms: inference.as_millis() as u64,
+            compile_cache_grew_mb,
+        },
     })
 }
 
@@ -1456,12 +1522,19 @@ fn rerank_blocking(
     documents: Vec<String>,
     provider_hint: &str,
     max_batch: usize,
+    request_id: &str,
 ) -> anyhow::Result<RerankResponse> {
     set_activity(state, "rerank: waiting for the engine");
+    // Queue wait around the MUTEX only, exactly as the embed path measures it.
+    let waited = std::time::Instant::now();
     let mut guard = lock_healing(&state.engines.rerank, "rerank");
+    let queue_wait_ms = waited.elapsed().as_millis() as u64;
+    let mut session_build_ms = 0u64;
     if guard.is_none() {
         set_activity(state, "rerank: building the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
+        let building = std::time::Instant::now();
         *guard = Some(load_rerank(state, provider_hint)?);
+        session_build_ms = building.elapsed().as_millis() as u64;
     }
     set_activity(state, format!("rerank: scoring {} document(s)", documents.len()));
 
@@ -1481,23 +1554,33 @@ fn rerank_blocking(
             "rerank request: {} document(s), pinned to {} row(s) of ({}, {}) for {provider}",
             documents.len(), expanded.len(), max_batch, state.config.rerank_max_length
         );
-        let padded = score_documents(state, &mut guard, &query, &expanded, max_batch)?;
-        return Ok(RerankResponse { scores: unpin_rows(padded, &positions)? });
+        let (padded, pass) = score_documents(state, &mut guard, &query, &expanded, max_batch, request_id)?;
+        return Ok(RerankResponse {
+            scores: unpin_rows(padded, &positions)?,
+            request_id: request_id.to_string(),
+            timings: PassTimings { queue_wait_ms, session_build_ms, ..pass },
+        });
     }
 
-    let scores = score_documents(state, &mut guard, &query, &documents, max_batch)?;
-    Ok(RerankResponse { scores })
+    let (scores, pass) = score_documents(state, &mut guard, &query, &documents, max_batch, request_id)?;
+    Ok(RerankResponse {
+        scores,
+        request_id: request_id.to_string(),
+        timings: PassTimings { queue_wait_ms, session_build_ms, ..pass },
+    })
 }
 
-/// One scoring pass over `documents`, returning sigmoid scores ALIGNED with the input order.
-/// Shared by the pinned and natural paths of `rerank_blocking`.
+/// One scoring pass over `documents`, returning sigmoid scores ALIGNED with the input order plus the
+/// pass's own timing spans (inference and compile; queue and build belong to the caller, which is why
+/// they come back zeroed here). Shared by the pinned and natural paths of `rerank_blocking`.
 fn score_documents(
     state: &AppState,
     guard: &mut std::sync::MutexGuard<'_, Option<TextRerank>>,
     query: &str,
     documents: &[String],
     max_batch: usize,
-) -> anyhow::Result<Vec<f32>> {
+    request_id: &str,
+) -> anyhow::Result<(Vec<f32>, PassTimings)> {
     let count = documents.len();
     let (cache_before, pass) = (mxr_cache_mb(&state.config.mxr_cache_base), std::time::Instant::now());
     // query.to_string(): fastembed's `rerank` shares one generic across the query and the document slice,
@@ -1506,12 +1589,21 @@ fn score_documents(
         .as_mut()
         .expect("just loaded")
         .rerank(query.to_string(), documents, false, Some(max_batch))?;
+    let inference = pass.elapsed();
+    let compile_cache_grew_mb = mxr_cache_mb(&state.config.mxr_cache_base).saturating_sub(cache_before);
     tracing::info!("{}", pass_log_message(
+        request_id,
         &format!("rerank: scored {count} document(s)"),
-        pass.elapsed().as_secs_f32(),
-        mxr_cache_mb(&state.config.mxr_cache_base).saturating_sub(cache_before),
+        inference.as_secs_f32(),
+        compile_cache_grew_mb,
     ));
-    Ok(aligned_scores(count, results.into_iter().map(|r| (r.index, r.score))))
+    let timings = PassTimings {
+        queue_wait_ms: 0,
+        session_build_ms: 0,
+        inference_ms: inference.as_millis() as u64,
+        compile_cache_grew_mb,
+    };
+    Ok((aligned_scores(count, results.into_iter().map(|r| (r.index, r.score))), timings))
 }
 
 /// Scores raised back into the DOCUMENT order the HTTP contract promises: `rerank()` returns results
@@ -1562,10 +1654,13 @@ fn mxr_cache_mb(base: &str) -> u64 {
 
 /// The per-pass log line: plain timing, plus the truth about compilation when the cache grew
 /// during the pass — that is the ONLY moment a MIGraphX compile is observable (lazy save).
-fn pass_log_message(action: &str, secs: f32, cache_grew_mb: u64) -> String {
+/// The caller's `request_id` leads the line when one was sent — two concurrent requests are
+/// otherwise indistinguishable here.
+fn pass_log_message(request_id: &str, action: &str, secs: f32, cache_grew_mb: u64) -> String {
+    let prefix = if request_id.is_empty() { String::new() } else { format!("[{request_id}] ") };
     match cache_grew_mb {
-        0 => format!("{action} in {secs:.1}s"),
-        grew => format!("{action} in {secs:.1}s — compiled and cached this input shape (+{grew} MB)"),
+        0 => format!("{prefix}{action} in {secs:.1}s"),
+        grew => format!("{prefix}{action} in {secs:.1}s — compiled and cached this input shape (+{grew} MB)"),
     }
 }
 
@@ -2071,7 +2166,7 @@ mod tests {
         execution_providers, copy_missing_files, embed_settling, find_tokenizer_file, join_error_text, loaded_now,
         lock_healing, cap_for, load_token_counter, parse_unload_request, pass_log_message, pin_shape,
         preflight_provider, rerank_batch, required_provider_libraries, should_pin_shape, unpin_rows,
-        with_engine_cache, Config, RungCache, TokenUsage, SETTLE_ATTEMPTS,
+        with_engine_cache, Config, EmbedResponse, PassTimings, RungCache, TokenUsage, SETTLE_ATTEMPTS,
     };
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -2449,14 +2544,67 @@ mod tests {
     /// first pass then silently compiled for two minutes — worse than no message at all.
     #[test]
     fn pass_log_reports_a_compile_only_when_the_cache_grew() {
-        let compiled = pass_log_message("sparse: embedded 32 row(s)", 118.3, 2401);
+        let compiled = pass_log_message("", "sparse: embedded 32 row(s)", 118.3, 2401);
         assert!(
             compiled.contains("compiled and cached") && compiled.contains("+2401 MB"),
             "a grown cache means THIS pass compiled: {compiled}"
         );
 
-        let plain = pass_log_message("dense: embedded 32 row(s)", 1.4, 0);
+        let plain = pass_log_message("", "dense: embedded 32 row(s)", 1.4, 0);
         assert!(!plain.contains("compiled"), "steady state stays plain timing: {plain}");
+    }
+
+    /// The request id is a correlation aid: it leads the line when the caller sent one and adds no
+    /// noise when none was sent — two concurrent requests were previously indistinguishable in the log.
+    #[test]
+    fn pass_log_prefixes_the_request_id_only_when_one_was_sent() {
+        let tagged = pass_log_message("leg-7/q3", "embedded 8 row(s)", 0.4, 0);
+        assert!(tagged.starts_with("[leg-7/q3] "), "the caller's id leads the line: {tagged}");
+
+        let untagged = pass_log_message("", "embedded 8 row(s)", 0.4, 0);
+        assert!(!untagged.contains('['), "no id, no prefix: {untagged}");
+    }
+
+    /// The four field names are a WIRE contract (consumed by the benchmark's telemetry and any other
+    /// HTTP caller): renaming one here silently breaks a consumer that deserializes by name.
+    #[test]
+    fn pass_timings_serialize_under_their_contract_names() {
+        let json = serde_json::to_value(PassTimings {
+            queue_wait_ms: 1,
+            session_build_ms: 2,
+            inference_ms: 3,
+            compile_cache_grew_mb: 4,
+        })
+        .expect("PassTimings is serializable");
+
+        assert_eq!(json["queue_wait_ms"], 1);
+        assert_eq!(json["session_build_ms"], 2);
+        assert_eq!(json["inference_ms"], 3);
+        assert_eq!(json["compile_cache_grew_mb"], 4);
+    }
+
+    /// embed_blocking's natural path returns `EmbedResponse { usage, ..inner }` — the struct update
+    /// must keep carrying the inner call's timings and echo. This goes red if a refactor ever rebuilds
+    /// that response without the new fields.
+    #[test]
+    fn the_struct_update_path_keeps_the_inner_timings_and_echo() {
+        let inner = EmbedResponse {
+            dense: vec![],
+            sparse: vec![],
+            usage: TokenUsage::default(),
+            request_id: "leg-7/q3".to_string(),
+            timings: PassTimings {
+                queue_wait_ms: 5,
+                session_build_ms: 0,
+                inference_ms: 9,
+                compile_cache_grew_mb: 0,
+            },
+        };
+
+        let outer = EmbedResponse { usage: TokenUsage::default(), ..inner };
+
+        assert_eq!(outer.timings.inference_ms, 9, "the inner pass's timing survives the update");
+        assert_eq!(outer.request_id, "leg-7/q3", "and so does the caller's echo");
     }
 
     /// The common case — a settled session — must cost exactly ONE run. This is the regression that

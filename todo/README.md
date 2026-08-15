@@ -15,6 +15,10 @@ Definition of Done.
 |---|---|---|
 | [PLAN_sidecar_product.md](PLAN_sidecar_product.md) | engine works and is measured on an R9700; distribution is not built | build recipe as data, self-verification against a reference vector, public-repository hygiene, host ergonomics |
 
+Implemented plans live in [`../research/`](../research/) — most recently
+[PLAN_response_timings.md](../research/PLAN_response_timings.md) (additive `timings` + `request_id`
+on `/embed` and `/rerank`, 2026-08-15).
+
 ## The constraint that shapes every plan here
 
 The execution provider is a **compile-time** feature, and the vendor providers — DirectML, NVIDIA CUDA and

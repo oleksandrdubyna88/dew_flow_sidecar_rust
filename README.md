@@ -43,11 +43,27 @@ Model files (~2.2 GB for bge-m3 FP32 + the reranker) download from Hugging Face 
 
 | Endpoint | Body | Response |
 |---|---|---|
-| `POST /embed` | `{ "texts": ["..."], "kind": "doc"\|"query", "provider": "auto\|cuda\|dml\|migraphx\|cpu"? }` | `{ "dense": [[f32]], "sparse": [{ "indices": [u32], "values": [f32] }], "token_count": [usize], "truncated": [bool], "max_length": usize, "token_accounting": bool }` |
-| `POST /rerank` | `{ "query": "...", "documents": ["..."], "provider": ...? }` | `{ "scores": [f32] }` (input order) |
+| `POST /embed` | `{ "texts": ["..."], "kind": "doc"\|"query", "provider": "auto\|cuda\|dml\|migraphx\|cpu"?, "request_id": "..."? }` | `{ "dense": [[f32]], "sparse": [{ "indices": [u32], "values": [f32] }], "token_count": [usize], "truncated": [bool], "max_length": usize, "token_accounting": bool, "request_id": "...", "timings": {...} }` |
+| `POST /rerank` | `{ "query": "...", "documents": ["..."], "provider": ...?, "request_id": "..."? }` | `{ "scores": [f32] (input order), "request_id": "...", "timings": {...} }` |
 | `GET /health` | — | `{ "status", "provider", "loaded": {...}, "models": {...}, "adapter": { "name", "vram_mb", "luid", "requested_device", "dml_device_id" } \| null }` |
 
 `kind` is accepted for contract compatibility; BGE-M3 embeds queries and documents identically.
+
+### Per-request timings (`timings`, 2026-08-15)
+
+Both inference responses attribute the request's wall-clock, because every number here used to die in
+this process's own log file — and the most important one was never measured at all:
+
+| Field | Meaning |
+|---|---|
+| `queue_wait_ms` | Waiting for the engine mutex behind **another** request. This is the caller's *infrastructure wait*, never model speed — a request that waited 8 s and ran 0.4 s used to look like a slow model. Measured around the mutex only. |
+| `session_build_ms` | Building + canary-checking the ORT session. `0` on a warm engine — a cold first call is otherwise indistinguishable, on the wire, from slow inference. |
+| `inference_ms` | The forward pass(es), settling re-runs included — what this request's inference actually cost. |
+| `compile_cache_grew_mb` | `> 0` = MIGraphX compiled this input shape during the pass (the compiled-model cache saves lazily, so growth across the pass is the only moment a compile is observable). |
+
+`request_id` is an optional, opaque caller correlation id: echoed verbatim in the response and
+prefixed to the request's pass log lines, so two concurrent requests can be told apart in both places.
+Absent ⇒ empty echo, unprefixed logs.
 
 ## Configuration (env, injected by the AppHost)
 
