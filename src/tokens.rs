@@ -46,7 +46,7 @@ pub(crate) struct TokenizerRegistry {
 impl TokenizerRegistry {
     /// Declares this build's rows and loads every one of them NOW.
     ///
-    /// Eager on purpose (`todo/PLAN_reliability_tail.md` item 2): the counters used to be `OnceLock`s
+    /// Eager on purpose (`research/PLAN_reliability_tail.md` item 2): the counters used to be `OnceLock`s
     /// filled by `get_or_init` inside the FIRST `/tokenize` call, so that request paid a directory walk
     /// and a multi-MB parse on the async runtime — and a model cache swapped under a running sidecar
     /// silently decided the answer.

@@ -1,9 +1,10 @@
 # PLAN — the reliability tail the 24/7 audit left open
 
-> Status: **partially implemented, 2026-08-16 — items 2, 3, 4, 5, 6, 7 and 8 are done; only item 1
-> remains open.** Item 1 (the MIGraphX cache race) is the only correctness hazard left, and it is the one item
-> that **cannot be verified on this machine** — it is feature-gated behind an AMD toolchain that itself
-> needs an ONNX Runtime built from source. Scope: `src/main.rs` throughout.
+> Status: **IMPLEMENTED, 2026-08-16.** All eight items shipped. Item 1 (the MIGraphX cache race) landed last,
+> as planned, and the honesty clause below is narrower than the plan expected: the SERIALIZATION is proved by a
+> test that runs on this machine (RED first), while what remains unverifiable here is the EP's own lazy read —
+> a property this codebase recorded during the 2026-07-27 incident, not a claim made by the fix. Scope:
+> `src/main.rs` throughout — which, by item 8, is now seventeen modules.
 > The CRITICAL/HIGH defects of the same audit — the blocking lock in `/unload`, the invisible
 > inference wedge, the DLL hashing on the `/health` path and the silently zeroed token counts — were
 > fixed in a separate task (2026-08-16) and are **not** in this plan. That task also took item 3 on the
@@ -17,7 +18,7 @@
 >
 > Related: `.claude/rules/shared/common/reliability.md` (the doctrine this audit produced),
 > [README.md](../README.md) (the incident history most of this file's machinery answers),
-> [PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md) (**implemented** — item 2 was its
+> [PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md) (**implemented** — item 2 was its
 > step 1, and the two landed together as both plans asked, because they were the same twenty lines).
 
 ## Why the line numbers moved, and what it cost
@@ -38,7 +39,57 @@ left open — which is its own lesson: the audit read the code, but not every co
 
 ## The symptom, per item
 
-### 1. The MIGraphX cache path is protected across the build but not the first inference — HIGH
+### 1. The MIGraphX cache path is protected across the build but not the first inference — HIGH · **DONE 2026-08-16**
+
+> **The claim outlives the build now.** `with_engine_cache` — a function whose scope ENDED where the hazard
+> began — is replaced by `CachePathLease` (`src/compile_cache.rs:95-169`), an RAII claim taken by the caller
+> that BUILDS and held across that engine's **first pass**. The two build sites are the only two places that
+> take one: `embed_natural` (`src/inference.rs:267-294`, dropped immediately after `embed_settling` returns —
+> everything below that line is arithmetic) and `rerank_blocking` (`src/inference.rs:357-366`, dropped at
+> return so it spans `score_documents` through both the pinned and the natural branch). A **resident** engine
+> claims nothing: serializing steady-state passes across the two engine types would cost far more than the
+> minutes this costs once, while one of them is cold.
+>
+> Three things came with it that the draft did not ask for, each because the widening made them visible:
+>
+> - **The lease is EVIDENCE, and the evidence is checked.** `load_dual` / `load_rerank` now require a
+>   `&CachePathLease`, so a session cannot be built without one — the hazard is a compile error rather than a
+>   convention. `load_session` refuses a lease taken for the OTHER engine, first thing, before a provider is
+>   pinned or anything is loaded: that mismatch would point a build at the other engine's slice, which is the
+>   2026-07-27 incident arriving through the guard meant to prevent it. Test:
+>   `a_session_built_under_another_engines_lease_is_refused`.
+> - **The canary's heal path stopped spelling the engine name by hand.** It composed
+>   `engine_cache_dir(base, "dual")` as a literal and did its own `mxr_cache_base.trim().is_empty()` check;
+>   both now come off the lease (`cache.dir()`, `cache.wipe()`). A name spelled twice is a name that drifts —
+>   the same defect item 4 fixed on the measurement side.
+> - **The recorded finding moved with the code.** The DoD asked for it, and it is now the opening paragraph of
+>   `CachePathLease`'s doc: this ROCm build honors only the process env, the per-session provider-options
+>   fields were tried and are IGNORED, and **they must be re-tested whenever `ort` or ROCm is bumped** —
+>   because that fix removes the hazard class rather than narrowing it.
+>
+> **Tests, and what they can and cannot prove here.**
+> `a_concurrent_build_cannot_change_the_cache_path_before_the_first_launch` — **RED first**, with exactly the
+> real symptom: the embed engine's first launch read `…/mxr-race-48440/rerank`, the other engine's slice,
+> against its own `…/dual`. Teeth proved by temporarily releasing the claim at the end of the build (the
+> retired scope) and restoring it. The test also reproduces that retired scope inline, single-threaded, so the
+> defect stays visible in the suite the way item 4's does. Plus
+> `wiping_a_slice_leaves_it_present_and_empty_and_never_touches_the_other_engine`.
+>
+> **What is still unverified on this machine, precisely:** that the MIGraphX EP reads the variable at the
+> first kernel launch rather than at session build. That is not this fix's claim — it is the codebase's
+> pre-existing record, cited in three doc comments and paid for during the 2026-07-27 incident. The
+> `migraphx` feature build was type-checked here (`cargo check --no-default-features --features migraphx`,
+> clean); it cannot be RUN without ONNX Runtime 1.24.x built `--use_migraphx` (see
+> `src/preflight.rs:184-198`). When that toolchain first works, verify this on the wire in the same session —
+> `dew_flow_benchmark · todo/PLAN_compute_backend_axis.md` §6 is blocked on exactly the same prerequisite and
+> should be measured then.
+>
+> *Deviation from the drafted fix:* the draft said "hold `BUILD_ENV_LOCK` through the canary's real `embed()`
+> call". That is what happens, but not by widening a lock inside `with_engine_cache` — the lock lives in a
+> function whose whole shape was the problem. Handing the claim to the caller is what makes the lifetime
+> visible at the call site, and what let the compiler enforce that a build has one.
+
+*(Original symptom, for the record, below.)*
 
 `src/compile_cache.rs:87-99`, `with_engine_cache`, serializes on a `BUILD_ENV_LOCK` while it sets the
 process-global `ORT_MIGRAPHX_MODEL_CACHE_PATH` / `ORT_MIGRAPHX_CACHE_PATH` and builds the session.
@@ -82,7 +133,7 @@ Feature-gated to `migraphx` builds.
 
 ### 2. `/tokenize` does CPU work — and first-call file I/O — on the async runtime — MEDIUM · **DONE 2026-08-16**
 
-> Landed with [PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md) step 1, as this plan's build
+> Landed with [PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md) step 1, as this plan's build
 > order asked — they were the same twenty lines. All three fixes shipped:
 >
 > - **Pre-warm.** `TokenizerRegistry::load` reads every row at startup, before the listener is up. The
@@ -285,7 +336,7 @@ afternoon that would not have been spent.
 
 **Fix:** set it explicitly, report it in `/health` beside `max_batch` (a limit a client cannot read is
 a limit it will guess at), document it beside the other env vars, and log rejections. Shares its `/health`
-half with [PLAN_sidecar_product.md](PLAN_sidecar_product.md) phase 4, which records the same finding.
+half with [PLAN_sidecar_product.md](../todo/PLAN_sidecar_product.md) phase 4, which records the same finding.
 
 ### 8. `src/main.rs` was 4 744 lines — LOW severity, high friction · **DONE 2026-08-16**
 
@@ -358,7 +409,7 @@ at `d0139b1`:
 | `wedge` | 172–472 | `Phase`, `WedgePolicy`, `InFlight`, `EngineWedged`, `wedge_action`, the watchdog |
 | `engine_cache` | 473–558 | `RungCache`, `EngineSlot` |
 | `state` | 559–680 | `Engines`, `AppState`, `Limits` |
-| `tokens` | 681–789 | tokenizer loading, `count_tokens`, `token_usage`, `usage_from_counts` — **the module [PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md) reshaped**, so this range has already moved |
+| `tokens` | 681–789 | tokenizer loading, `count_tokens`, `token_usage`, `usage_from_counts` — **the module [PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md) reshaped**, so this range has already moved |
 | `main` | 790–930 | startup, logging init, router |
 | `preflight` | 931–1127 | ORT dylib + MIGraphX cache probes, model-cache seeding |
 | `wire` | 1128–1445 | request/response types, `ApiError` constructors |
@@ -380,16 +431,15 @@ this table's numbers, trust its groupings.
 ## Build order
 
 *(Items 2 and 3 are done. Item 2 went first because it was the same twenty lines as
-[PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md)'s step 1, which is on the critical path of two
+[PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md)'s step 1, which is on the critical path of two
 other repositories — `dew_flow_rag_qln`, then `dew_flow_benchmark`.)*
 
-*(Items 2, 3, 4, 6 and 7 are done — the verifiable set was closed first, deliberately: everything that
-could be proven on this hardware was proven before starting the one item that cannot be.)*
+*(Items 2, 3, 4, 6 and 7 were done first — the verifiable set was closed deliberately ahead of the one item
+believed unprovable here, and item 8's split then landed before item 1 so the last fix went into a 208-line
+module rather than a 4 744-line file. Both orderings paid: the cache race turned out to be ~80 lines in one
+module, and its serialization turned out to be testable here after all.)*
 
-1. **(1) the cache race** — all that is left, and the only correctness hazard. The investigation the
-   draft asked for is already answered (see the REVISED note): implement the widened serialization. It
-   now lands in `compile_cache.rs`, ~210 lines, rather than in a 4 744-line file. Feature-gated; see the
-   honesty clause in the test plan about what can be run here.
+1. **(1) the cache race** — ✅ **done last**, as the order above intended.
 
 ## Test plan
 
@@ -399,7 +449,7 @@ idiom to follow — fake clocks and held mutexes rather than a real GPU:
 
 | item | test name |
 |---|---|
-| 1 | `a_concurrent_build_cannot_change_the_cache_path_before_the_first_launch` |
+| 1 | shipped under the drafted name, `a_concurrent_build_cannot_change_the_cache_path_before_the_first_launch` — **RED first** (`left: …/rerank`, `right: …/dual`: the embed engine's first launch reading the other engine's slice), plus `a_session_built_under_another_engines_lease_is_refused` and `wiping_a_slice_leaves_it_present_and_empty_and_never_touches_the_other_engine`. The test-plan note below expected this one to be compile-only here; it RUNS — the serialization is `std::sync` and process env, not the EP |
 | 2 | shipped as `tokenize_refuses_a_batch_beyond_the_cap` **+** `a_tokenizer_present_at_startup_still_counts_after_its_file_is_gone` — the second one is the pre-warm half, and it is the only way to assert "loaded at startup" without watching syscalls: a tokenizer that was on disk when the process started keeps counting after the file is taken away |
 | 3 | ~~`the_ruler_is_allocated_once`~~ → shipped as `the_ruler_is_allocated_once_and_shared` |
 | 4 | shipped as `a_compile_by_one_engine_is_not_reported_as_growth_by_the_other` + `a_flavour_with_no_cache_never_walks_anything` — the guarantee turned out to be SCOPE, not frequency: the walk stays, it just reads one engine's subdirectory |
@@ -412,24 +462,28 @@ Item 8 asserted nothing new, as planned: the suite was green on both sides (82 b
 the diff carried no behaviour change — proved by counting every statement of the old file against the
 union of the new ones (0 lost) and by calling the rebuilt binary's endpoints.
 
-Note honestly which items cannot be verified on this machine: the MIGraphX path is feature-gated and
-needs the AMD toolchain — and that toolchain currently needs an ONNX Runtime built from source with
-`--use_migraphx` — so item 1's test may only be compilable, not runnable, here. Say which, rather than
-implying a green run that did not happen.
+**The honesty clause, settled.** The draft expected item 1's test to be "compilable, not runnable" here. That
+turned out to be too pessimistic by one level, and the distinction is worth keeping rather than smoothing
+over: the SERIALIZATION is `std::sync` plus process environment, so it runs and it went red first. The
+MIGraphX EP's own lazy read is what needs the AMD toolchain — ONNX Runtime built from source with
+`--use_migraphx` — and it is a property this repository recorded during an incident, not something the fix
+asserts. `cargo check --no-default-features --features migraphx` was run and is clean; that is a type check,
+and it is reported as one.
 
 ## Definition of Done
 
-- [ ] Item 1 is resolved by the widened serialization, and the recorded finding — that this ROCm build
+- [x] Item 1 is resolved by the widened serialization, and the recorded finding — that this ROCm build
       ignores the provider-options fields, so the per-session option is unavailable — is carried into
-      the code comment at `:2189-2192` so the next `ort` bump knows to re-test it.
-- [ ] Every other item is implemented, or explicitly declined here with the reason recorded (item 4 is
-      the likely decline; it must be a written decision, not an omission).
-- [ ] Each implemented item has a RED-then-GREEN test, both observations quoted; items that could not
-      run on this hardware are named as such.
-- [ ] Every new guard carries a comment naming the incident class it prevents — the convention this
+      the code comment (now `CachePathLease`'s opening paragraph, `src/compile_cache.rs:95-102`) so the
+      next `ort` bump knows to re-test it.
+- [x] Every other item is implemented. Nothing was declined: item 4 — flagged in the draft as the likely
+      decline — turned out to be a correctness fix rather than a cost one, and shipped.
+- [x] Each implemented item has a RED-then-GREEN test, both observations quoted; the one thing that could
+      not run on this hardware is named above, and it is narrower than the item.
+- [x] Every new guard carries a comment naming the incident class it prevents — the convention this
       file already follows and the reason it is defensible.
-- [ ] `cargo build` and `cargo test` green; the logging contract (ANSI stdout, plain file, UTC day
-      folder, level from `RUST_LOG`) still holds.
-- [ ] After the split, no file exceeds 800 lines.
-- [ ] On completion the plan is promoted to `research/` with its deviations recorded, and the
-      *Currently open* table in [README.md](README.md) is updated in the same task.
+- [x] `cargo build` and `cargo test` green (90 passed, 0 failed, 0 warnings, both flavours type-checked);
+      the logging contract (ANSI stdout, plain file, UTC day folder, level from `RUST_LOG`) still holds.
+- [x] After the split, no file exceeds 800 lines.
+- [x] On completion the plan is promoted to `research/` with its deviations recorded, and the
+      *Currently open* table in [README.md](../todo/README.md) is updated in the same task.

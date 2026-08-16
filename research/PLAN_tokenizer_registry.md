@@ -8,7 +8,7 @@
 >
 > **Three deviations, all deliberate.**
 >
-> 1. **The `/tokenize` batch cap is not `/embed`'s.** [PLAN_reliability_tail.md](../todo/PLAN_reliability_tail.md)
+> 1. **The `/tokenize` batch cap is not `/embed`'s.** [PLAN_reliability_tail.md](PLAN_reliability_tail.md)
 >    item 2 drafted it as "matching the one `/embed` already enforces". `/embed` does not *refuse* at
 >    `max_batch`, it re-batches internally, and the host assembles `/tokenize` calls of up to 512 rows by
 >    design (`SidecarClient.RequestRowBudget`, `dew_flow_rag_qln`) — so a cap at 64 would have refused
@@ -147,7 +147,7 @@ What this plan needs from nobody: it is standalone and can ship before or after 
 
 1. **The registry** — the two present tokenizers become rows, **loaded at startup**; `/tokenize` resolves
    through it; the refusal names the registered set. Behaviour for `bge`/`qwen` is byte-identical.
-   Coordinate with [PLAN_reliability_tail.md](../todo/PLAN_reliability_tail.md) item 2, which touches the same
+   Coordinate with [PLAN_reliability_tail.md](PLAN_reliability_tail.md) item 2, which touches the same
    handler: startup loading removes its first-call disk I/O, and its `spawn_blocking` + batch cap sit on
    top of this unchanged.
 2. **`GET /models`** — the metadata read, with unknown as its own state.
