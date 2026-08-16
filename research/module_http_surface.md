@@ -1,6 +1,6 @@
 # Module — HTTP surface
 
-> `src/main.rs`: the request/response records and the five handlers. The system as it is, 2026-08-15.
+> `src/main.rs`: the request/response records and the five handlers. The system as it is, 2026-08-16.
 
 ## Purpose
 
@@ -15,16 +15,16 @@ flowchart LR
         EMBED["POST /embed"]
         RERANK["POST /rerank"]
     end
-    subgraph free["never queues"]
+    subgraph free["never queues without a ceiling"]
         HEALTH["GET /health<br/>try_lock only"]
         TOKENIZE["POST /tokenize<br/>pure CPU"]
-        UNLOAD["POST /unload<br/>drops engines off-lock"]
+        UNLOAD["POST /unload<br/>blocking pool, bounded wait"]
     end
     EMBED --> BLOCKING["spawn_blocking → embed_blocking"]
     RERANK --> BLOCKING2["spawn_blocking → rerank_blocking"]
     HEALTH --> STATE["AppState snapshot"]
     TOKENIZE --> TOK["tokenizers, no session"]
-    UNLOAD --> DROP["take engines, drop in spawn_blocking"]
+    UNLOAD --> DROP["spawn_blocking: take under the lock,<br/>drop outside it"]
 ```
 
 ## Wire shapes
@@ -57,12 +57,27 @@ by score, while the C# consumer pairs by position.
 
 `{ texts[], model: "bge" | "qwen" }` → `{ token_count[], model, available }`. Pure CPU: a vocabulary
 lookup and BPE merges, no session and no GPU, which is what makes it safe to call from inside an index
-pass. An unknown model name is a `400` — a count from the wrong tokenizer is worse than no count.
+pass. An unknown model name is a `400` — a count from the wrong tokenizer is worse than no count. A text
+the tokenizer **refuses** makes the whole answer `available: false` with an empty array: a `0` a caller
+cannot tell from an empty text is worse than an honest "not measured".
 
 ### `GET /health`
 
-Never blocks: every lock is a `try_lock`, and a busy lock reads as "unknown yet", which is honest. It
-reports four provider facts that a single field used to conflate:
+Never blocks and never *computes*: every lock is a `try_lock` (a busy lock reads as "unknown yet", which
+is honest), and the two provenance hashes are read from a cell a startup task filled on the blocking
+pool. The first call used to SHA-256 the executable and every library beside it inline on a reactor
+thread — 1.4 s over 67 MB of test binaries, and a CUDA deployment is gigabytes.
+
+`status` is `"ok"` or `"wedged"` — deliberately not a constant, because the one failure that matters here
+is an engine held past its ceiling by an ONNX Runtime call nothing can cancel:
+
+| Field | Answers |
+|---|---|
+| `status` / `wedged` | The verdict. `wedged` is any engine past its phase's ceiling |
+| `in_flight[]` | Per held engine: `engine`, `phase` (`building` \| `running`), `activity`, `elapsed_seconds`, `ceiling_seconds`, `wedged`. Empty when nothing holds an engine |
+| `provenance_ready` | The two hashes are final. `false` = still being computed, so an empty hash means "not yet", not "unreadable" |
+
+Plus four provider facts that a single field used to conflate:
 
 | Field | Answers |
 |---|---|
@@ -81,6 +96,15 @@ split again); `resident_embed_max_lengths`; and the resolved DXGI `adapter`.
 rung left behind would keep holding the card the lease is handing to something else. Engines are taken
 under the lock and dropped **outside** it, in a blocking task, because session teardown takes a moment.
 
+The lock is acquired on that same blocking task, with a ceiling (`UNLOAD_LOCK_WAIT_SECONDS`, 30 s). It
+used to be taken directly on a Tokio **worker** thread: the operator's only recovery tool — which also
+serves the host's GPU-lease coordinator — queued on the very mutex a hung request was holding, and with
+Tokio's default worker count a handful of such calls starved the whole HTTP server, `/health` included.
+The same file had already solved exactly this for `/health` (`loaded_now`); `/unload` was left behind.
+An engine it could not take stays loaded, and the answer says so — `loaded` still reports it and
+`in_flight[]` names what holds it, because a partial handover read as a complete one is how an exclusive
+LLM ends up sharing the card.
+
 ## Fields that exist to prevent a specific wrong reading
 
 | Field | Without it |
@@ -90,12 +114,18 @@ under the lock and dropped **outside** it, in a blocking task, because session t
 | `loaded_max_batch` / `loaded_embed_max_length` | The configured default reads as a fact. It described an intention — "why 15 methods/s when the batch is 126?" produced three different numbers, none of them the one that ran |
 | `timings.queue_wait_ms` | A request that waited behind another caller looks like a slow model |
 | `activity` | A multi-minute first-build renders as a dead card in the host UI |
+| `in_flight[].wedged` + `ceiling_seconds` | A stuck inference and a healthy cold compile look identical. The elapsed time alone cannot separate them — the ceiling has to travel with it |
+| `provenance_ready` | An empty hash reads as "unreadable" when it only means "not hashed yet" |
 
 ## Error handling
 
-`internal_error` → `500 { "error": … }`, logged with the full chain. `bad_request` → `400`. A panicked
-blocking task is turned into a `500` naming the panic rather than a dropped connection. Empty inputs
-short-circuit with an empty, well-formed answer and default timings.
+`internal_error` → `500 { "error": … }`, logged with the full chain. `bad_request` → `400`.
+`engine_error` → **`503`** for an `EngineWedged`: nothing is wrong with the request, the card is
+unavailable right now, and a host that degrades or retries on `503` while treating `500` as a hard
+failure can only act on the difference if we make it. The message carries the holder's activity, its
+elapsed time and how to recover. A panicked blocking task is turned into a `500` naming the panic rather
+than a dropped connection. Empty inputs short-circuit with an empty, well-formed answer and default
+timings.
 
 ## Dependencies
 

@@ -65,7 +65,7 @@ graph TD
 
 | Route | Body | Answer |
 |---|---|---|
-| `GET /health` | — | status, activity, requested/compiled/active provider, `provider_ready`, last provider error, exe and runtime-manifest hashes, loaded models, limits, DXGI adapter |
+| `GET /health` | — | `status` (`ok` \| `wedged`), activity, `in_flight[]`, `wedged`, requested/compiled/active provider, `provider_ready`, last provider error, exe and runtime-manifest hashes + `provenance_ready`, loaded models, limits, DXGI adapter |
 | `POST /embed` | `texts[]`, `kind`, `provider?`, `max_length?`, `max_batch?`, `request_id?` | `dense[][]`, `sparse[]`, token accounting, `request_id`, `timings` |
 | `POST /rerank` | `query`, `documents[]`, `provider?`, `max_batch?`, `request_id?` | `scores[]` in input order, `request_id`, `timings` |
 | `POST /tokenize` | `texts[]`, `model` (`bge` \| `qwen`) | `token_count[]`, `model`, `available` |
@@ -90,7 +90,7 @@ sequenceDiagram
     opt provider pins shapes (MIGraphX)
         B->>B: pin_shape — pad to one constant (batch, seq)
     end
-    B->>M: lock  ← queue_wait_ms measured HERE
+    B->>M: lock_or_refuse  ← queue_wait_ms measured HERE; 503 if the holder is wedged
     opt rung not resident
         B->>E: build + canary  ← session_build_ms
     end
@@ -118,6 +118,30 @@ though the prefix were the whole text. So `/embed` returns per-text `token_count
 "nothing was truncated". Measured on an R9700: real source tokenizes at 2.99–3.50 chars/token, so a host
 budgeting 4 chars/token overshoots by ~34 % and loses the tail of every text it fills.
 
+### The wedge detector — the ceiling on this file's one uncancellable wait
+
+An ONNX Runtime forward pass **cannot be cancelled**: it is a C++ call on a thread this process does not
+own, and a thread merely *stuck* inside it never panics — so the poison healing, which recovers a mutex a
+*panic* poisoned, can never reach it. Until 2026-08-16 nothing else could either: every later `/embed`
+queued on `.lock()` forever, `/health` reported the freeze exactly as it reports a healthy multi-minute
+build, and the daemon's deliberately infinite sidecar HTTP timeout composed the two into a system-wide
+freeze nobody could observe.
+
+The remedy is visibility plus a ceiling, not cancellation:
+
+| Piece | What it does |
+|---|---|
+| `InFlight` + `InFlightStamp` | The holder stamps *what* it is doing and *since when*, in a mutex of its own — never inside the engine slot, because a holder wedged under that mutex could not be observed through it. RAII, so `?` and panics clear it |
+| `lock_or_refuse` | Every engine acquisition. Heals poison as before, waits while the holder is legitimately alive, and **refuses** — `503`, not `500` — once the holder passes its ceiling |
+| `/health` `status` / `wedged` / `in_flight[]` | The verdict, the elapsed time, the phase and the activity, all readable while the wedge is happening |
+| `spawn_wedge_watchdog` | Says it in the **log**, once per wedge — the party that would otherwise have asked `/health` is the one already blocked |
+
+The ceilings are deliberately generous, because a false "wedged" is expensive in both directions: a
+first-ever MIGraphX shape compile is **minutes of correct slowness** (214 s measured), and killing a
+process mid-compile is exactly how a corrupt `.mxr` lands in the cache — the 2026-07-31 incident the
+canary exists for. So `building` gets 3600 s, `running` 900 s (~1.5× the slowest honest pass on record),
+and the process-exit last resort is **opt-in** (`WEDGE_EXIT`) and **off**.
+
 ### Provider selection, and what `/health` really says
 
 The provider of the first successful session is **pinned until restart**. `/health` separates four
@@ -125,7 +149,10 @@ things that a single `provider` field conflated: what was *requested*, what the 
 with, what is *active*, and the last registration *error*. A provider absent from `compiled_providers`
 can never become active however it is configured — the failure is in the build flavour, not the
 settings. `exe_sha256` and `runtime_manifest_sha256` exist so a benchmark can prove it measured the same
-binary: an installed sidecar older than its commit is invisible to every other field.
+binary: an installed sidecar older than its commit is invisible to every other field. Both are hashed
+**at startup on the blocking pool**, never on the probe path — the first `/health` used to compute them
+inline (measured 1.4 s over 67 MB of test binaries; a CUDA install is gigabytes), and `provenance_ready`
+is the field that distinguishes "not hashed yet" from "unreadable".
 
 ### Shape pinning and the settling retry
 
@@ -154,6 +181,9 @@ forever.
 Handler failures become `ApiError` — a status plus `{ "error": … }`. An unknown tokenizer name is a
 `400` rather than a silent answer from the wrong tokenizer, because a count from the wrong model is
 worse than no count. A poisoned engine mutex is healed by dropping every resident engine and rebuilding.
+A **wedged** engine — held past its ceiling by an uncancellable ORT call — is a `503` carrying the
+holder's activity and elapsed time, because nothing is wrong with the request and a host that degrades on
+`503` while treating `500` as a hard failure can only act on the difference if it is made.
 
 ### CI
 
@@ -177,10 +207,11 @@ pre-existing rustfmt diffs, and the gate is open work in
   `mxr_cache_mb` is disk usage of the compiled-program cache, not memory.
 - **No queue-depth signal.** Concurrency is implicit in mutex contention, and `/health` deliberately
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
+  `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
 - **No request body limit is set**, so every route runs on axum's default 2 MB. Measured: 980 KB to
   `/tokenize` succeeds, 2.1 MB returns `413`. The host now batches under it; the cap is not stated in
   `/health`, and saying so is open work.
 - **No integration test suite** — testing is inline `#[cfg(test)]` in `main.rs` and `adapters.rs`
-  (51 tests).
+  (62 tests).
 - **Distribution is not built**: no build-recipe-as-data, no self-verification gate, no LICENSE or
   third-party notices.

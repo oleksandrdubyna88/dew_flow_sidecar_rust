@@ -1,9 +1,11 @@
 # PLAN — the reliability tail the 24/7 audit left open
 
-> Status: **plan only, nothing implemented yet, 2026-08-16.** Scope: `src/main.rs` throughout.
+> Status: **partially implemented, 2026-08-16 — item 3 only; items 1, 2, 4, 5, 6, 7, 8 remain open.**
+> Scope: `src/main.rs` throughout.
 > The CRITICAL/HIGH defects of the same audit — the blocking lock in `/unload`, the invisible
-> inference wedge, the DLL hashing on the `/health` path and the silently zeroed token counts — are
-> being fixed in a separate task and are **not** in this plan.
+> inference wedge, the DLL hashing on the `/health` path and the silently zeroed token counts — were
+> fixed in a separate task (2026-08-16) and are **not** in this plan. That task also took item 3 on the
+> way past, because it was one line in a function it was already editing.
 >
 > Related: `.claude/rules/shared/common/reliability.md` (the doctrine this audit produced),
 > [README.md](../README.md) (the incident history most of this file's machinery answers).
@@ -60,7 +62,13 @@ call from an index pass", which holds for one short text and is not guaranteed f
 **Fix:** `spawn_blocking` for the encode, a cap on the batch matching the one `/embed` already
 enforces, and — cheapest of all — pre-warm the tokenizers at startup so no request pays the load.
 
-### 3. The ruler string is rebuilt, then cloned, on every pinned request — MEDIUM
+### 3. The ruler string is rebuilt, then cloned, on every pinned request — MEDIUM · **DONE 2026-08-16**
+
+> Landed with the CRITICAL/HIGH reliability fixes: `ruler_text()` now returns `&'static str` from a
+> `static RULER: OnceLock<String>`, and the three call sites pass it straight through. Test:
+> `the_ruler_is_allocated_once_and_shared` (pointer identity, so a future `String` return goes red).
+> `pin_shape` still clones per padding row — that is the layout's own contract, and the allocation it
+> now clones from is one, not one per request.
 
 `src/main.rs:1269-1271`, `ruler_text()`, returns `"lorem ipsum dolor sit amet ".repeat(4096)` — about
 114 KB, allocated fresh at `:1426` (embed), `:1552` (rerank) and `:1830` (canary) whenever shape
@@ -132,7 +140,7 @@ own commit, mechanically, with no behaviour change — and `cargo test` green on
 
 1. **(1) the cache race** — the only correctness hazard here; investigate the per-session option
    first, because it decides whether the rest of the item exists.
-2. **(2) `/tokenize`** and **(3) the ruler** — same hot path, both small.
+2. **(2) `/tokenize`** — small, same hot path. *(item 3, the ruler, is done)*
 3. **(4) cache walk**, **(6) teardown attribution**, **(7) body limit** — measurable hygiene.
 4. **(5) the two comments/logs** — trivial, any time.
 5. **(8) the module split** — last, alone, no behaviour change.
@@ -147,7 +155,7 @@ idiom to follow — fake clocks and held mutexes rather than a real GPU:
 |---|---|
 | 1 | `a_concurrent_build_cannot_change_the_cache_path_before_the_first_launch` |
 | 2 | `tokenize_refuses_a_batch_beyond_the_cap` |
-| 3 | `the_ruler_is_allocated_once` |
+| 3 | ~~`the_ruler_is_allocated_once`~~ → shipped as `the_ruler_is_allocated_once_and_shared` |
 | 4 | `the_cache_is_not_walked_when_no_build_happened` |
 | 6 | `an_evicted_engine_is_dropped_outside_the_lock` |
 | 7 | `a_body_beyond_the_limit_is_refused_and_logged` |

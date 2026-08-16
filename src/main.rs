@@ -69,6 +69,7 @@ fn day_and_clock(unix_seconds: u64) -> (String, String) {
 }
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -117,6 +118,8 @@ struct Config {
     /// ladder's own maximum, so a pass never rebuilds a rung it will return to; 1 restores the old
     /// evict-on-change behaviour.
     engine_cache_rungs: usize,
+    /// When a wait stops being "slow but alive" — see `WedgePolicy`.
+    wedge: WedgePolicy,
 }
 
 impl Config {
@@ -147,6 +150,7 @@ impl Config {
             // would only hold an engine nothing asks for. An operator who opts the ladder back in raises
             // this with the same setting that raises the rung count.
             engine_cache_rungs: env_parse("EMBED_ENGINE_CACHE_RUNGS", 1),
+            wedge: WedgePolicy::from_env(),
         }
     }
 }
@@ -157,6 +161,300 @@ fn env_str(key: &str, default: &str) -> String {
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// An opt-in switch, spelled the way every other boolean knob here is (`PIN_INPUT_SHAPE`). Absent
+/// or unrecognised means OFF — a switch whose default is "maybe" is not a switch.
+fn env_truthy(key: &str) -> bool {
+    matches!(env_str(key, "").trim().to_lowercase().as_str(), "1" | "true" | "on" | "yes")
+}
+
+// ---------- the wedge detector: this file's one unbounded wait, made observable ----------
+//
+// An ORT/MIGraphX forward pass cannot be cancelled. It is a C++ call on a thread we do not own, and a
+// thread merely STUCK inside it never panics — so `lock_or_refuse`'s poison healing, which recovers a
+// mutex a PANIC poisoned, can never reach it. Before 2026-08-16 that combination had no detector at
+// all: every later /embed queued on `.lock()` forever, /health reported the freeze exactly as it
+// reports a healthy multi-minute build, and the daemon's deliberately infinite sidecar HTTP timeout
+// composed the two into a system-wide freeze nobody could see (the four-repo reliability audit,
+// .claude/rules/shared/common/reliability.md § "Every wait has a ceiling").
+//
+// The remedy is not cancellation — it cannot be — but VISIBILITY plus a ceiling: stamp what holds an
+// engine and since when, declare it wedged once that passes the phase's ceiling, refuse new requests
+// with a reason instead of queueing them, and say so in the log without waiting to be asked.
+
+/// What an engine's holder is doing. The two phases exist because their ceilings differ by an order
+/// of magnitude, and conflating them is what would make a correct cold compile look like a freeze.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    /// Building + canary-checking a session. Minutes here are CORRECT.
+    Building,
+    /// A forward pass on an engine that is already built.
+    Running,
+}
+
+impl Phase {
+    /// The name /health reports.
+    fn name(self) -> &'static str {
+        match self {
+            Phase::Building => "building",
+            Phase::Running => "running",
+        }
+    }
+}
+
+/// The ceilings, all env-overridable. Deliberately generous: a false "wedged" is expensive in both
+/// directions — it refuses requests a healthy compile would have served, and (with the opt-in exit)
+/// killing a process mid-compile is precisely how a corrupt `.mxr` lands in the compiled-model cache,
+/// the 2026-07-31 incident the build canary exists for.
+#[derive(Clone, Copy)]
+struct WedgePolicy {
+    /// A forward pass on a built engine. Warm passes are seconds (measured 1.6 s at a 256 cap, 6.8 s at
+    /// 1024); the slowest legitimate one on record is ~608 s, when a first request also paid a lazy
+    /// MIGraphX compile plus its settling retries, and a first rerank pass compiles 92-162 s with no
+    /// canary ahead of it. 900 s is ~1.5x that worst honest case.
+    running_after: Duration,
+    /// Building + canary-checking a session. This phase legitimately contains the cold compile
+    /// (measured 214 s), up to `SETTLE_ATTEMPTS` canary runs, and — on a corrupt cache — a wipe plus one
+    /// clean recompile with a canary of its own. An hour, not a quarter of one.
+    building_after: Duration,
+    /// How long /unload waits for an engine before answering "still loaded". It is the operator's
+    /// recovery tool and the host's GPU-lease handover: long enough to ride out a normal in-flight pass,
+    /// short enough that the coordinator gets an answer rather than a hang.
+    unload_wait: Duration,
+    /// How often a waiter re-checks the lock and the holder's stamp.
+    poll: Duration,
+    /// Recovery of last resort: exit the process — the host restarts the sidecar — once an engine has
+    /// been WEDGED (not merely busy) for this long on top of its ceiling. `None`, the DEFAULT, never
+    /// exits. Opt in with `WEDGE_EXIT=1`.
+    exit_after_wedged: Option<Duration>,
+}
+
+impl WedgePolicy {
+    fn from_env() -> Self {
+        let running_after = Duration::from_secs(env_parse("WEDGE_RUNNING_AFTER_SECONDS", 900));
+        Self {
+            running_after,
+            building_after: Duration::from_secs(env_parse("WEDGE_BUILDING_AFTER_SECONDS", 3600)),
+            unload_wait: Duration::from_secs(env_parse("UNLOAD_LOCK_WAIT_SECONDS", 30)),
+            poll: Duration::from_millis(env_parse("WEDGE_POLL_MS", 50)),
+            exit_after_wedged: env_truthy("WEDGE_EXIT").then(|| {
+                Duration::from_secs(env_parse("WEDGE_EXIT_AFTER_SECONDS", running_after.as_secs()))
+            }),
+        }
+    }
+
+    /// How long this phase may run before it stops being "slow but alive".
+    fn ceiling(&self, phase: Phase) -> Duration {
+        match phase {
+            Phase::Building => self.building_after,
+            Phase::Running => self.running_after,
+        }
+    }
+}
+
+/// What holds an engine right now, and since when.
+///
+/// It lives in its OWN tiny mutex, never inside the engine slot, and that is the whole design: a
+/// holder wedged UNDER the engine mutex could never be observed THROUGH that same mutex, which is
+/// exactly why the freeze was invisible. This lock is only ever held for the length of an assignment.
+#[derive(Clone)]
+struct InFlight {
+    phase: Phase,
+    /// The same human label /health already showed as `activity` ("embed: embedding 64 row(s)").
+    label: String,
+    since: Instant,
+}
+
+/// Stamps the engine a request holds, and CLEARS the stamp on drop — including the `?` early return
+/// and the panic unwind, which is where a hand-written clear gets forgotten and leaves a phantom wedge
+/// that refuses every later request for the life of the process.
+struct InFlightStamp<'a> {
+    state: &'a AppState,
+    slot: &'a Mutex<Option<InFlight>>,
+}
+
+impl<'a> InFlightStamp<'a> {
+    fn hold(state: &'a AppState, slot: &'a Mutex<Option<InFlight>>) -> Self {
+        Self { state, slot }
+    }
+
+    /// Enters a phase: re-stamps the record — the clock restarts, because a finished build is not part
+    /// of the pass that follows it — and mirrors the label into /health's `activity`, so the operator's
+    /// window and the wedge detector can never disagree about what is happening.
+    fn enter(&self, phase: Phase, label: impl Into<String>) {
+        let label = label.into();
+        set_activity(self.state, label.clone());
+        write_inflight(self.slot, Some(InFlight { phase, label, since: Instant::now() }));
+    }
+}
+
+impl Drop for InFlightStamp<'_> {
+    fn drop(&mut self) {
+        write_inflight(self.slot, None);
+    }
+}
+
+/// Writes the in-flight record, healing poison. This mutex guards three fields and is never held
+/// across anything that can block, so a poisoned one means a panic somewhere else — never a wedge
+/// here — and failing to clear the stamp because of it would strand the engine as permanently busy.
+fn write_inflight(slot: &Mutex<Option<InFlight>>, record: Option<InFlight>) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = record,
+        Err(poisoned) => {
+            slot.clear_poison();
+            *poisoned.into_inner() = record;
+        }
+    }
+}
+
+/// A NON-BLOCKING read of the in-flight record. /health's standing rule, and doubly so here: the
+/// entire purpose of this slot is to stay readable while something else is stuck.
+fn inflight_now(slot: &Mutex<Option<InFlight>>) -> Option<InFlight> {
+    slot.try_lock().ok().and_then(|holder| holder.clone())
+}
+
+/// The refusal a caller gets rather than an unbounded queue. A distinct error type so the HTTP layer
+/// can answer **503** (temporary — retry, degrade, or look at /health) instead of 500 ("your request
+/// was wrong"): the host's degradation logic reads that difference, and a wedge is not the caller's
+/// fault.
+#[derive(Debug)]
+struct EngineWedged {
+    what: String,
+    /// What the holder said it was doing; empty when nothing had stamped it.
+    activity: String,
+    elapsed: Duration,
+    /// True = the holder passed its own ceiling (a real wedge). False = it is still legitimately busy
+    /// and THIS caller ran out of patience, which is a different sentence for the operator to read.
+    wedged: bool,
+}
+
+impl std::fmt::Display for EngineWedged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seconds = self.elapsed.as_secs();
+        if self.wedged {
+            return write!(
+                f,
+                "the {} engine is WEDGED: `{}` has held it for {seconds}s, past its ceiling. An ONNX Runtime \
+                 call cannot be cancelled from outside, so this request is refused instead of queueing behind \
+                 it forever — see /health (status \"wedged\"), then POST /unload or restart the sidecar",
+                self.what, self.activity
+            );
+        }
+        write!(
+            f,
+            "the {} engine is busy (`{}`) and did not come free within {seconds}s — refusing rather than \
+             queueing without a ceiling",
+            self.what,
+            if self.activity.is_empty() { "no activity recorded" } else { &self.activity }
+        )
+    }
+}
+
+impl std::error::Error for EngineWedged {}
+
+/// How long a caller is willing to wait for an engine somebody else holds.
+#[derive(Clone, Copy)]
+enum Patience {
+    /// The inference path: wait as long as the holder is legitimately alive, however long that is —
+    /// a first-ever shape compile is minutes of CORRECT slowness, and failing a pass that would have
+    /// succeeded is worse than waiting. This is the "documented pair" reliability.md allows: an
+    /// unbounded-looking wait plus the detector that ends it the moment the holder stops being alive.
+    UntilTheHolderIsWedged,
+    /// /unload: answer the caller within a bound, whatever the holder is doing.
+    AtMost(Duration),
+}
+
+/// What the watchdog does about a phase that has been in flight this long. Pure, so the policy is
+/// testable without a clock, a GPU, or a process to kill.
+#[derive(Debug, PartialEq, Eq)]
+enum WedgeAction {
+    /// Slow but alive.
+    Nothing,
+    /// Past its ceiling: /health says `wedged` and new requests are refused with the reason.
+    Report,
+    /// Past the OPT-IN exit ceiling on top of that: leave loudly, so the host's restart is the recovery.
+    Exit,
+}
+
+/// The exit ceiling is measured FROM the wedge verdict, never from the phase start — otherwise a
+/// `WEDGE_EXIT_AFTER_SECONDS` shorter than the (deliberately hour-long) build ceiling would kill the
+/// process in the middle of a legitimate compile, which is the one action guaranteed to leave a
+/// corrupt program in the compiled-model cache.
+fn wedge_action(phase: Phase, elapsed: Duration, policy: WedgePolicy) -> WedgeAction {
+    let ceiling = policy.ceiling(phase);
+    if elapsed < ceiling {
+        return WedgeAction::Nothing;
+    }
+    match policy.exit_after_wedged {
+        Some(after) if elapsed >= ceiling + after => WedgeAction::Exit,
+        _ => WedgeAction::Report,
+    }
+}
+
+/// How often the watchdog looks. A wedge lasts forever by definition, so the tick only decides how
+/// soon it reaches the log — never whether it does.
+const WEDGE_WATCHDOG_TICK: Duration = Duration::from_secs(30);
+
+/// The exit code a deliberate wedge exit leaves behind, distinct from the two startup preflights
+/// (1, 2) so a supervisor's restart log says WHY this process left.
+const WEDGE_EXIT_CODE: i32 = 3;
+
+/// The staleness watchdog — the LOG half of the detector.
+///
+/// /health can only tell someone who asks, and by construction the party that would have asked (the
+/// daemon, on an infinite sidecar HTTP timeout) is the one already blocked. So the wedge has to reach
+/// the log on its own, once, with the phase and the elapsed time, or the incident is again only
+/// visible to whoever thinks to poll a port.
+fn spawn_wedge_watchdog(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let policy = state.config.wedge;
+        // One announcement per wedge, not one per tick: an hour of a 30-second tick is 120 identical
+        // ERROR lines, which is how a real incident gets scrolled past.
+        let mut announced = [false, false];
+        loop {
+            tokio::time::sleep(WEDGE_WATCHDOG_TICK).await;
+            let engines: [(&str, &Mutex<Option<InFlight>>); 2] = [
+                ("embed", &state.engines.embed_inflight),
+                ("rerank", &state.engines.rerank_inflight),
+            ];
+            for (at, (engine, slot)) in engines.into_iter().enumerate() {
+                let Some(holder) = inflight_now(slot) else {
+                    announced[at] = false;
+                    continue;
+                };
+                let elapsed = holder.since.elapsed();
+                match wedge_action(holder.phase, elapsed, policy) {
+                    WedgeAction::Nothing => announced[at] = false,
+                    WedgeAction::Report if announced[at] => {}
+                    WedgeAction::Report => {
+                        announced[at] = true;
+                        tracing::error!(
+                            "{engine} engine WEDGED: `{}` has held it for {}s, past the {}s ceiling for phase \
+                             `{}`. An ONNX Runtime call cannot be cancelled from outside, so /health now reports \
+                             status \"wedged\" and new requests are refused with this reason instead of queueing. \
+                             Recovery: POST /unload, or restart the sidecar (WEDGE_EXIT=1 makes this process \
+                             exit on its own).",
+                            holder.label,
+                            elapsed.as_secs(),
+                            policy.ceiling(holder.phase).as_secs(),
+                            holder.phase.name()
+                        );
+                    }
+                    WedgeAction::Exit => {
+                        tracing::error!(
+                            "{engine} engine wedged for {}s in `{}` — WEDGE_EXIT is set, so this process is \
+                             exiting with code {WEDGE_EXIT_CODE} for the host to restart it. Nothing inside this \
+                             process can free a thread stuck in the ONNX Runtime C++ call.",
+                            elapsed.as_secs(),
+                            holder.label
+                        );
+                        std::process::exit(WEDGE_EXIT_CODE);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Engines that have been built, keyed by the sequence cap baked into them.
@@ -260,12 +558,23 @@ impl<T> EngineSlot for RungCache<T> {
 /// it has nothing to key on.
 struct Engines {
     embed: Mutex<RungCache<Bgem3DualEmbedding>>,
+    /// What holds `embed` right now — read WITHOUT taking `embed`, which is the only way a wedged
+    /// holder can ever be observed. See `InFlight`.
+    embed_inflight: Mutex<Option<InFlight>>,
     rerank: Mutex<Option<TextRerank>>,
+    /// The same, for the reranker: the two engines have separate mutexes and can be in flight at once,
+    /// so one shared stamp would let a rerank overwrite the record of a wedged embed.
+    rerank_inflight: Mutex<Option<InFlight>>,
 }
 
 impl Engines {
     fn new(cache_rungs: usize) -> Self {
-        Self { embed: Mutex::new(RungCache::new(cache_rungs)), rerank: Mutex::new(None) }
+        Self {
+            embed: Mutex::new(RungCache::new(cache_rungs)),
+            embed_inflight: Mutex::new(None),
+            rerank: Mutex::new(None),
+            rerank_inflight: Mutex::new(None),
+        }
     }
 }
 
@@ -431,13 +740,47 @@ fn token_usage(state: &AppState, texts: &[String], max_length: usize) -> TokenUs
     let Some(tokenizer) = state.token_counter() else {
         return TokenUsage { max_length, ..TokenUsage::default() };
     };
-    let counts: Vec<usize> = texts
+    usage_from_counts(count_tokens(tokenizer, texts, "embed"), max_length)
+}
+
+/// Counts each text, keeping a REFUSAL as `None` instead of folding it to `0` — and saying so in the
+/// log.
+///
+/// The fold used to be `.map(|e| e.len()).unwrap_or(0)`, silently, in both places that count. A text
+/// the tokenizer refused was then reported as 0 tokens and `truncated: false` — "measured, and
+/// definitely not truncated", which is the exact inversion of the only guarantee this accounting
+/// exists to give. The host owns no tokenizer, so it has no second opinion to check that against.
+fn count_tokens(tokenizer: &tokenizers::Tokenizer, texts: &[String], what: &str) -> Vec<Option<usize>> {
+    texts
         .iter()
-        .map(|t| tokenizer.encode(t.as_str(), true).map(|e| e.len()).unwrap_or(0))
-        .collect();
+        .map(|text| match tokenizer.encode(text.as_str(), true) {
+            Ok(encoded) => Some(encoded.len()),
+            Err(e) => {
+                tracing::warn!(
+                    "{what}: the tokenizer refused a text of {} char(s) ({e}) — reporting the count as UNKNOWN \
+                     rather than as zero, which a caller reads as proof that nothing was truncated",
+                    text.len()
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Folds per-text counts into the wire shape, keeping UNKNOWN distinct from CLEAN.
+///
+/// One refusal turns accounting off for the WHOLE response, because that is the distinction this file
+/// already models one level up (`token_accounting: false` = NOT MEASURED, both arrays empty) and the
+/// only one the host understands. A per-text hole would have to be invented on the wire, and every
+/// caller that did not learn about it would read the hole as a zero — the defect again, with an extra
+/// field. Conservative in the right direction: the batch reads as unmeasured, never as proven clean.
+fn usage_from_counts(counts: Vec<Option<usize>>, max_length: usize) -> TokenUsage {
+    let Some(measured) = counts.into_iter().collect::<Option<Vec<usize>>>() else {
+        return TokenUsage { max_length, ..TokenUsage::default() };
+    };
     TokenUsage {
-        truncated: counts.iter().map(|&n| n > max_length).collect(),
-        token_count: counts,
+        truncated: measured.iter().map(|&n| n > max_length).collect(),
+        token_count: measured,
         max_length,
         token_accounting: true,
     }
@@ -551,6 +894,20 @@ async fn main() {
         token_counter: OnceLock::new(),
         qwen_counter: OnceLock::new(),
     });
+
+    tracing::info!(
+        "wedge detector: a build is slow-but-alive for up to {}s, a forward pass for {}s; past that /health \
+         reports status \"wedged\" and new requests are refused with the reason. Process exit on a wedge is {} \
+         (WEDGE_EXIT)",
+        state.config.wedge.building_after.as_secs(),
+        state.config.wedge.running_after.as_secs(),
+        match state.config.wedge.exit_after_wedged {
+            Some(after) => format!("ON, {}s after the verdict", after.as_secs()),
+            None => "OFF".to_string(),
+        }
+    );
+    prewarm_provenance();
+    spawn_wedge_watchdog(state.clone());
 
     let app = Router::new()
         .route("/health", get(health))
@@ -911,6 +1268,9 @@ struct RerankResponse {
 
 #[derive(Serialize)]
 struct HealthResponse {
+    /// `"ok"`, or `"wedged"` once an engine has been held past its phase's ceiling. Deliberately not a
+    /// constant: a health endpoint that always says "ok" cannot report the one failure that matters
+    /// here (reliability.md § "Health endpoints tell the truth and never block").
     status: &'static str,
     /// What the sidecar is doing right now: "idle", "dense: building session…", "sparse:
     /// embedding N row(s)". Lets the host UI show "compiling models" instead of a dead card
@@ -933,14 +1293,26 @@ struct HealthResponse {
     provider_ready: bool,
     /// The last EP registration failure, verbatim. `null` when none was recorded.
     last_provider_error: Option<String>,
-    /// SHA-256 of the executable serving this response. Empty only when `current_exe()` is unreadable.
-    /// A benchmark records it so a later run can prove it measured the same binary — an installed
-    /// sidecar older than its commit is invisible to every other field here.
-    exe_sha256: &'static str,
+    /// SHA-256 of the executable serving this response. Empty when `current_exe()` is unreadable — or
+    /// when `provenance_ready` is false and it has simply not been computed yet. A benchmark records it
+    /// so a later run can prove it measured the same binary; an installed sidecar older than its commit
+    /// is invisible to every other field here.
+    exe_sha256: String,
     /// SHA-256 over the sorted `name:sha256` manifest of the dynamic libraries beside the executable.
-    /// Empty when none were found. Identical executables with different provider libraries are
-    /// different runtimes, and this is the field that says so.
-    runtime_manifest_sha256: &'static str,
+    /// Empty when none were found (or not yet computed — see `provenance_ready`). Identical executables
+    /// with different provider libraries are different runtimes, and this is the field that says so.
+    runtime_manifest_sha256: String,
+    /// The two hashes above are FINAL. False = the startup task is still hashing, so an empty hash means
+    /// "not yet", not "unreadable". They are computed on the blocking pool at startup precisely because
+    /// the first /health used to compute them inline — 1.4 s over 67 MB of test binaries, and a CUDA
+    /// deployment is gigabytes (cuDNN alone often >500 MB) — on a Tokio reactor thread.
+    provenance_ready: bool,
+    /// The engine work in flight right now, one entry per engine that is held. THE window into the one
+    /// wait this process cannot cancel: without it a wedged inference and a healthy multi-minute build
+    /// looked identical from outside.
+    in_flight: Vec<InFlightWire>,
+    /// Any engine past its ceiling. The single boolean a host can route on.
+    wedged: bool,
     loaded: LoadedModels,
     models: ModelNames,
     /// The memory envelope in force — the defaults plus the cap the loaded engines actually carry, so the
@@ -956,6 +1328,48 @@ struct LoadedModels {
     dense: bool,
     sparse: bool,
     rerank: bool,
+}
+
+/// One held engine, as /health reports it.
+#[derive(Serialize)]
+struct InFlightWire {
+    /// `"embed"` | `"rerank"`.
+    engine: &'static str,
+    /// `"building"` | `"running"` — the ceilings differ by an order of magnitude, so the phase has to
+    /// travel with the elapsed time or the number cannot be judged.
+    phase: &'static str,
+    /// What the holder said it was doing, verbatim from `activity`.
+    activity: String,
+    elapsed_seconds: u64,
+    /// The ceiling this phase is judged against, so a reader needs no access to the configuration.
+    ceiling_seconds: u64,
+    /// Past that ceiling: no longer "slow but alive". A first-ever MIGraphX shape compile is minutes of
+    /// CORRECT slowness and must never read as this — which is why `building` gets an hour.
+    wedged: bool,
+}
+
+impl InFlightWire {
+    fn of(engine: &'static str, holder: &InFlight, policy: WedgePolicy) -> Self {
+        let elapsed = holder.since.elapsed();
+        let ceiling = policy.ceiling(holder.phase);
+        Self {
+            engine,
+            phase: holder.phase.name(),
+            activity: holder.label.clone(),
+            elapsed_seconds: elapsed.as_secs(),
+            ceiling_seconds: ceiling.as_secs(),
+            wedged: elapsed >= ceiling,
+        }
+    }
+}
+
+/// Every engine currently held, with its verdict. Reads only the tiny stamp mutexes, never an engine
+/// lock — a probe that queued behind the wedge it is meant to report would be the defect itself.
+fn in_flight_now(state: &AppState) -> Vec<InFlightWire> {
+    [("embed", &state.engines.embed_inflight), ("rerank", &state.engines.rerank_inflight)]
+        .into_iter()
+        .filter_map(|(engine, slot)| inflight_now(slot).map(|holder| InFlightWire::of(engine, &holder, state.config.wedge)))
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -1003,6 +1417,17 @@ fn bad_request(error: String) -> ApiError {
     (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
 }
 
+/// Maps an inference failure to its status code. A wedged or busy engine is **503**, not 500: nothing
+/// is wrong with the request, the card is unavailable RIGHT NOW, and a host that degrades or retries on
+/// 503 while treating 500 as a hard failure can only act on the difference if we make it.
+fn engine_error(err: anyhow::Error) -> ApiError {
+    if err.downcast_ref::<EngineWedged>().is_some() {
+        tracing::warn!("refusing a request: {err:#}");
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: format!("{err:#}") }));
+    }
+    internal_error(err)
+}
+
 /// The message out of a `spawn_blocking` panic — the payload is the only place the actual reason
 /// (a failed expect deep in ort/fastembed, an allocation failure) survives, and it belongs in the
 /// operator's log instead of an opaque "task panicked".
@@ -1030,8 +1455,14 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     // `loaded_now` follows. A busy lock reads as "unknown yet", which is honest.
     let active = state.active_provider.try_lock().ok().and_then(|a| a.clone());
     let last_error = state.last_provider_error.try_lock().ok().and_then(|e| e.clone());
+    let in_flight = in_flight_now(&state);
+    let wedged = in_flight.iter().any(|held| held.wedged);
+    // Read, never compute: the hashes are prewarmed on the blocking pool at startup. This endpoint is
+    // a readiness probe, and a probe that SHA-256s every provider library beside the exe on its first
+    // call reports nothing, slowly, from a reactor thread.
+    let provenance = PROVENANCE.get();
     Json(HealthResponse {
-        status: "ok",
+        status: if wedged { "wedged" } else { "ok" },
         activity: state.activity.try_lock().map(|a| a.clone()).unwrap_or_else(|_| "busy".to_string()),
         provider: active.clone().unwrap_or_else(|| requested.clone()),
         requested_provider: requested,
@@ -1039,8 +1470,11 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         provider_ready: active.is_some(),
         active_provider: active,
         last_provider_error: last_error,
-        exe_sha256: exe_sha256(),
-        runtime_manifest_sha256: runtime_manifest_sha256(),
+        exe_sha256: provenance.map(|p| p.exe_sha256.clone()).unwrap_or_default(),
+        runtime_manifest_sha256: provenance.map(|p| p.runtime_manifest_sha256.clone()).unwrap_or_default(),
+        provenance_ready: provenance.is_some(),
+        in_flight,
+        wedged,
         loaded: LoadedModels {
             // Both heads are served by the ONE dual engine, so the two flags mirror it — the wire
             // shape stays as the C# host (SidecarEmbedder.UnloadAsync) asserts it.
@@ -1118,44 +1552,98 @@ async fn unload(State(state): State<Arc<AppState>>, body: Bytes) -> Json<HealthR
         return health(State(state)).await;
     };
 
-    // Take each engine out under its lock, then drop OUTSIDE the lock in a blocking task: ort session
-    // teardown can take a moment, and a poisoned lock (a panicked load) counts as "nothing to unload".
-    let (embed, rerank) = if req.is_full_drain() {
-        // EVERY resident rung goes, not just the current one — a rung left behind would keep holding
-        // the card the lease is handing to an exclusive LLM.
-        (
-            state.engines.embed.lock().map(|mut g| g.drain()).unwrap_or_default(),
-            state.engines.rerank.lock().map(|mut g| g.take()).unwrap_or(None),
-        )
-    } else {
-        let embed = state
-            .engines
-            .embed
-            .lock()
-            .map(|mut g| req.embed_max_lengths.iter().filter_map(|&cap| g.remove(cap).map(|e| (cap, e))).collect())
-            .unwrap_or_default();
-        let rerank = if req.rerank == Some(true) {
-            state.engines.rerank.lock().map(|mut g| g.take()).unwrap_or(None)
-        } else {
-            None
-        };
-        (embed, rerank)
-    };
+    // The ACQUISITION moved onto the blocking pool with the teardown, and it acquired a ceiling.
+    // Both halves answer one incident class: /unload took the blocking engine mutex directly on a Tokio
+    // WORKER thread, so the operator's only recovery tool — which also serves the host's GPU-lease
+    // coordinator — queued on the very mutex a hung request was holding. With Tokio's default worker
+    // count a handful of such calls starved the whole HTTP server, /health included, so the one endpoint
+    // that could have explained the freeze went down with it. The same file had already solved exactly
+    // this for /health (`loaded_now`); /unload was left behind.
+    let worker = state.clone();
+    let drained = tokio::task::spawn_blocking(move || drain_engines(&worker, &req))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("unload task panicked: {}", join_error_text(e));
+            Drained::default()
+        });
 
-    let dropped_rungs: Vec<usize> = embed.iter().map(|(cap, _)| *cap).collect();
-    let dropped = [embed.len(), usize::from(rerank.is_some())];
-    tokio::task::spawn_blocking(move || {
-        drop(embed);
-        drop(rerank);
-    })
-    .await
-    .ok();
     let resident: Vec<usize> = state.engines.embed.try_lock().map(|g| g.caps()).unwrap_or_default();
     tracing::info!(
         "unloaded engines (embed rung(s) {:?}, rerank: {}) — resident rung(s) now: {:?}",
-        dropped_rungs, dropped[1], resident
+        drained.embed_rungs, drained.rerank, resident
     );
+    if !drained.refused.is_empty() {
+        // Loud, because a PARTIAL handover read as a complete one is how an exclusive LLM ends up
+        // sharing the card with a session that never let go. The body says so too: `loaded` still
+        // reports the engine, and `in_flight` names what is holding it.
+        tracing::warn!(
+            "/unload could not take {:?} within {}s — those engines are STILL LOADED and this response says so \
+             (`loaded`/`in_flight`). Whoever asked for the card must not assume it was released.",
+            drained.refused,
+            state.config.wedge.unload_wait.as_secs()
+        );
+    }
     health(State(state)).await
+}
+
+/// What one `/unload` actually moved.
+#[derive(Default)]
+struct Drained {
+    embed_rungs: Vec<usize>,
+    rerank: bool,
+    /// Engines /unload could NOT take before its ceiling. Reported so a caller can never read a partial
+    /// handover as a complete one.
+    refused: Vec<&'static str>,
+}
+
+/// Takes the named engines out under their locks and drops them OUTSIDE those locks.
+///
+/// Runs entirely on the blocking pool (see `unload`): ort session teardown is not instant, and both the
+/// wait and the drop would otherwise sit on a reactor thread. The drop-outside-the-lock shape is the
+/// pre-existing correct design and is preserved deliberately — holding an engine mutex through a
+/// teardown would block the very /health that reports the handover.
+fn drain_engines(state: &AppState, req: &UnloadRequest) -> Drained {
+    let policy = state.config.wedge;
+    let patience = Patience::AtMost(policy.unload_wait);
+    let mut drained = Drained::default();
+
+    // EVERY resident rung goes on a full drain, not just the current one — a rung left behind would keep
+    // holding the card the lease is handing to an exclusive LLM.
+    if req.is_full_drain() || !req.embed_max_lengths.is_empty() {
+        match lock_or_refuse(&state.engines.embed, &state.engines.embed_inflight, "embed", policy, patience) {
+            Ok(mut guard) => {
+                let taken: Vec<(usize, Bgem3DualEmbedding)> = if req.is_full_drain() {
+                    guard.drain()
+                } else {
+                    req.embed_max_lengths.iter().filter_map(|&cap| guard.remove(cap).map(|e| (cap, e))).collect()
+                };
+                drop(guard);
+                drained.embed_rungs = taken.iter().map(|(cap, _)| *cap).collect();
+                drop(taken);
+            }
+            Err(e) => {
+                tracing::warn!("/unload: {e:#}");
+                drained.refused.push("embed");
+            }
+        }
+    }
+
+    if req.is_full_drain() || req.rerank == Some(true) {
+        match lock_or_refuse(&state.engines.rerank, &state.engines.rerank_inflight, "rerank", policy, patience) {
+            Ok(mut guard) => {
+                let taken = guard.take();
+                drop(guard);
+                drained.rerank = taken.is_some();
+                drop(taken);
+            }
+            Err(e) => {
+                tracing::warn!("/unload: {e:#}");
+                drained.refused.push("rerank");
+            }
+        }
+    }
+
+    drained
 }
 
 async fn embed(
@@ -1182,7 +1670,7 @@ async fn embed(
     set_activity(&shared, "idle");
     let result = outcome
         .map_err(|e| internal_error(anyhow::anyhow!("embed task panicked: {}", join_error_text(e))))?
-        .map_err(internal_error)?;
+        .map_err(engine_error)?;
     Ok(Json(result))
 }
 
@@ -1208,11 +1696,13 @@ async fn tokenize(
         return Ok(Json(TokenizeResponse { token_count: vec![], model: model.to_string(), available: false }));
     };
 
-    let token_count = req
-        .texts
-        .iter()
-        .map(|t| tokenizer.encode(t.as_str(), true).map(|e| e.len()).unwrap_or(0))
-        .collect();
+    // Same rule as /embed's accounting: one refusal makes the whole answer UNKNOWN rather than zero.
+    // A caller asks here precisely so it can split BEFORE anything is capped, and a `0` it cannot tell
+    // from an empty text is worse than an honest "not measured".
+    let Some(token_count) = count_tokens(tokenizer, &req.texts, "tokenize").into_iter().collect::<Option<Vec<usize>>>()
+    else {
+        return Ok(Json(TokenizeResponse { token_count: vec![], model: model.to_string(), available: false }));
+    };
     Ok(Json(TokenizeResponse { token_count, model: model.to_string(), available: true }))
 }
 
@@ -1238,7 +1728,7 @@ async fn rerank(
     set_activity(&shared, "idle");
     let result = outcome
         .map_err(|e| internal_error(anyhow::anyhow!("rerank task panicked: {}", join_error_text(e))))?
-        .map_err(internal_error)?;
+        .map_err(engine_error)?;
     Ok(Json(result))
 }
 
@@ -1266,8 +1756,13 @@ fn should_pin_shape(setting: &str, provider: &str) -> bool {
 /// A sequence guaranteed to exceed any `max_length` we allow (8192 tokens max), so the tokenizer
 /// truncates it to EXACTLY the cap. One of these in a batch makes `PaddingStrategy::BatchLongest`
 /// pad the whole batch to the cap — which is how `pin_shape` gets a constant shape.
-fn ruler_text() -> String {
-    "lorem ipsum dolor sit amet ".repeat(4096)
+///
+/// Built ONCE and shared: it is ~110 KB of constant text, and every pinned request used to allocate a
+/// fresh copy and then clone it once per chunk — at `max_batch` 64 that is megabytes of pure
+/// allocation per request for a value that never changes.
+fn ruler_text() -> &'static str {
+    static RULER: OnceLock<String> = OnceLock::new();
+    RULER.get_or_init(|| "lorem ipsum dolor sit amet ".repeat(4096)).as_str()
 }
 
 /// How many runs of the SAME real batch a request gets before it fails. Measured behaviour is that
@@ -1423,7 +1918,7 @@ fn embed_blocking(
     // first run a freshly built session returns.
     let retry_short = should_pin_shape(&state.config.pin_input_shape, &provider);
     if retry_short && limits.max_batch >= 2 {
-        let (expanded, positions) = pin_shape(&texts, limits.max_batch, &ruler_text());
+        let (expanded, positions) = pin_shape(&texts, limits.max_batch, ruler_text());
         tracing::info!(
             "embed request: {} text(s), pinned to {} row(s) of ({}, {}) for {provider}",
             texts.len(), expanded.len(), limits.max_batch, limits.max_length
@@ -1466,20 +1961,29 @@ fn embed_natural(
     set_activity(state, "embed: waiting for the engine");
     // Queue wait is measured around the MUTEX only — another request holding the engine is the
     // caller's infrastructure wait, and it must never blend into the inference span below.
-    let waited = std::time::Instant::now();
-    let mut guard = lock_healing(&state.engines.embed, "embed");
+    let waited = Instant::now();
+    let mut guard = lock_or_refuse(
+        &state.engines.embed,
+        &state.engines.embed_inflight,
+        "embed",
+        state.config.wedge,
+        Patience::UntilTheHolderIsWedged,
+    )?;
     let queue_wait_ms = waited.elapsed().as_millis() as u64;
+    // From here the engine is OURS, and the stamp is what makes a wedge UNDER it observable — /health
+    // reads it without ever touching the engine lock. It clears itself on every exit, `?` included.
+    let stamp = InFlightStamp::hold(state, &state.engines.embed_inflight);
     let mut session_build_ms = 0u64;
     if guard.get_mut(limits.max_length).is_none() {
-        set_activity(state, "embed: building and canary-checking the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
-        let building = std::time::Instant::now();
+        stamp.enter(Phase::Building, "embed: building and canary-checking the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
+        let building = Instant::now();
         let built = load_validated_dual(state, provider_hint, limits, retry_short)?;
         remember_engine(&mut guard, "embed", limits.max_length, built);
         session_build_ms = building.elapsed().as_millis() as u64;
     }
-    set_activity(state, format!("embed: embedding {} row(s)", texts.len()));
+    stamp.enter(Phase::Running, format!("embed: embedding {} row(s)", texts.len()));
     // The duration below includes any settling re-runs — that is honest: it is what the caller waited.
-    let (cache_before, pass) = (mxr_cache_mb(&state.config.mxr_cache_base), std::time::Instant::now());
+    let (cache_before, pass) = (mxr_cache_mb(&state.config.mxr_cache_base), Instant::now());
     let engine = guard.get_mut(limits.max_length).expect("just loaded");
     // Rows are (dense, sparse) ZIPPED per text, so the settling retry polices one length and a short
     // first run can never shorten one head without the other.
@@ -1526,17 +2030,26 @@ fn rerank_blocking(
 ) -> anyhow::Result<RerankResponse> {
     set_activity(state, "rerank: waiting for the engine");
     // Queue wait around the MUTEX only, exactly as the embed path measures it.
-    let waited = std::time::Instant::now();
-    let mut guard = lock_healing(&state.engines.rerank, "rerank");
+    let waited = Instant::now();
+    let mut guard = lock_or_refuse(
+        &state.engines.rerank,
+        &state.engines.rerank_inflight,
+        "rerank",
+        state.config.wedge,
+        Patience::UntilTheHolderIsWedged,
+    )?;
     let queue_wait_ms = waited.elapsed().as_millis() as u64;
+    // Its own stamp, not the embed one: the two engines have separate mutexes and can be in flight at
+    // the same time, so a shared record would let one overwrite the other's wedge.
+    let stamp = InFlightStamp::hold(state, &state.engines.rerank_inflight);
     let mut session_build_ms = 0u64;
     if guard.is_none() {
-        set_activity(state, "rerank: building the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
-        let building = std::time::Instant::now();
+        stamp.enter(Phase::Building, "rerank: building the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
+        let building = Instant::now();
         *guard = Some(load_rerank(state, provider_hint)?);
         session_build_ms = building.elapsed().as_millis() as u64;
     }
-    set_activity(state, format!("rerank: scoring {} document(s)", documents.len()));
+    stamp.enter(Phase::Running, format!("rerank: scoring {} document(s)", documents.len()));
 
     // Shape pinning, exactly as the embed path does it and for the same provider: fastembed forms
     // (query, document) pairs and pads each chunk to ITS longest member, so under MIGraphX every distinct
@@ -1549,7 +2062,7 @@ fn rerank_blocking(
         .cloned()
         .unwrap_or_else(|| effective_provider(&state.config, provider_hint));
     if should_pin_shape(&state.config.pin_input_shape, &provider) && max_batch >= 2 {
-        let (expanded, positions) = pin_shape(&documents, max_batch, &ruler_text());
+        let (expanded, positions) = pin_shape(&documents, max_batch, ruler_text());
         tracing::info!(
             "rerank request: {} document(s), pinned to {} row(s) of ({}, {}) for {provider}",
             documents.len(), expanded.len(), max_batch, state.config.rerank_max_length
@@ -1691,28 +2204,62 @@ fn with_engine_cache<T>(base: &str, engine: &str, build: impl FnOnce() -> anyhow
     build()
 }
 
-/// Locks an engine slot, HEALING a poisoned mutex instead of failing forever. A panic inside a
-/// model load (fastembed/ort) unwinds while the guard is held and poisons the lock; the old
-/// `map_err(_ -> "engine poisoned")` then failed EVERY later request until a process restart —
-/// a live Fast pass ground through thousands of methods with "sparse engine poisoned" on each
-/// batch, Succeeded=0. One panic must cost one failed request, not the rest of the process: clear
-/// the poison, drop whatever half-built state the panic left, and let the caller reload.
-fn lock_healing<'a, S: EngineSlot>(engine: &'a Mutex<S>, what: &str) -> std::sync::MutexGuard<'a, S> {
-    match engine.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            engine.clear_poison();
-            let mut guard = poisoned.into_inner();
-            guard.discard_all();
-            // Dropping the engine is the conservative choice — we cannot tell from the poison alone
-            // whether the session itself is broken. But a panic in POST-PROCESSING poisons the mutex
-            // just as a failed load does, and then this costs a ~60s rebuild per request forever. So
-            // the inference paths must return errors rather than panic; see the shape guard in
-            // vendor-fastembed/src/sparse_text_embedding/impl.rs. EVERY resident rung goes, for the same
-            // reason: the poison says nothing about WHICH engine the panic touched.
-            tracing::warn!("{what} engine mutex was poisoned by a panic while it was held — cleared it, rebuilding the engine (~1 min); if this repeats every request, something in the embed path is panicking rather than erroring");
-            guard
+/// Acquires an engine slot with a CEILING, healing a poisoned mutex and refusing a wedged one.
+///
+/// Three failures meet here, and they need three different answers:
+///
+/// 1. **Poisoned** — a panic inside a model load (fastembed/ort) unwound while the guard was held. The
+///    old `map_err(_ -> "engine poisoned")` failed EVERY later request until a process restart: a live
+///    Fast pass ground through thousands of methods answering "sparse engine poisoned", Succeeded=0.
+///    One panic must cost one request, so clear the poison, drop whatever half-built state it left, and
+///    let the caller reload. Dropping is the conservative choice — the poison says nothing about WHICH
+///    engine the panic touched, nor whether the session itself is broken — but it means a panic in
+///    POST-PROCESSING costs a ~60 s rebuild per request, so the inference paths must return errors
+///    rather than panic (see the shape guard in vendor-fastembed/src/sparse_text_embedding/impl.rs).
+/// 2. **Held by a healthy holder** — a first-ever shape compile is minutes of CORRECT slowness. Wait.
+/// 3. **Held by a WEDGED holder** — a thread stuck inside the ONNX Runtime C++ call. It never panics,
+///    so case 1 can never see it, and the mutex is simply never released. Before this, every caller
+///    queued on `.lock()` forever. Refuse, with the holder's activity and elapsed time in the message.
+///
+/// `Patience` decides how case 2 ends: the inference path waits as long as the holder is alive, /unload
+/// waits a bounded time. A hold that nothing STAMPED falls back to `running_after` under either — the
+/// missing ceiling is the defect, so the fallback has to exist even when the stamp does not.
+fn lock_or_refuse<'a, S: EngineSlot>(
+    engine: &'a Mutex<S>,
+    inflight: &Mutex<Option<InFlight>>,
+    what: &str,
+    policy: WedgePolicy,
+    patience: Patience,
+) -> anyhow::Result<std::sync::MutexGuard<'a, S>> {
+    let waiting_since = Instant::now();
+    loop {
+        match engine.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                engine.clear_poison();
+                let mut guard = poisoned.into_inner();
+                guard.discard_all();
+                tracing::warn!("{what} engine mutex was poisoned by a panic while it was held — cleared it, rebuilding the engine (~1 min); if this repeats every request, something in the embed path is panicking rather than erroring");
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
+
+        let holder = inflight_now(inflight);
+        let (activity, held_for) = holder
+            .as_ref()
+            .map_or_else(|| (String::new(), waiting_since.elapsed()), |h| (h.label.clone(), h.since.elapsed()));
+        let ceiling = holder.as_ref().map_or(policy.running_after, |h| policy.ceiling(h.phase));
+        if held_for >= ceiling {
+            anyhow::bail!(EngineWedged { what: what.to_string(), activity, elapsed: held_for, wedged: true });
+        }
+        if let Patience::AtMost(limit) = patience {
+            let waited = waiting_since.elapsed();
+            if waited >= limit {
+                anyhow::bail!(EngineWedged { what: what.to_string(), activity, elapsed: waited, wedged: false });
+            }
+        }
+        std::thread::sleep(policy.poll);
     }
 }
 
@@ -1827,7 +2374,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// absorbs the shape's expensive first run before any real batch pays for it.
 fn canary_check(engine: &mut Bgem3DualEmbedding, limits: Limits, pin: bool) -> anyhow::Result<()> {
     let (texts, position) = if pin && limits.max_batch >= 2 {
-        let (expanded, positions) = pin_shape(&[CANARY_TEXT.to_string()], limits.max_batch, &ruler_text());
+        let (expanded, positions) = pin_shape(&[CANARY_TEXT.to_string()], limits.max_batch, ruler_text());
         (expanded, positions[0])
     } else {
         (vec![CANARY_TEXT.to_string()], 0)
@@ -2047,20 +2594,70 @@ fn sha256_file(path: &Path) -> Option<String> {
     Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Build provenance: what binary is answering, and which provider libraries stand behind it.
+struct Provenance {
+    exe_sha256: String,
+    runtime_manifest_sha256: String,
+}
+
+/// Computed exactly once, at STARTUP, on the blocking pool — never on a request path. `None` until
+/// that task lands, which /health reports as `provenance_ready: false`.
+static PROVENANCE: OnceLock<Provenance> = OnceLock::new();
+
+/// Hashes the executable and the libraries beside it. Blocking and unbounded by design: on a
+/// CUDA/DirectML deployment this is hundreds of MB to gigabytes (cuDNN alone is often >500 MB).
+fn compute_provenance() -> Provenance {
+    Provenance { exe_sha256: compute_exe_sha256(), runtime_manifest_sha256: compute_runtime_manifest_sha256() }
+}
+
+/// Starts the hashing off the request path.
+///
+/// The incident class: the first `/health` call used to compute both hashes INLINE on a Tokio reactor
+/// thread — measured at 1.4 s over a mere 67 MB of test binaries, and a real CUDA install is orders of
+/// magnitude more — which is exactly the blocking work this endpoint's own design forbids a few lines
+/// above (`loaded_now`'s try_lock, written after a hung load froze /health forever). A readiness probe
+/// that hashes gigabytes reports nothing, slowly, while occupying a thread the server needs.
+///
+/// The outer task exists so the fault is OBSERVED: a detached `spawn_blocking` whose JoinHandle nobody
+/// awaits is a hash that silently never happens, and /health would then say `provenance_ready: false`
+/// forever with no line in the log saying why.
+fn prewarm_provenance() {
+    tokio::spawn(async {
+        let started = Instant::now();
+        match tokio::task::spawn_blocking(|| PROVENANCE.set(compute_provenance()).is_ok()).await {
+            Ok(_) => tracing::info!(
+                "build provenance hashed in {:.1}s (off the request path): exe {}, runtime manifest {}",
+                started.elapsed().as_secs_f32(),
+                short_hash(PROVENANCE.get().map(|p| p.exe_sha256.as_str()).unwrap_or_default()),
+                short_hash(PROVENANCE.get().map(|p| p.runtime_manifest_sha256.as_str()).unwrap_or_default()),
+            ),
+            Err(e) => tracing::warn!(
+                "build provenance could not be computed ({}) — /health will keep reporting provenance_ready: \
+                 false, which is honest but leaves a benchmark unable to prove which binary it measured",
+                join_error_text(e)
+            ),
+        }
+    });
+}
+
+/// A hash short enough to read in a log line; `(none)` when there is nothing to shorten.
+fn short_hash(hash: &str) -> &str {
+    match hash.len() {
+        0 => "(none)",
+        _ => &hash[..hash.len().min(12)],
+    }
+}
+
 /// SHA-256 of the executable THIS PROCESS is running from.
 ///
 /// Read via `current_exe()`, never from a configured path or an environment variable: the whole point
 /// is to catch the case where the installed binary is not the one the build produced, and a value the
-/// launcher supplies describes the binary somebody INTENDED to start. Computed once — on Windows the
-/// running image is locked, so it cannot change underneath itself.
-fn exe_sha256() -> &'static str {
-    static SHA: OnceLock<String> = OnceLock::new();
-    SHA.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| sha256_file(&p))
-            .unwrap_or_default()
-    })
+/// launcher supplies describes the binary somebody INTENDED to start.
+fn compute_exe_sha256() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| sha256_file(&p))
+        .unwrap_or_default()
 }
 
 /// SHA-256 over the manifest of every dynamic library sitting beside the executable.
@@ -2071,42 +2668,39 @@ fn exe_sha256() -> &'static str {
 /// by name and newline-joined, so the order the filesystem happens to enumerate them in is never
 /// mistaken for a change. Names are lower-cased: Windows paths are case-insensitive and a
 /// differently-cased listing is not a different runtime.
-fn runtime_manifest_sha256() -> &'static str {
-    static SHA: OnceLock<String> = OnceLock::new();
-    SHA.get_or_init(|| {
-        use sha2::Digest;
-        let Ok(entries) = std::fs::read_dir(exe_dir()) else {
-            return String::new();
-        };
+fn compute_runtime_manifest_sha256() -> String {
+    use sha2::Digest;
+    let Ok(entries) = std::fs::read_dir(exe_dir()) else {
+        return String::new();
+    };
 
-        let mut rows: Vec<String> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("dll") || ext.eq_ignore_ascii_case("so"))
-            })
-            .filter_map(|path| {
-                let name = path.file_name()?.to_str()?.to_ascii_lowercase();
-                Some(format!("{name}:{}", sha256_file(&path)?))
-            })
-            .collect();
+    let mut rows: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("dll") || ext.eq_ignore_ascii_case("so"))
+        })
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+            Some(format!("{name}:{}", sha256_file(&path)?))
+        })
+        .collect();
 
-        if rows.is_empty() {
-            // No libraries beside the executable is a real fact about a misdeployed install, but it is
-            // not a manifest — hashing nothing would let two unrelated deployments agree.
-            return String::new();
-        }
+    if rows.is_empty() {
+        // No libraries beside the executable is a real fact about a misdeployed install, but it is
+        // not a manifest — hashing nothing would let two unrelated deployments agree.
+        return String::new();
+    }
 
-        rows.sort();
-        sha2::Sha256::new()
-            .chain_update(rows.join("\n").as_bytes())
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    })
+    rows.sort();
+    sha2::Sha256::new()
+        .chain_update(rows.join("\n").as_bytes())
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Records the OUTCOME of a session build. Success promotes the provider to `active`; failure stores
@@ -2163,13 +2757,90 @@ fn execution_providers(provider: &str, cuda_device_id: i32, dml_device_id: i32) 
 mod tests {
     use super::{
         aligned_scores, cache_dir_verdict, compiled_providers, dylib_verdict, effective_provider, engine_cache_dir,
-        execution_providers, copy_missing_files, embed_settling, find_tokenizer_file, join_error_text, loaded_now,
-        lock_healing, cap_for, load_token_counter, parse_unload_request, pass_log_message, pin_shape,
-        preflight_provider, rerank_batch, required_provider_libraries, should_pin_shape, unpin_rows,
-        with_engine_cache, Config, EmbedResponse, PassTimings, RungCache, TokenUsage, SETTLE_ATTEMPTS,
+        execution_providers, copy_missing_files, embed_settling, find_tokenizer_file, health, inflight_now,
+        join_error_text, loaded_now, lock_or_refuse, cap_for, load_token_counter, parse_unload_request,
+        pass_log_message, pin_shape, preflight_provider, rerank_batch, required_provider_libraries, ruler_text,
+        should_pin_shape, unload, unpin_rows, usage_from_counts, wedge_action, with_engine_cache, write_inflight,
+        AppState, Config, EmbedResponse, Engines, InFlight, PassTimings, Patience, Phase, Provenance,
+        RungCache, TokenUsage, WedgeAction, WedgePolicy, SETTLE_ATTEMPTS,
     };
+    use axum::body::Bytes;
+    use axum::extract::State;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// Wedge ceilings scaled down to milliseconds so the tests measure the RULE rather than the clock.
+    /// The shipped values (15 min / 60 min / 30 s) are asserted separately, from the env defaults.
+    fn test_wedge_policy() -> WedgePolicy {
+        WedgePolicy {
+            running_after: Duration::from_millis(300),
+            building_after: Duration::from_millis(600),
+            unload_wait: Duration::from_millis(200),
+            poll: Duration::from_millis(10),
+            exit_after_wedged: None,
+        }
+    }
+
+    /// An in-flight record that started `ago` in the past — the injected clock these tests need, without
+    /// a clock abstraction: `Instant` arithmetic is the whole of it.
+    fn stamped(phase: Phase, label: &str, ago: Duration) -> InFlight {
+        InFlight {
+            phase,
+            label: label.to_string(),
+            since: Instant::now().checked_sub(ago).expect("the process started after the epoch"),
+        }
+    }
+
+    /// A sidecar state with no engines and no GPU behind it. Every reliability test here exercises
+    /// the LOCKS and the probe path, never the model, so an empty state is the whole subject.
+    fn app_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            engines: Engines::new(2),
+            config: config(""),
+            activity: Mutex::new("idle".to_string()),
+            pinned_provider: OnceLock::new(),
+            active_provider: Mutex::new(None),
+            last_provider_error: Mutex::new(None),
+            loaded_embed_max_length: Mutex::new(None),
+            loaded_max_batch: Mutex::new(None),
+            adapter: None,
+            token_counter: OnceLock::new(),
+            qwen_counter: OnceLock::new(),
+        })
+    }
+
+    /// Holds an engine mutex from another thread until it is told to let go — the shape of a thread
+    /// WEDGED inside the ORT/MIGraphX C++ call, which is the one failure the poison healing can never
+    /// see: a stuck thread does not panic, so the mutex is never poisoned, only never released.
+    struct HeldEngine {
+        release: mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeldEngine {
+        fn hold<S: Send + 'static>(engine: Arc<AppState>, pick: fn(&AppState) -> &Mutex<S>) -> Self {
+            let (release, released) = mpsc::channel::<()>();
+            let (holding, held) = mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                let _guard = pick(&engine).lock().expect("fresh lock");
+                holding.send(()).expect("announce the hold");
+                released.recv().ok();
+            });
+            held.recv().expect("the engine is held");
+            Self { release, thread: Some(thread) }
+        }
+    }
+
+    impl Drop for HeldEngine {
+        fn drop(&mut self) {
+            self.release.send(()).ok();
+            if let Some(thread) = self.thread.take() {
+                thread.join().ok();
+            }
+        }
+    }
 
     fn config(provider: &str) -> Config {
         Config {
@@ -2184,6 +2855,7 @@ mod tests {
             pin_input_shape: "auto".to_string(),
             mxr_cache_base: String::new(),
             engine_cache_rungs: 2,
+            wedge: test_wedge_policy(),
         }
     }
 
@@ -2504,25 +3176,6 @@ mod tests {
 
         // A short result must fail loudly rather than misalign.
         assert!(unpin_rows(vec!["only-one".to_string()], &positions).is_err());
-    }
-
-    /// A panicked load poisons the engine mutex; the pre-fix behavior then failed EVERY request
-    /// until a process restart — a live Fast pass answered "sparse engine poisoned" for hours with
-    /// Succeeded=0. Healing must clear the poison, drop the half-built state, and leave the lock
-    /// usable for the reload.
-    #[test]
-    fn a_poisoned_engine_lock_heals_instead_of_failing_forever() {
-        let engine: Mutex<Option<u8>> = Mutex::new(Some(7));
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = engine.lock().expect("fresh lock");
-            panic!("load blew up mid-flight");
-        }));
-        assert!(panicked.is_err() && engine.is_poisoned(), "precondition: the panic poisoned the lock");
-
-        let guard = lock_healing(&engine, "test");
-        assert!(guard.is_none(), "half-built state is dropped so the caller reloads");
-        drop(guard);
-        assert!(engine.lock().is_ok(), "poison is cleared for every later request");
     }
 
     /// Dense, sparse, and rerank run the SAME graph at the SAME pinned shape, so the EP's cache
@@ -2882,5 +3535,287 @@ mod tests {
         assert!(!usage.token_accounting);
         assert!(usage.token_count.is_empty());
         assert!(usage.truncated.is_empty());
+    }
+
+    // ---------- 24/7 reliability: no unbounded wait, no blind probe (2026-08-16) --------------
+
+    /// /unload is the operator's ONLY recovery tool and the host's GPU-lease handover, so it has to
+    /// ANSWER while an engine is held — it used to take the blocking mutex directly on a Tokio worker
+    /// thread, so a handful of calls against a stuck engine starved every worker and took /health down
+    /// with them. Two worker threads: one the handler can occupy, one for the timer that catches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unload_answers_while_the_engine_is_held() {
+        let state = app_state();
+        let held = HeldEngine::hold(state.clone(), |s| &s.engines.embed);
+
+        // The handler runs as its OWN task on purpose: a future that blocks inside `.lock()` never
+        // returns to the executor, so a timeout wrapped straight around it could not fire either —
+        // which IS the starvation under test, and would hang this test instead of failing it.
+        let handler = tokio::spawn(async move { unload(State(state), Bytes::new()).await });
+        let answered = tokio::time::timeout(Duration::from_secs(2), handler).await;
+
+        // Release before asserting, whatever the verdict: a worker still blocked on the mutex would
+        // keep the runtime from shutting down and turn a red test into a hung one.
+        drop(held);
+        let body = answered
+            .expect("/unload must answer while the engine is held, never queue on it")
+            .expect("the unload task must not panic");
+        assert!(body.0.loaded.dense, "and it must answer HONESTLY: an engine it could not take is still loaded");
+    }
+
+    /// A thread STUCK inside the ORT/MIGraphX C++ call never panics, so the poison healing can never
+    /// reach it: the mutex is not poisoned, it is simply never released. /health must be able to SAY
+    /// so — before this, a wedged engine and a healthy idle one answered with the same `status`, which
+    /// is exactly why a system-wide freeze was invisible from the outside.
+    #[tokio::test]
+    async fn health_reports_wedged_once_an_inference_exceeds_the_threshold() {
+        let state = app_state();
+        let idle = health(State(state.clone())).await.0;
+
+        // A cold compile: MINUTES here are correct, and must keep reading as "ok". This is the case the
+        // ceilings are chosen around, and the one a naive watchdog would have called a hang.
+        write_inflight(
+            &state.engines.embed_inflight,
+            Some(stamped(Phase::Building, "embed: building and canary-checking the session", Duration::from_millis(50))),
+        );
+        let building = health(State(state.clone())).await.0;
+        assert_eq!(building.status, "ok", "a build inside its ceiling is slow but alive");
+        assert!(!building.wedged && !building.in_flight[0].wedged);
+
+        // The same phase, past its ceiling.
+        write_inflight(
+            &state.engines.embed_inflight,
+            Some(stamped(Phase::Building, "embed: building and canary-checking the session", Duration::from_secs(9))),
+        );
+        let wedged = health(State(state)).await.0;
+
+        assert_ne!(wedged.status, idle.status, "a wedged engine must not answer /health exactly as an idle one");
+        assert_eq!(wedged.status, "wedged");
+        assert!(wedged.wedged, "the one boolean a host can route on");
+        assert_eq!(wedged.in_flight[0].engine, "embed");
+        assert_eq!(wedged.in_flight[0].phase, "building");
+        assert!(wedged.in_flight[0].activity.contains("canary-checking"), "the operator sees WHAT is stuck");
+        assert!(wedged.in_flight[0].elapsed_seconds >= 9, "and for how long: {:?}", wedged.in_flight[0].elapsed_seconds);
+        assert!(idle.in_flight.is_empty(), "an idle sidecar reports nothing in flight");
+    }
+
+    /// The request path had no deadline of any kind: every /embed behind a wedged inference queued on
+    /// `.lock()` forever, and the daemon's deliberately infinite HTTP timeout turned that into a
+    /// system-wide freeze nobody could see. A request must be REFUSED with a reason instead.
+    #[test]
+    fn a_request_refuses_instead_of_queueing_behind_a_wedged_inference() {
+        let state = app_state();
+        let _held = HeldEngine::hold(state.clone(), |s| &s.engines.embed);
+        write_inflight(
+            &state.engines.embed_inflight,
+            Some(stamped(Phase::Running, "embed: embedding 64 row(s)", Duration::from_secs(30))),
+        );
+
+        let asked = Instant::now();
+        let Err(refused) = lock_or_refuse(
+            &state.engines.embed,
+            &state.engines.embed_inflight,
+            "embed",
+            state.config.wedge,
+            Patience::UntilTheHolderIsWedged,
+        ) else {
+            panic!("a wedged engine must refuse, not queue");
+        };
+        let waited = asked.elapsed();
+
+        assert!(waited < Duration::from_millis(200), "the refusal is immediate, not another wait: {waited:?}");
+        let text = format!("{refused:#}");
+        assert!(text.contains("WEDGED"), "{text}");
+        assert!(text.contains("embed: embedding 64 row(s)"), "the reason names what is holding it: {text}");
+        assert!(text.contains("/unload"), "and how to recover: {text}");
+    }
+
+    /// The counter-guarantee, and the reason the ceilings are minutes rather than seconds: a FIRST-EVER
+    /// MIGraphX shape compile is minutes of CORRECT slowness (measured 214 s on an R9700). A waiter must
+    /// ride that out — refusing it would fail an index pass that was about to succeed.
+    #[test]
+    fn a_request_still_queues_behind_a_cold_compile_that_is_slow_but_alive() {
+        let state = app_state();
+        let held = HeldEngine::hold(state.clone(), |s| &s.engines.embed);
+        // Well inside the 600 ms building ceiling this test config carries.
+        write_inflight(
+            &state.engines.embed_inflight,
+            Some(stamped(Phase::Building, "embed: building the session", Duration::from_millis(10))),
+        );
+
+        let waiter = state.clone();
+        let (answered, outcome) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let taken = lock_or_refuse(
+                &waiter.engines.embed,
+                &waiter.engines.embed_inflight,
+                "embed",
+                waiter.config.wedge,
+                Patience::UntilTheHolderIsWedged,
+            );
+            answered.send(taken.is_ok()).ok();
+        });
+
+        assert!(
+            outcome.recv_timeout(Duration::from_millis(80)).is_err(),
+            "a healthy build must NOT be refused — the waiter is supposed to still be waiting"
+        );
+        drop(held);
+        assert_eq!(outcome.recv_timeout(Duration::from_secs(2)), Ok(true), "and it gets the engine once the build ends");
+        thread.join().ok();
+    }
+
+    /// A hold that nothing stamped still needs a ceiling — a missing stamp is exactly the case where a
+    /// wait would otherwise be unbounded again, so the fallback must not depend on the record existing.
+    #[test]
+    fn an_unstamped_hold_is_still_refused_at_the_running_ceiling() {
+        let state = app_state();
+        let _held = HeldEngine::hold(state.clone(), |s| &s.engines.rerank);
+
+        let asked = Instant::now();
+        let Err(refused) = lock_or_refuse(
+            &state.engines.rerank,
+            &state.engines.rerank_inflight,
+            "rerank",
+            state.config.wedge,
+            Patience::UntilTheHolderIsWedged,
+        ) else {
+            panic!("an unstamped hold cannot be waited on forever either");
+        };
+
+        assert!(asked.elapsed() >= state.config.wedge.running_after, "it waited the fallback ceiling out first");
+        assert!(format!("{refused:#}").contains("rerank"), "{refused:#}");
+        assert!(inflight_now(&state.engines.rerank_inflight).is_none(), "precondition: nothing had stamped it");
+    }
+
+    /// Poison healing is UNCHANGED by the deadline: a panicked load still costs ONE request, never the
+    /// process. Before it existed, a live Fast pass answered "sparse engine poisoned" for hours with
+    /// Succeeded=0 — and a stuck thread is a different failure precisely because it never gets here.
+    #[test]
+    fn a_poisoned_engine_lock_still_heals_under_the_deadline() {
+        let engine: Mutex<Option<u8>> = Mutex::new(Some(7));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = engine.lock().expect("fresh lock");
+            panic!("load blew up mid-flight");
+        }));
+        assert!(panicked.is_err() && engine.is_poisoned(), "precondition: the panic poisoned the lock");
+
+        let inflight = Mutex::new(None);
+        let guard = lock_or_refuse(&engine, &inflight, "test", test_wedge_policy(), Patience::UntilTheHolderIsWedged)
+            .expect("a poisoned lock heals rather than refusing");
+        assert!(guard.is_none(), "half-built state is dropped so the caller reloads");
+        drop(guard);
+        assert!(engine.lock().is_ok(), "poison is cleared for every later request");
+    }
+
+    /// The three verdicts, and the ordering that matters most: the OPT-IN exit is measured from the
+    /// wedge verdict, never from the phase start. An exit ceiling shorter than the (hour-long) build
+    /// ceiling would otherwise kill the process mid-compile — the one action guaranteed to leave a
+    /// corrupt program in the compiled-model cache, which is the 2026-07-31 incident the canary exists
+    /// for.
+    #[test]
+    fn the_wedge_verdict_spares_a_cold_compile_and_never_exits_before_it_reports() {
+        let off = WedgePolicy { exit_after_wedged: None, ..test_wedge_policy() };
+        assert_eq!(wedge_action(Phase::Building, Duration::from_millis(500), off), WedgeAction::Nothing);
+        assert_eq!(wedge_action(Phase::Running, Duration::from_millis(500), off), WedgeAction::Report);
+        assert_eq!(
+            wedge_action(Phase::Building, Duration::from_secs(600), off),
+            WedgeAction::Report,
+            "the exit is OPT-IN: with it off, a wedge is only ever reported"
+        );
+
+        // Opted in, with an exit ceiling far SHORTER than the build ceiling — the dangerous combination.
+        let on = WedgePolicy { exit_after_wedged: Some(Duration::from_millis(100)), ..test_wedge_policy() };
+        assert_eq!(
+            wedge_action(Phase::Building, Duration::from_millis(550), on),
+            WedgeAction::Nothing,
+            "a build inside its ceiling is never exited on, however short the exit ceiling is"
+        );
+        assert_eq!(wedge_action(Phase::Building, Duration::from_millis(650), on), WedgeAction::Report);
+        assert_eq!(wedge_action(Phase::Building, Duration::from_millis(750), on), WedgeAction::Exit);
+    }
+
+    /// The shipped ceilings, asserted from the env defaults rather than from the test config: a build
+    /// gets an hour because it legitimately contains a cold compile plus a wipe-and-recompile, a pass
+    /// gets 15 minutes (~1.5x the slowest honest one on record), and the process exit is OFF.
+    #[test]
+    fn the_shipped_ceilings_leave_room_for_a_cold_compile_and_default_to_never_exiting() {
+        let shipped = Config::from_env().wedge;
+
+        assert_eq!(shipped.ceiling(Phase::Running), Duration::from_secs(900));
+        assert_eq!(shipped.ceiling(Phase::Building), Duration::from_secs(3600));
+        assert!(
+            shipped.ceiling(Phase::Building) > shipped.ceiling(Phase::Running),
+            "a compile is slower than a pass, and conflating them is what would flag correct slowness"
+        );
+        assert_eq!(shipped.unload_wait, Duration::from_secs(30), "/unload answers the lease coordinator, not never");
+        assert_eq!(shipped.exit_after_wedged, None, "the process exit is opt-in (WEDGE_EXIT) and OFF by default");
+    }
+
+    /// /health is a readiness probe: it must do ZERO blocking work inline. The first call used to
+    /// SHA-256 the executable AND every provider library beside it (cuDNN alone is often >500 MB) on
+    /// a Tokio reactor thread — a probe that hashes gigabytes is a probe that reports nothing.
+    #[tokio::test]
+    async fn the_first_health_probe_never_hashes_the_binaries_inline() {
+        let state = app_state();
+
+        let started = Instant::now();
+        let answer = health(State(state)).await.0;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "the first /health took {elapsed:?} — it hashed the executable and every library beside it on the probe path"
+        );
+        // Nothing prewarmed it in a test process, so the honest answer is "not yet", never a made-up hash.
+        assert!(!answer.provenance_ready, "an unhashed provenance says so instead of pretending");
+        assert!(answer.exe_sha256.is_empty(), "and leaves the field empty rather than inventing a value");
+    }
+
+    /// The provenance READER never computes — that is the whole fix. A local cell, so the assertion is
+    /// about the rule rather than about which test in this binary happened to run first.
+    #[test]
+    fn reading_provenance_never_computes_it() {
+        let cell: OnceLock<Provenance> = OnceLock::new();
+
+        assert!(cell.get().is_none(), "a fresh cell holds nothing");
+
+        cell.set(Provenance { exe_sha256: "abc".to_string(), runtime_manifest_sha256: "def".to_string() })
+            .map_err(|_| "already set")
+            .expect("the startup task sets it once");
+        assert_eq!(cell.get().map(|p| p.exe_sha256.as_str()), Some("abc"));
+    }
+
+    /// The whole point of token accounting is a TRUSTWORTHY truncation signal, so an encode failure
+    /// folded to `0` tokens is the exact inversion of the contract: it reads as "measured, and
+    /// definitely not truncated". Unknown must stay unknown.
+    #[test]
+    fn an_unencodable_text_is_reported_as_unknown_rather_than_zero_tokens() {
+        let usage = usage_from_counts(vec![Some(10), None, Some(300)], 256);
+
+        assert!(!usage.token_accounting, "one refusal makes the whole answer UNMEASURED");
+        assert!(usage.token_count.is_empty() && usage.truncated.is_empty(), "and empties the arrays with it");
+        assert_eq!(usage.max_length, 256, "the cap they would have been judged against still travels");
+
+        // The refuted approach, reproduced so the defect stays visible in the suite: the shipped fold was
+        // `.map(|e| e.len()).unwrap_or(0)`, which reported the refused text as 0 tokens and NOT truncated —
+        // "measured, and definitely nothing lost", from the one signal the host cannot compute itself.
+        let folded: Vec<usize> = [Ok(10usize), Err("refused"), Ok(300usize)]
+            .into_iter()
+            .map(|encoded| encoded.unwrap_or(0))
+            .collect();
+        assert_eq!((folded[1], folded[1] > 256), (0, false), "which is exactly what it claimed");
+
+        // A clean batch still measures, truncation flags and all.
+        let clean = usage_from_counts(vec![Some(10), Some(300)], 256);
+        assert!(clean.token_accounting);
+        assert_eq!(clean.truncated, vec![false, true]);
+    }
+
+    /// ~110 KB of constant text, cloned once per chunk of every pinned request. One allocation, shared.
+    #[test]
+    fn the_ruler_is_allocated_once_and_shared() {
+        assert!(std::ptr::eq(ruler_text(), ruler_text()), "the same buffer, not a fresh copy per request");
+        assert!(ruler_text().len() > 100_000, "still long enough to truncate to any cap we allow");
     }
 }

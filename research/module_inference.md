@@ -1,7 +1,7 @@
 # Module — inference
 
 > `src/main.rs`: `Engines`, `RungCache`, `Limits`, `embed_blocking`, `embed_natural`, `rerank_blocking`,
-> `score_documents`, `pin_shape`, `embed_settling`. The system as it is, 2026-08-15.
+> `score_documents`, `pin_shape`, `embed_settling`, `lock_or_refuse`. The system as it is, 2026-08-16.
 
 ## Purpose
 
@@ -22,12 +22,14 @@ flowchart TD
     PIN -->|no| NATURAL
     RULER --> NATURAL["embed_natural"]
 
-    NATURAL --> WAIT["lock_healing(engines.embed)<br/>⏱ queue_wait_ms"]
-    WAIT --> RESIDENT{"rung resident?"}
-    RESIDENT -->|no| BUILD["load_validated_dual<br/>⏱ session_build_ms"]
+    NATURAL --> WAIT["lock_or_refuse(engines.embed)<br/>⏱ queue_wait_ms"]
+    WAIT -->|holder past its ceiling| REFUSE["503 EngineWedged<br/>names the activity + elapsed"]
+    WAIT --> STAMP["InFlightStamp — what holds it, since when"]
+    STAMP --> RESIDENT{"rung resident?"}
+    RESIDENT -->|no| BUILD["load_validated_dual<br/>⏱ session_build_ms — phase `building`"]
     RESIDENT -->|yes| RUN
     BUILD --> REMEMBER["remember_engine — LRU insert"]
-    REMEMBER --> RUN["embed_settling → engine.embed<br/>⏱ inference_ms"]
+    REMEMBER --> RUN["embed_settling → engine.embed<br/>⏱ inference_ms — phase `running`"]
     RUN --> GROWTH["mxr_cache_mb delta ⇒ compile_cache_grew_mb"]
     GROWTH --> UNZIP["unzip (dense, sparse) per text"]
     UNZIP --> UNPIN{"was pinned?"}
@@ -40,7 +42,9 @@ flowchart TD
 
 | Type | Role |
 |---|---|
-| `Engines` | Two mutex-guarded slots: `embed: Mutex<RungCache<Bgem3DualEmbedding>>`, `rerank: Mutex<Option<TextRerank>>` |
+| `Engines` | Two mutex-guarded slots — `embed: Mutex<RungCache<Bgem3DualEmbedding>>`, `rerank: Mutex<Option<TextRerank>>` — each paired with its own `Mutex<Option<InFlight>>` stamp, read **without** taking the engine |
+| `InFlight` / `InFlightStamp` | The holder's phase, label and start instant; RAII, so `?` and panics clear it. The only thing that can see a wedge, because it lives outside the mutex the wedge is under |
+| `WedgePolicy` | The ceilings: `building` 3600 s, `running` 900 s, `/unload` 30 s, poll 50 ms, opt-in process exit (default off) |
 | `RungCache<T>` | One engine per `max_length` ("rung"), least-recently-**used** eviction, capacity from `EMBED_ENGINE_CACHE_RUNGS` |
 | `Limits` | `max_length` (clamped 16…8192) and `max_batch` (≥ 1), resolved per request over the configured defaults |
 | `PassTimings` | `queue_wait_ms`, `session_build_ms`, `inference_ms`, `compile_cache_grew_mb` |
@@ -58,6 +62,8 @@ flowchart TD
 | `cap_for(kind, requested, loaded)` | A `query` may never move the loaded cap — it arrives interleaved with index passes |
 | `pin_shape` / `unpin_rows` | Splice ruler rows to one constant shape, then strip them |
 | `embed_settling` | Re-runs the same batch when a freshly built session returns a short one |
+| `lock_or_refuse` | Every engine acquisition: heals poison, waits while the holder is alive, refuses (`503`) once it is wedged |
+| `wedge_action` / `spawn_wedge_watchdog` | The verdict, and the log line that reports it without being asked |
 
 ## Measured decisions
 
@@ -72,6 +78,9 @@ flowchart TD
 | Per-engine EP cache directory | The dense, sparse and rerank engines run the same graph at the same pinned shape, so the EP's cache key collided; a sparse session loaded another engine's program and died on `index < dim` (2026-07-27) |
 | Rows zipped per text | The settling retry polices one length, so a short first run cannot shorten one head without the other |
 | Timing spans measured separately | Queue wait and session build are both infrastructure wait, but the remedies differ — concurrency against warm-up — and one bucket for both explains neither |
+| Wedge ceilings 900 s / 3600 s, not seconds | A first-ever shape compile is 214 s of CORRECT slowness, a first rerank pass 92–162 s, and the slowest honest first request on record ~608 s. A ceiling below those would refuse work that was about to succeed |
+| The process-exit last resort is opt-in and OFF | Exiting mid-compile is exactly how a corrupt `.mxr` reaches the cache (2026-07-31), so the exit ceiling is measured **from the wedge verdict**, never from the phase start |
+| The ruler string is one `OnceLock` allocation | ~110 KB rebuilt per pinned request and cloned per padding row — megabytes of allocator work per request, in the flavour that exists to avoid expensive work |
 
 ## Dependencies
 
@@ -86,3 +95,9 @@ Inline `#[cfg(test)] mod tests` in `main.rs`: the rung cache's hand-back, ladder
 behaviour and LRU eviction order; `pin_shape`/`unpin_rows` round-tripping; `embed_settling` costing
 exactly one run when settled; `aligned_scores` returning document order; `cap_for`; the pass log line;
 and the `PassTimings` wire field names.
+
+The wedge guards are tested with a held mutex and an `Instant` moved into the past — no GPU, no clock
+abstraction: a wedged holder is refused within milliseconds and the message names it; a **healthy** cold
+compile is still waited out (the counter-guarantee, and the reason the ceilings are minutes); an
+unstamped hold still hits the fallback ceiling; poison still heals under the deadline; and the shipped
+ceilings are asserted from the env defaults so a stray override cannot green them.

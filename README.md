@@ -45,7 +45,7 @@ Model files (~2.2 GB for bge-m3 FP32 + the reranker) download from Hugging Face 
 |---|---|---|
 | `POST /embed` | `{ "texts": ["..."], "kind": "doc"\|"query", "provider": "auto\|cuda\|dml\|migraphx\|cpu"?, "request_id": "..."? }` | `{ "dense": [[f32]], "sparse": [{ "indices": [u32], "values": [f32] }], "token_count": [usize], "truncated": [bool], "max_length": usize, "token_accounting": bool, "request_id": "...", "timings": {...} }` |
 | `POST /rerank` | `{ "query": "...", "documents": ["..."], "provider": ...?, "request_id": "..."? }` | `{ "scores": [f32] (input order), "request_id": "...", "timings": {...} }` |
-| `GET /health` | — | `{ "status", "provider", "loaded": {...}, "models": {...}, "adapter": { "name", "vram_mb", "luid", "requested_device", "dml_device_id" } \| null }` |
+| `GET /health` | — | `{ "status": "ok"\|"wedged", "wedged", "in_flight": [...], "provider", "provenance_ready", "loaded": {...}, "models": {...}, "adapter": { "name", "vram_mb", "luid", "requested_device", "dml_device_id" } \| null }` |
 
 `kind` is accepted for contract compatibility; BGE-M3 embeds queries and documents identically.
 
@@ -77,6 +77,12 @@ Absent ⇒ empty echo, unprefixed logs.
 | `EMBED_MAX_LENGTH` | 1024 | Default token cap for both embedding engines — **the VRAM driver, squared in the peak below**. **Overridable per request** (`max_length`); a change evicts the loaded engines so they rebuild at the new cap. |
 | `RERANK_MAX_LENGTH` | 1024 | Token cap for reranker pairs |
 | `MODEL_CACHE_DIR` | `.model-cache` | Where model files download to |
+| `WEDGE_RUNNING_AFTER_SECONDS` | 900 | A forward pass held longer than this is **wedged** — see below |
+| `WEDGE_BUILDING_AFTER_SECONDS` | 3600 | The same for a session build + canary, which legitimately contains a multi-minute compile |
+| `UNLOAD_LOCK_WAIT_SECONDS` | 30 | How long `/unload` waits for an engine before answering "still loaded" |
+| `WEDGE_POLL_MS` | 50 | How often a waiter re-checks the lock and the holder's stamp |
+| `WEDGE_EXIT` | *(off)* | `1` = exit the process on a wedge so the host restarts it. **Opt-in**, and off by default |
+| `WEDGE_EXIT_AFTER_SECONDS` | = `WEDGE_RUNNING_AFTER_SECONDS` | How long **after the wedge verdict** the exit fires (never from the phase start — exiting mid-compile corrupts the `.mxr` cache) |
 
 The provider chosen at the **first model load** is pinned until restart (`/health` reports it) —
 execution provider is machine-level hardware config; changing the setting requires a sidecar restart.
@@ -118,6 +124,42 @@ request and for a bare `cargo run`.
 `v2.Web.Contracts/Models/SidecarMemoryModels.cs` (`SidecarMemory`) — with tests in
 `tests/v2.Tests/Rag/SidecarMemoryTests.cs`.
 
+## The wedge detector: the one wait this process cannot cancel (2026-08-16)
+
+An ONNX Runtime forward pass **cannot be cancelled**. It is a C++ call on a thread this process does not
+own, and a thread merely *stuck* inside it never panics — so the poison-healing lock, which recovers a
+mutex a *panic* poisoned, can never reach it. Until this landed, nothing else could either: every later
+`/embed` queued on `.lock()` forever, `/health` reported the freeze exactly as it reports a healthy
+multi-minute build, and the daemon's deliberately infinite sidecar HTTP timeout composed the two into a
+system-wide freeze with no symptom anyone could observe.
+
+The remedy is visibility plus a ceiling, not cancellation:
+
+- **The holder stamps itself** — what it is doing and since when — in a mutex of its own, never inside
+  the engine slot. A holder wedged *under* the engine mutex could never be observed *through* it.
+- **`/health` says so.** `status` flips to `"wedged"`, `wedged: true`, and `in_flight[]` carries
+  `{ engine, phase, activity, elapsed_seconds, ceiling_seconds, wedged }` per held engine.
+- **New requests fail fast** with `503` and a message naming the activity, the elapsed time and how to
+  recover — instead of queueing behind a mutex that will never be released.
+- **The log says it unasked**, once per wedge: the party that would otherwise have polled `/health` is
+  precisely the one already blocked.
+- **`/unload` still answers.** It waits on the blocking pool with a ceiling, never on a reactor thread,
+  and an engine it could not take stays loaded and is reported as such.
+
+### Why the ceilings are minutes, not seconds
+
+A **false** "wedged" is expensive in both directions, so the numbers are deliberately generous:
+
+| Phase | Ceiling | Why |
+|---|---|---|
+| `running` | 900 s | Warm passes are seconds (1.6 s at a 256 cap, 6.8 s at 1024). The slowest *honest* one on record is ~608 s — a first request that also paid a lazy MIGraphX compile plus its settling retries — and a first rerank pass compiles 92–162 s with no canary ahead of it. 900 s is ~1.5× the worst honest case |
+| `building` | 3600 s | This phase legitimately contains the cold compile (**214 s measured**), up to three canary runs, and — on a corrupt cache — a wipe plus one clean recompile with a canary of its own |
+
+**A first-ever MIGraphX shape compile is correct slowness and must never be flagged.** That is also why
+the process-exit last resort is opt-in and off: killing a process mid-compile is exactly how a corrupt
+`.mxr` reaches the compiled-model cache, which is the 2026-07-31 incident the build canary exists for.
+When it *is* enabled, its ceiling is measured from the wedge verdict, never from the phase start.
+
 ## Token accounting: why `/embed` reports what it tokenized (2026-08-13)
 
 An input longer than `max_length` is **truncated to a prefix by the tokenizer and embedded as though that
@@ -132,11 +174,13 @@ So every `/embed` reply now carries, parallel to `texts`:
 | `token_count[]` | What each text really cost, special tokens included, measured **before** the cap — so a value above `max_length` is exactly the overflow that was discarded. |
 | `truncated[]` | The model saw a prefix of this text. |
 | `max_length` | The **effective** cap they were judged against (after `cap_for`, which forbids a `query` from moving the loaded rung). |
-| `token_accounting` | `false` = NOT MEASURED (the tokenizer would not load). The two arrays are then empty, and a caller must not read "no truncation reported" as "nothing was truncated". |
+| `token_accounting` | `false` = NOT MEASURED — the tokenizer would not load, **or it refused one of the texts**. The two arrays are then empty, and a caller must not read "no truncation reported" as "nothing was truncated". |
 
 The counter is BGE-M3's own `tokenizer.json`, read from the model cache on first use purely to count; it
 never feeds inference. A missing file logs a warning at startup and turns accounting off rather than
-failing the sidecar.
+failing the sidecar. A text the tokenizer *refuses* does the same for that response: the count used to be
+folded to `0`, which reads as "measured, and definitely not truncated" — the exact inversion of the only
+guarantee this accounting exists to give, on the one signal the host cannot compute for itself.
 
 **What it is for.** The host (`SidecarEmbedder`) turns any reported truncation into
 `EmbedInputTruncatedException`, which fails the index run with an operator-readable diagnosis instead of
