@@ -1,6 +1,6 @@
 # PLAN — the reliability tail the 24/7 audit left open
 
-> Status: **partially implemented, 2026-08-16 — items 2, 3, 4, 6 and 7 are done; items 1, 5 and 8 remain
+> Status: **partially implemented, 2026-08-16 — items 2, 3, 4, 6, 7 and 8 are done; items 1 and 5 remain
 > open.** Item 1 (the MIGraphX cache race) is the only correctness hazard left, and it is the one item
 > that **cannot be verified on this machine** — it is feature-gated behind an AMD toolchain that itself
 > needs an ONNX Runtime built from source. Scope: `src/main.rs` throughout.
@@ -9,10 +9,11 @@
 > fixed in a separate task (2026-08-16) and are **not** in this plan. That task also took item 3 on the
 > way past, because it was one line in a function it was already editing.
 >
-> **Re-anchored 2026-08-16 against `d0139b1` (`src/main.rs`, 3 821 lines).** Every reference below was
-> re-read at that revision, not re-derived from the original audit. `a44e00e` leaves that file
-> byte-identical, so the references hold there too — but item 2 shipped after the re-anchoring and moved
-> the numbers again; see the note under item 8.
+> **Re-anchored twice.** First on 2026-08-16 against `d0139b1`, because the CRITICAL/HIGH fix commit had
+> moved every line the original audit cited. Then again after item 8 split `main.rs` into 17 modules —
+> the two remaining items now point at `compile_cache.rs`, `canary.rs`, `inference.rs` and
+> `bookkeeping.rs`, because the file they were written against no longer holds that code. Re-anchoring
+> the open items is part of finishing a change here, not a later tidy-up.
 >
 > Related: `.claude/rules/shared/common/reliability.md` (the doctrine this audit produced),
 > [README.md](../README.md) (the incident history most of this file's machinery answers),
@@ -39,22 +40,24 @@ left open — which is its own lesson: the audit read the code, but not every co
 
 ### 1. The MIGraphX cache path is protected across the build but not the first inference — HIGH
 
-`src/main.rs:2193-2205`, `with_engine_cache`, serializes on a `BUILD_ENV_LOCK` while it sets the
+`src/compile_cache.rs:87-99`, `with_engine_cache`, serializes on a `BUILD_ENV_LOCK` while it sets the
 process-global `ORT_MIGRAPHX_MODEL_CACHE_PATH` / `ORT_MIGRAPHX_CACHE_PATH` and builds the session.
-But this file's own comments (`:2143-2147`, `:2470`, `:2496`) record that the execution provider reads
-and writes that cache **lazily, at the first kernel launch** — which happens *after*
-`with_engine_cache` has returned and released the lock: in `canary_check` via `load_validated_dual`
-(`:2418-2447`) for embed, and in `score_documents` (`:2089-2120`) for rerank.
+But the codebase's own comments (`compile_cache.rs:18`, `compile_cache.rs:36`, `provider.rs:35`,
+`provider.rs:61`) record that the execution provider reads and writes that cache **lazily, at the first
+kernel launch** — which happens *after* `with_engine_cache` has returned and released the lock: in
+`canary.rs:70` `canary_check`, reached via `canary.rs:113` `load_validated_dual`, for embed; and in
+`inference.rs:380` `score_documents` for rerank.
 
 `Engines.embed` and `Engines.rerank` are two independent mutexes, so an embed build and a rerank
 build legitimately run concurrently on two `spawn_blocking` threads — the ordinary situation right
 after a restart when the host hits both endpoints. If the other engine's build flips the env var in
 that window, engine A compiles or reads against engine B's cache directory. That is the 2026-07-27
-stale-cache incident (`:2183`, `:2447`) whose entire fix was per-engine subdirectories, reopened
+stale-cache incident (`compile_cache.rs:80`, `provider.rs:12`) whose entire fix was per-engine
+subdirectories, reopened
 through a timing gap the lock does not cover.
 
 **REVISED — the choice between the two fixes is already made, by a comment this plan's own audit
-walked past.** `with_engine_cache`'s doc comment (`:2189-2192`) reads:
+walked past.** `with_engine_cache`'s doc comment (`compile_cache.rs:83-86`) reads:
 
 > *The path travels via process env (the only knob this ROCm build honors — **it ignores the
 > provider-options fields**), so builds are serialized by a lock: two engines building at once would
@@ -73,7 +76,7 @@ types during a build — which is minutes, once, and only when both are cold.
 Keep fix 1 recorded as the preferred shape for a **future `ort` or ROCm upgrade**: it removes the
 hazard class rather than narrowing it, and the reason it is unavailable is a property of this build,
 not of the design. Re-test the provider-options fields whenever either is bumped, and update the
-comment at `:2189-2192` — it is the only place that finding lives.
+comment at `compile_cache.rs:83-86` — it is the only place that finding lives.
 
 Feature-gated to `migraphx` builds.
 
@@ -165,11 +168,11 @@ signal there is.
 
 ### 5. Two silent-degradation corners — LOW
 
-- `:1987` and `:2103` — `.expect("just loaded")`. Sound today: the same `MutexGuard` that inserted
+- `inference.rs:273` and `inference.rs:394` — `.expect("just loaded")`. Sound today: the same `MutexGuard` that inserted
   the entry is the only handle that can evict it, and `RungCache` capacity is `max(1)`. It is a
   latent panic the day a refactor separates the insert from the `get_mut`. **Fix:** a comment
   anchoring the invariant, so the next editor meets it. *(Still bare at both sites.)*
-- `:2279-2292` — `record_embed_max_length` / `record_max_batch` use `let Ok(mut x) = … else { return; }`
+- `bookkeeping.rs:14-39` — `record_embed_max_length` / `record_max_batch` / `record_embed_dimension` use `let Ok(mut x) = … else { return; }`
   with no log and no `clear_poison()`, unlike the engine mutexes which `lock_or_refuse` (`:2227`)
   explicitly un-poisons. If either is ever poisoned, `/health` stops reporting those two fields forever
   with no diagnostic trail. **Fix:** log the degradation at minimum; heal it like the engine locks if
@@ -265,7 +268,53 @@ afternoon that would not have been spent.
 a limit it will guess at), document it beside the other env vars, and log rejections. Shares its `/health`
 half with [PLAN_sidecar_product.md](PLAN_sidecar_product.md) phase 4, which records the same finding.
 
-### 8. `src/main.rs` is 3 821 lines — LOW severity, high friction
+### 8. `src/main.rs` was 4 744 lines — LOW severity, high friction · **DONE 2026-08-16**
+
+> **Split into 17 modules. The largest file is now 702 lines; `main.rs` is 264.** Done as its own
+> commit, mechanically, with `cargo test` green on both sides — 82 passed before, 82 passed after, and
+> zero compiler warnings in both the binary and the test build.
+>
+> | module | lines | what it owns |
+> |---|---|---|
+> | `logging` | 26 | the UTC day/clock the log path is named from |
+> | `config` | 135 | `Config`, the env readers, the model-name constants |
+> | `wedge` | 372 | `Phase`, `WedgePolicy`, `InFlight`, `EngineWedged`, the watchdog |
+> | `engine_cache` | 211 | `RungCache`, `EngineSlot` |
+> | `state` | 124 | `Engines`, `AppState`, `Limits` |
+> | `tokens` | 292 | the tokenizer registry and the counting path |
+> | `preflight` | 297 | ORT dylib + MIGraphX cache probes, model-cache seeding |
+> | `wire` | 476 | request/response types, `ApiError` |
+> | `introspection` | 565 | `/health`, `/models`, `/unload` — the routes that only READ |
+> | `handlers` | 391 | `/embed`, `/tokenize`, `/rerank` — the routes that COMPUTE |
+> | `inference` | 702 | pinning, settling, the blocking passes, `lock_or_refuse` |
+> | `compile_cache` | 208 | `CompileWatch`, `with_engine_cache`, the per-engine cache paths |
+> | `bookkeeping` | 122 | the recorders, `remember_engine`, `teardown_off_the_lock` |
+> | `canary` | 174 | reference vector, `cosine`, `canary_check` |
+> | `provider` | 435 | engine loading, provider preflight, provenance |
+> | `testing` | 193 | the shared fixtures (`app_state`, the wedge policy, the tokenizer fixture) |
+> | `main` | 264 | crate docs, the module list, `main`, `build_router`, the body-limit middleware |
+>
+> **Deviations from the table this plan drafted.** Two modules were split again rather than shipped over
+> the limit: `handlers` became `handlers` + `introspection` (compute routes against read-only routes) and
+> `inference` became `inference` + `compile_cache`. The drafted `loading` module is `bookkeeping`, and
+> `testing` did not exist in the draft — the 77 tests distributed to the module each one tests, as the
+> plan asked, but `app_state`/`config`/the tokenizer fixture are used from six modules and a fixture
+> copied per module is a fixture that drifts.
+>
+> **How it was verified as a pure move**, rather than asserted: every non-import statement of the original
+> 4 744-line file was counted and matched against the union of the new files — **0 lost**. The test names
+> were diffed the same way, which is how two tests dropped by the extraction script were caught and
+> restored (`unpinning_leaves_the_width_untouched`, `models_answers_while_an_engine_is_held`; both were
+> the last block in their file, and the parser was eating the closing brace). `/health`, `/models` and
+> `/tokenize` were then called against the rebuilt binary and answered byte-identically.
+>
+> Visibility is `pub(crate)` throughout — this is a binary crate with no external API, so the alternative
+> was a per-item audit that would have changed nothing observable.
+>
+> *(The growth record, kept because it is the argument for not deferring again: 2 887 at the audit →
+> 3 821 after the CRITICAL/HIGH fixes → 4 129 after the registry → 4 744 after `/models` and items 4, 6
+> and 7. Every one of those lines was added by this plan's own items, and each deferral was individually
+> defensible.)*
 
 **REVISED — the number, four times in two days.** The original draft said 2 887; the CRITICAL/HIGH fix
 commit reached **3 821**; item 2's registry **4 129**; `/models` plus items 4, 6 and 7 **4 744** — against
@@ -320,10 +369,11 @@ could be proven on this hardware was proven before starting the one item that ca
 
 1. **(1) the cache race** — the only correctness hazard left. The investigation the draft asked for is
    already answered (see the REVISED note): implement the widened serialization. Feature-gated, and see
-   the honesty clause in the test plan about what can be run here.
-2. **(5) the two comments/logs** — trivial, any time.
-3. **(8) the module split** — last, alone, no behaviour change. Note that it has grown with every item
-   above; see the note under item 8.
+   the honesty clause in the test plan about what can be run here. It now lands in `compile_cache.rs`,
+   208 lines, rather than in a 4 744-line file.
+2. **(5) the two comments/logs** — trivial, any time. Note that the three recorders it names are now
+   together in `bookkeeping.rs`, and they are near-identical: one shared writer would fix all three at
+   once rather than three times.
 
 ## Test plan
 
@@ -341,8 +391,9 @@ idiom to follow — fake clocks and held mutexes rather than a real GPU:
 | 6 | shipped as `an_evicted_engine_is_dropped_outside_the_lock` — RED first (`ThreadId(2)` against `ThreadId(2)`) |
 | 7 | shipped as `a_body_beyond_the_configured_limit_is_refused` (RED first: `200` against `413`) + `a_body_within_the_configured_limit_still_reaches_the_handler` + `health_reports_the_body_limit_it_enforces`; the log half was verified on the wire, not in a test |
 
-Item 8 asserts nothing new: the guarantee is that the existing suite is green before and after, and
-the diff contains no behaviour change.
+Item 8 asserted nothing new, as planned: the suite was green on both sides (82 before, 82 after) and
+the diff carried no behaviour change — proved by counting every statement of the old file against the
+union of the new ones (0 lost) and by calling the rebuilt binary's endpoints.
 
 Note honestly which items cannot be verified on this machine: the MIGraphX path is feature-gated and
 needs the AMD toolchain — and that toolchain currently needs an ONNX Runtime built from source with

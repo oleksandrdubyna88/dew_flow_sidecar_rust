@@ -1,7 +1,9 @@
 # Module — inference
 
-> `src/main.rs`: `Engines`, `RungCache`, `Limits`, `embed_blocking`, `embed_natural`, `rerank_blocking`,
-> `score_documents`, `pin_shape`, `embed_settling`, `lock_or_refuse`. The system as it is, 2026-08-16.
+> `src/inference.rs` (`embed_blocking`, `embed_natural`, `rerank_blocking`, `score_documents`,
+> `pin_shape`, `embed_settling`, `lock_or_refuse`), `src/engine_cache.rs` (`RungCache`),
+> `src/state.rs` (`Engines`, `Limits`), `src/compile_cache.rs` (`CompileWatch`, `with_engine_cache`)
+> and `src/bookkeeping.rs` (the recorders, `remember_engine`). The system as it is, 2026-08-16.
 
 ## Purpose
 

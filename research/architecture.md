@@ -1,6 +1,6 @@
 # Architecture — dew_flow_sidecar_rust (bge-sidecar)
 
-> The system **as it is**, 2026-08-15. Everything below is in the repository today; what is planned but
+> The system **as it is**, 2026-08-16. Everything below is in the repository today; what is planned but
 > absent is listed in [What does not exist yet](#what-does-not-exist-yet). Open work lives in
 > [../todo/](../todo/).
 
@@ -20,9 +20,16 @@ everywhere. The customer's machine builds the flavour it needs.
   `tokenizers`, `tracing`.
 - **Execution providers** — DirectML (default feature), CUDA, MIGraphX, CPU. Selected at **build** time;
   `ORT_PROVIDER` only chooses among the ones compiled in.
-- **Layout** — `src/main.rs` (~2 800 lines: config, state, engine cache, handlers, inference, preflight,
-  logging), `src/adapters.rs` (DXGI device resolution, Windows-only), `vendor-fastembed/` (a full
-  vendored copy carrying one marked patch).
+- **Layout** — **17 modules under `src/`**, none over 800 lines (2026-08-16; it was one 4 744-line
+  `main.rs` until then). `main.rs` keeps only the crate docs, the module list, `main`, `build_router`
+  and the body-limit middleware. The rest, by job: `config`, `state`, `wedge` (the wedge detector),
+  `engine_cache` (`RungCache`), `tokens` (the tokenizer registry), `preflight`, `wire` (request/response
+  records), `introspection` (`/health`, `/models`, `/unload` — the routes that only READ),
+  `handlers` (`/embed`, `/tokenize`, `/rerank` — the routes that COMPUTE), `inference`,
+  `compile_cache` (the MIGraphX cache paths and `with_engine_cache`), `bookkeeping`, `canary`,
+  `provider`, `logging`, and `testing` (shared test fixtures). Plus `src/adapters.rs` (DXGI device
+  resolution, Windows-only) and `vendor-fastembed/` (a full vendored copy carrying one marked patch).
+  Visibility is `pub(crate)` throughout: a binary crate has no external API to narrow.
 
 ## Containers
 
@@ -166,7 +173,7 @@ it. Measured 2026-07-28 at `(64, 1024)`: dense returned 80 rows for a 128-row in
 ### The engine cache
 
 `RungCache` holds one engine per `max_length`, least-recently-used eviction, capacity from
-`EMBED_ENGINE_CACHE_RUNGS` (default **1** — `src/main.rs:149`; this document said 2 until 2026-08-15, and 1 is the value that reproduces the pre-cache behaviour, so the two-rung ladder is opted IN rather than shipped). A Fast lane walks the ladder down and back up, crossing the
+`EMBED_ENGINE_CACHE_RUNGS` (default **1** — `src/config.rs:95`; this document said 2 until 2026-08-15, and 1 is the value that reproduces the pre-cache behaviour, so the two-rung ladder is opted IN rather than shipped). A Fast lane walks the ladder down and back up, crossing the
 boundary twice per pass; before the cache each crossing evicted both engines — ~5.5 minutes per pass,
 forever.
 
@@ -212,10 +219,7 @@ pre-existing rustfmt diffs, and the gate is open work in
 - **No queue-depth signal.** Concurrency is implicit in mutex contention, and `/health` deliberately
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
   `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
-- **No request body limit is set**, so every route runs on axum's default 2 MB. Measured: 980 KB to
-  `/tokenize` succeeds, 2.1 MB returns `413`. The host now batches under it; the cap is not stated in
-  `/health`, and saying so is open work.
-- **No integration test suite** — testing is inline `#[cfg(test)]` in `main.rs` and `adapters.rs`
-  (62 tests).
+- **No integration test suite** — testing is inline `#[cfg(test)]` beside what each module tests
+  (82 tests), with shared fixtures in `src/testing.rs`.
 - **Distribution is not built**: no build-recipe-as-data, no self-verification gate, no LICENSE or
   third-party notices.

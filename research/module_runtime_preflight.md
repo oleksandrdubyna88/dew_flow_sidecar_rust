@@ -1,7 +1,8 @@
 # Module — runtime and preflight
 
-> `src/main.rs`: `Config`, `AppState`, `main`, the `preflight_*` and `*_verdict` functions,
-> `seed_model_cache_from_env`, logging setup; and all of `src/adapters.rs`. As it is, 2026-08-15.
+> `src/config.rs` (`Config`), `src/state.rs` (`AppState`), `src/main.rs` (`main`, `build_router`),
+> `src/preflight.rs` (the `preflight_*` / `*_verdict` functions, `seed_model_cache_from_env`),
+> `src/logging.rs`; and all of `src/adapters.rs`. As it is, 2026-08-16.
 
 ## Purpose
 

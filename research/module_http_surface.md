@@ -1,6 +1,7 @@
 # Module — HTTP surface
 
-> `src/main.rs`: the request/response records and the five handlers. The system as it is, 2026-08-16.
+> `src/wire.rs` (the request/response records), `src/introspection.rs` (`/health`, `/models`,
+> `/unload`) and `src/handlers.rs` (`/embed`, `/tokenize`, `/rerank`). The system as it is, 2026-08-16.
 
 ## Purpose
 
