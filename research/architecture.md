@@ -138,7 +138,7 @@ it. Measured 2026-07-28 at `(64, 1024)`: dense returned 80 rows for a 128-row in
 ### The engine cache
 
 `RungCache` holds one engine per `max_length`, least-recently-used eviction, capacity from
-`EMBED_ENGINE_CACHE_RUNGS` (default 2). A Fast lane walks the ladder down and back up, crossing the
+`EMBED_ENGINE_CACHE_RUNGS` (default **1** — `src/main.rs:149`; this document said 2 until 2026-08-15, and 1 is the value that reproduces the pre-cache behaviour, so the two-rung ladder is opted IN rather than shipped). A Fast lane walks the ladder down and back up, crossing the
 boundary twice per pass; before the cache each crossing evicted both engines — ~5.5 minutes per pass,
 forever.
 

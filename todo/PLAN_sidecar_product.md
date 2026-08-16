@@ -86,6 +86,16 @@ wrong".
 - **A shutdown that releases VRAM promptly.** Three sidecars were found running on this machine during
   development, two of them holding models nobody was using — the RAG runtime panel now surfaces that, and the
   sidecar should make the fix easy.
+- **The body limit should say what it is** (2026-08-15, found from the host side). Every route runs on axum's
+  DEFAULT 2 MB request cap — nothing here sets `DefaultBodyLimit`, so nothing states it either. Measured:
+  980 KB to `/tokenize` succeeds, 2.1 MB returns `413`. The host now batches under it
+  (`SidecarClient.RequestByteBudget`, `dew_flow_rag_qln`), so this is no longer a defect — but it cost an
+  afternoon to find, because of HOW it presents: the server rejects the body while the client is still
+  writing it, and the client raises "an established connection was aborted by the software in your host
+  machine", which names the socket and nothing else. A 10,000-file repository died nine minutes into an
+  indexing pass this way. Two things would have made it a five-minute diagnosis: reporting the cap in
+  `/health` alongside `max_batch` (a limit a client cannot read is a limit it will guess at), and setting it
+  explicitly so it is a decision rather than a framework default.
 
 ## Definition of Done
 
