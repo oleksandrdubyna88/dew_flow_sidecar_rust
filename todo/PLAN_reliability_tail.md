@@ -1,7 +1,9 @@
 # PLAN — the reliability tail the 24/7 audit left open
 
-> Status: **partially implemented, 2026-08-16 — items 2 and 3 are done; items 1, 4, 5, 6, 7, 8 remain
-> open.** Scope: `src/main.rs` throughout.
+> Status: **partially implemented, 2026-08-16 — items 2, 3, 4, 6 and 7 are done; items 1, 5 and 8 remain
+> open.** Item 1 (the MIGraphX cache race) is the only correctness hazard left, and it is the one item
+> that **cannot be verified on this machine** — it is feature-gated behind an AMD toolchain that itself
+> needs an ONNX Runtime built from source. Scope: `src/main.rs` throughout.
 > The CRITICAL/HIGH defects of the same audit — the blocking lock in `/unload`, the invisible
 > inference wedge, the DLL hashing on the `/health` path and the silently zeroed token counts — were
 > fixed in a separate task (2026-08-16) and are **not** in this plan. That task also took item 3 on the
@@ -109,7 +111,32 @@ bounded how many texts one call could carry.)*
 per padding row; at `max_batch = 64` a single-text request could churn ~7 MB of pure allocator work in
 the hot path of the flavour that exists precisely to avoid expensive work.)*
 
-### 4. The compiled-model cache tree is walked twice per request — LOW-MEDIUM
+### 4. The compiled-model cache tree is walked twice per request — LOW-MEDIUM · **DONE 2026-08-16**
+
+> **Resolved by scoping, not by skipping** — and it turned out to be a correctness fix as much as a cost
+> one. `CompileWatch` replaces the two inline before/after pairs and measures **the engine's own cache
+> subdirectory** (`EMBED_CACHE_ENGINE` / `RERANK_CACHE_ENGINE`, now constants shared with
+> `with_engine_cache` so the builder and the measurement cannot drift onto different directories).
+>
+> `with_engine_cache` has given each engine its own subdirectory since the 2026-07-27 stale-cache
+> incident; the measurement never followed and kept summing the whole tree. `Engines.embed` and
+> `Engines.rerank` are independent mutexes, so **a rerank compile running during an embed pass was
+> reported as that pass's growth** — on the one field that exists to say "a compile happened here".
+> Measured by the test: 3 MB of the other engine's compile charged to this pass.
+>
+> Cost falls out of the same change: one engine's slice instead of a multi-GB tree, twice per request.
+> The empty-base early return is preserved explicitly (`a_flavour_with_no_cache_never_walks_anything`),
+> because `engine_cache_dir("", "dual")` would otherwise compose `/dual` — a real path to stat.
+>
+> **The walk itself stays, deliberately.** The draft's other option — measure only when a compile could
+> have happened — is refuted by `mxr_cache_mb`'s own record: the EP saves LAZILY, at the first kernel
+> launch, so a fresh-build flag does not predict when bytes land, and a build-scoped measurement claimed
+> "served from cache" while the first pass then compiled for two minutes.
+>
+> Tests: `a_compile_by_one_engine_is_not_reported_as_growth_by_the_other` (teeth proven by reverting the
+> scope: `left: 3, right: 0`) and `a_flavour_with_no_cache_never_walks_anything`.
+
+*(Original symptom, for the record, below.)*
 
 `src/main.rs:2148-2165`, `mxr_cache_mb`, recursively sums the directory tree, and it is called before
 and after inference at `:1986`/`:1992` (embed) and `:2098`/`:2106` (rerank) to report
@@ -152,7 +179,22 @@ signal there is.
   which answers *why* it swallows. `record_max_batch` (`:2288-2290`) is still a bare `else { return; }`.
   **Neither logs, and neither heals** — the open half is the diagnostic trail, not the rationale.
 
-### 6. `queue_wait_ms` silently includes engine teardown — LOW
+### 6. `queue_wait_ms` silently includes engine teardown — LOW · **DONE 2026-08-16**
+
+> `remember_engine` now hands the evicted engine to `teardown_off_the_lock`, which drops it on a thread
+> of its own and logs how long that took. The teardown leaves the critical path, so it stops landing in
+> the next waiter's `queue_wait_ms`; the log line exists because once it is off the lock, nothing else
+> would ever say it was slow. A spawn failure drops inline — slow beats leaked — and warns that it did.
+>
+> Test: `an_evicted_engine_is_dropped_outside_the_lock`, which compares the thread the drop ran on
+> against the caller's. **RED first**: `left: ThreadId(2), right: ThreadId(2)`.
+>
+> *Deviation:* the drafted fix — "hand it to `spawn_blocking`, as `/unload` does" — named the wrong axis,
+> as the REVISED note below already found. What was needed is a thread that is not the lock holder's, and
+> `std::thread::Builder` gives that without requiring a Tokio runtime in context, which matters because
+> `remember_engine` is reachable from tests that have none.
+
+*(Original symptom, for the record, below.)*
 
 `remember_engine` (`:2297-2306`) drops the evicted engine synchronously — the `Some((evicted, _))`
 binding at `:2300` drops it at the end of the match arm — while its caller `embed_blocking` (`:1981`)
@@ -185,7 +227,27 @@ lock-shaped move `drain_engines` makes, not a thread-shaped one.
 Scope: the **embed path only**. `remember_engine` has exactly one call site (`:1981`); rerank holds an
 `Option<TextRerank>` slot with no rung cache and no eviction.
 
-### 7. The implicit 2 MB body limit is invisible when it fires — LOW
+### 7. The implicit 2 MB body limit is invisible when it fires — LOW · **DONE 2026-08-16**
+
+> Four halves, all shipped: the limit is **set explicitly** (`DefaultBodyLimit::max`, from
+> `MAX_BODY_BYTES`, defaulting to the same 2 MiB so nothing changes but the fact that it is a decision);
+> it is **reported** on `/health` as `max_body_bytes` beside the new `tokenize_max_texts`; rejections are
+> **logged** by a `log_body_rejections` middleware that names the route and the announced size; and the
+> router moved into `build_router` so a test can drive it.
+>
+> Tests: `a_body_beyond_the_configured_limit_is_refused` (**RED first**: `left: 200, right: 413` — a 4 KB
+> body passed a configured 1 KB cap, because only axum's own 2 MB default was in force),
+> `a_body_within_the_configured_limit_still_reaches_the_handler`, `health_reports_the_body_limit_it_enforces`.
+>
+> **Verified on the wire**, since the layer and the middleware are exactly what a unit test reaches least
+> well: with `MAX_BODY_BYTES=4096`, `/health` reported `max_body_bytes: 4096`, an 8 KB POST came back
+> `413`, and the log carried the line that did not exist before —
+> *"/tokenize: request body refused — 8030 byte(s) announced, over MAX_BODY_BYTES."*
+>
+> One dev-dependency: `tower` (with `util`), for `ServiceExt::oneshot`. Already in the tree at that exact
+> version via axum — no new supply chain — and a layer cannot be proven applied from below the router.
+
+*(Original symptom, for the record, below.)*
 
 The router (`:912-918`) adds no layers, so axum's default `DefaultBodyLimit` (2 MB) applies. It is a
 useful accidental backstop against unbounded-body memory growth — but it is not in the README's
@@ -205,15 +267,17 @@ half with [PLAN_sidecar_product.md](PLAN_sidecar_product.md) phase 4, which reco
 
 ### 8. `src/main.rs` is 3 821 lines — LOW severity, high friction
 
-**REVISED — the number, twice in one day.** The original draft said 2 887; the CRITICAL/HIGH fix commit
-added 1 253 lines to reach **3 821**; item 2's registry then added ~308 more, so the file stands at
-**4 129** against a family limit of 800 (`.claude/rules/shared/common/coding-style.md`, typical
-200–400).
+**REVISED — the number, four times in two days.** The original draft said 2 887; the CRITICAL/HIGH fix
+commit reached **3 821**; item 2's registry **4 129**; `/models` plus items 4, 6 and 7 **4 744** — against
+a family limit of 800 (`.claude/rules/shared/common/coding-style.md`, typical 200–400). The file has grown
+by 64 % while this plan sat open, and every one of those lines was added by this plan's own items.
 
-That is worth stating plainly rather than quietly re-typing: this plan defers the split so its fixes stay
-reviewable, and every deferral makes the next fix land in a bigger file. The trade is still the right one
-per fix and clearly wrong in aggregate — **the split should happen after item 1, not after item 8's turn
-comes around.** Re-derive the table below when it does; do not trust these numbers, trust the groupings.
+That is worth stating plainly rather than quietly re-typing. The deferral is defensible per fix — a split
+done first would have buried each one in an unreviewable diff — and indefensible in aggregate: the file is
+now 5.9× the limit and every remaining item lands in something harder to review than when it was written.
+**The split should happen next, before item 1, not when item 8's turn comes around.** The table below is
+therefore already stale by construction: re-derive it from the banners, and trust its groupings rather
+than its numbers.
 
 The file marks its own seams with `// ---------- X ----------` banners, though fewer than the draft
 implied: seven survive (`:172`, `:931`, `:1128`, `:1446`, `:1735`, `:2270`, `:2314`). Re-derived split,
@@ -251,14 +315,15 @@ this table's numbers, trust its groupings.
 [PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md)'s step 1, which is on the critical path of two
 other repositories — `dew_flow_rag_qln`, then `dew_flow_benchmark`.)*
 
-1. **(1) the cache race** — the only correctness hazard left here. The investigation the draft asked
-   for is already answered (see the REVISED note): implement the widened serialization. Feature-gated,
-   and see the honesty clause in the test plan about what can be run on this machine.
-2. **(6) teardown attribution**, **(7) body limit**, **(4) cache walk** — measurable hygiene, in that
-   order: (6) is a documented contract violation, (7) is one line plus a `/health` field, and (4) may
-   end in a recorded decline.
-3. **(5) the two comments/logs** — trivial, any time.
-4. **(8) the module split** — last, alone, no behaviour change.
+*(Items 2, 3, 4, 6 and 7 are done — the verifiable set was closed first, deliberately: everything that
+could be proven on this hardware was proven before starting the one item that cannot be.)*
+
+1. **(1) the cache race** — the only correctness hazard left. The investigation the draft asked for is
+   already answered (see the REVISED note): implement the widened serialization. Feature-gated, and see
+   the honesty clause in the test plan about what can be run here.
+2. **(5) the two comments/logs** — trivial, any time.
+3. **(8) the module split** — last, alone, no behaviour change. Note that it has grown with every item
+   above; see the note under item 8.
 
 ## Test plan
 
@@ -271,10 +336,10 @@ idiom to follow — fake clocks and held mutexes rather than a real GPU:
 | 1 | `a_concurrent_build_cannot_change_the_cache_path_before_the_first_launch` |
 | 2 | shipped as `tokenize_refuses_a_batch_beyond_the_cap` **+** `a_tokenizer_present_at_startup_still_counts_after_its_file_is_gone` — the second one is the pre-warm half, and it is the only way to assert "loaded at startup" without watching syscalls: a tokenizer that was on disk when the process started keeps counting after the file is taken away |
 | 3 | ~~`the_ruler_is_allocated_once`~~ → shipped as `the_ruler_is_allocated_once_and_shared` |
-| 4 | `the_cache_is_not_walked_when_no_build_happened` |
+| 4 | shipped as `a_compile_by_one_engine_is_not_reported_as_growth_by_the_other` + `a_flavour_with_no_cache_never_walks_anything` — the guarantee turned out to be SCOPE, not frequency: the walk stays, it just reads one engine's subdirectory |
 | 5 | `poisoned_bookkeeping_is_logged_rather_than_silent` |
-| 6 | `an_evicted_engine_is_dropped_outside_the_lock` |
-| 7 | `a_body_beyond_the_limit_is_refused_and_logged` |
+| 6 | shipped as `an_evicted_engine_is_dropped_outside_the_lock` — RED first (`ThreadId(2)` against `ThreadId(2)`) |
+| 7 | shipped as `a_body_beyond_the_configured_limit_is_refused` (RED first: `200` against `413`) + `a_body_within_the_configured_limit_still_reaches_the_handler` + `health_reports_the_body_limit_it_enforces`; the log half was verified on the wire, not in a test |
 
 Item 8 asserts nothing new: the guarantee is that the existing suite is green before and after, and
 the diff contains no behaviour change.

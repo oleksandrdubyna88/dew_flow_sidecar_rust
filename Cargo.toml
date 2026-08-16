@@ -87,6 +87,12 @@ cuda = ["ort/cuda"]
 # main.rs preflights this at startup and exits with the required version on mismatch.
 migraphx = ["ort/migraphx", "ort/load-dynamic", "dep:libloading"]
 
+# Driving the router in a test (`ServiceExt::oneshot`) without binding a port or writing an HTTP client.
+# axum is built on tower and already carries it at this exact version — no new supply chain, and the
+# body limit is a LAYER, so nothing below the router can prove it is applied.
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [profile.release]
 lto = true
 strip = true

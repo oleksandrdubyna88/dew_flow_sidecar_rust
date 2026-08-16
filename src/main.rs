@@ -113,6 +113,15 @@ struct Config {
     /// the ROW count: a 10,000-file pass sent 52,617 texts in one request, and enough of them are short
     /// that such a batch fits under 2 MB while still being tens of thousands of encodes.
     tokenize_max_texts: usize,
+    /// The largest request body any route accepts.
+    ///
+    /// Explicit on purpose. Every route ran on axum's DEFAULT 2 MB cap, which meant the limit was real,
+    /// undocumented and unreadable — and it fails in the worst possible shape: the server rejects the
+    /// body while the client is still writing it, so the client sees "an established connection was
+    /// aborted by the software in your host machine", which names the socket and not the cause. A
+    /// 10,000-file repository died nine minutes into an indexing pass that way. Same number as before,
+    /// so nothing changes but the fact that it is now a decision.
+    max_body_bytes: usize,
     /// Force every embedding batch into ONE tensor shape (see `pin_shape`). "auto" (the default)
     /// turns it on only for MIGraphX, the provider that compiles per shape; "1"/"0" force it.
     pin_input_shape: String,
@@ -155,6 +164,11 @@ impl Config {
             // wall a normal pass walks into. A cap at the host's number would refuse batches its only
             // caller assembles by design.
             tokenize_max_texts: env_parse("TOKENIZE_MAX_TEXTS", 4096),
+            // 2 MiB — axum's own default, kept exactly. Measured against this sidecar from the host side
+            // (2026-08-15): 980 KB to /tokenize succeeds, 2.1 MB comes back 413. Writing it down changes
+            // no behaviour; it makes the number readable, configurable, and reportable on /health, which
+            // is what an operator raising EMBED_MAX_LENGTH toward 8192 needs before they hit it.
+            max_body_bytes: env_parse("MAX_BODY_BYTES", 2 * 1024 * 1024),
             pin_input_shape: env_str("PIN_INPUT_SHAPE", "auto"),
             mxr_cache_base: env_str("ORT_MIGRAPHX_MODEL_CACHE_PATH", ""),
             // 1, not 2: the host ships a SINGLE 256 rung now (RagSettingLimits.PlanFor), so a second slot
@@ -999,14 +1013,7 @@ async fn main() {
     prewarm_provenance();
     spawn_wedge_watchdog(state.clone());
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/models", get(models))
-        .route("/embed", post(embed))
-        .route("/rerank", post(rerank))
-        .route("/unload", post(unload))
-        .route("/tokenize", post(tokenize))
-        .with_state(state);
+    let app = build_router(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!("bge-sidecar listening on http://{addr}");
@@ -1017,6 +1024,51 @@ async fn main() {
         })
         .await
         .expect("server failed");
+}
+
+/// The routes and the layers around them, built apart from `main` so a test can drive them without
+/// binding a port — a body limit is a LAYER, and nothing below the router can prove one is applied.
+fn build_router(state: Arc<AppState>) -> Router {
+    let max_body_bytes = state.config.max_body_bytes;
+    Router::new()
+        .route("/health", get(health))
+        .route("/models", get(models))
+        .route("/embed", post(embed))
+        .route("/rerank", post(rerank))
+        .route("/unload", post(unload))
+        .route("/tokenize", post(tokenize))
+        .with_state(state)
+        // Set EXPLICITLY. The value is axum's own default, so nothing changes but the fact that it is a
+        // decision — readable on /health, movable by an operator, and no longer a framework constant
+        // nobody could find. The log layer is outermost so it observes the rejection the limit produces.
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
+        .layer(axum::middleware::from_fn(log_body_rejections))
+}
+
+/// Says, in the log, when a request was refused for its SIZE.
+///
+/// axum rejects an oversized body before any handler runs, so a 413 produced nothing at all in
+/// `bge-sidecar-*.log` — and it reaches the caller as a socket abort ("an established connection was
+/// aborted by the software in your host machine"), which names neither the size nor the cap, because the
+/// server rejects while the client is still writing. A 10,000-file repository died nine minutes into an
+/// indexing pass this way and it cost an afternoon to find. This is the line that makes it five minutes.
+async fn log_body_rejections(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let route = request.uri().path().to_string();
+    let announced = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unstated")
+        .to_string();
+    let response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        tracing::warn!(
+            "{route}: request body refused — {announced} byte(s) announced, over MAX_BODY_BYTES. The caller \
+             sees only a socket abort, so it cannot learn this from the response: batch under the cap \
+             /health reports as `max_body_bytes`."
+        );
+    }
+    response
 }
 
 // ---------- ONNX Runtime dylib preflight (load-dynamic flavor) ----------
@@ -1488,6 +1540,12 @@ struct LimitsWire {
     /// occupancy, which `loaded_embed_max_length` (the current rung alone) cannot show. Empty also
     /// when the probe found the cache busy: /health must never queue behind model work.
     resident_embed_max_lengths: Vec<usize>,
+    /// The largest request body any route accepts. Here because a limit a client cannot read is a limit
+    /// it will guess at — the host had to find this one by bisection after a pass died nine minutes in,
+    /// and the rejection names the socket rather than the cause.
+    max_body_bytes: usize,
+    /// The most texts one `/tokenize` call may carry, for the same reason.
+    tokenize_max_texts: usize,
 }
 
 #[derive(Serialize)]
@@ -1650,6 +1708,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
             loaded_embed_max_length: state.loaded_embed_max_length.try_lock().ok().and_then(|g| *g),
             loaded_max_batch: state.loaded_max_batch.try_lock().ok().and_then(|g| *g),
             resident_embed_max_lengths: state.engines.embed.try_lock().map(|g| g.caps()).unwrap_or_default(),
+            max_body_bytes: state.config.max_body_bytes,
+            tokenize_max_texts: state.config.tokenize_max_texts,
         },
         adapter: state.adapter.clone(),
     })
@@ -2264,13 +2324,13 @@ fn embed_natural(
     }
     stamp.enter(Phase::Running, format!("embed: embedding {} row(s)", texts.len()));
     // The duration below includes any settling re-runs — that is honest: it is what the caller waited.
-    let (cache_before, pass) = (mxr_cache_mb(&state.config.mxr_cache_base), Instant::now());
+    let (compiles, pass) = (CompileWatch::start(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE), Instant::now());
     let engine = guard.get_mut(limits.max_length).expect("just loaded");
     // Rows are (dense, sparse) ZIPPED per text, so the settling retry polices one length and a short
     // first run can never shorten one head without the other.
     let rows = embed_settling("embed", texts.len(), retry_short, || engine.embed(texts.clone(), batch))?;
     let inference = pass.elapsed();
-    let compile_cache_grew_mb = mxr_cache_mb(&state.config.mxr_cache_base).saturating_sub(cache_before);
+    let compile_cache_grew_mb = compiles.grew_mb();
     tracing::info!("{}", pass_log_message(
         request_id,
         &format!("embedded {} row(s), dense+sparse in one pass", rows.len()),
@@ -2381,7 +2441,7 @@ fn score_documents(
     request_id: &str,
 ) -> anyhow::Result<(Vec<f32>, PassTimings)> {
     let count = documents.len();
-    let (cache_before, pass) = (mxr_cache_mb(&state.config.mxr_cache_base), std::time::Instant::now());
+    let (compiles, pass) = (CompileWatch::start(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE), std::time::Instant::now());
     // query.to_string(): fastembed's `rerank` shares one generic across the query and the document slice,
     // so an owned query is what lets `&[String]` documents satisfy it.
     let results = guard
@@ -2389,7 +2449,7 @@ fn score_documents(
         .expect("just loaded")
         .rerank(query.to_string(), documents, false, Some(max_batch))?;
     let inference = pass.elapsed();
-    let compile_cache_grew_mb = mxr_cache_mb(&state.config.mxr_cache_base).saturating_sub(cache_before);
+    let compile_cache_grew_mb = compiles.grew_mb();
     tracing::info!("{}", pass_log_message(
         request_id,
         &format!("rerank: scored {count} document(s)"),
@@ -2431,6 +2491,48 @@ fn set_activity(state: &AppState, activity: impl Into<String>) {
 /// writes the cache LAZILY — at the first kernel launch, not at session build — so growth is
 /// measured across a PASS, never across a session build (which taught us nothing and lied
 /// "served from cache" while the first pass then compiled for two minutes).
+/// The cache subdirectory each engine builds into. Shared by the builder (`with_engine_cache`) and the
+/// measurement (`CompileWatch`) so the two cannot drift: a measurement pointed at a directory nothing
+/// writes to reports every compile as zero, which is indistinguishable from a healthy warm cache.
+const EMBED_CACHE_ENGINE: &str = "dual";
+const RERANK_CACHE_ENGINE: &str = "rerank";
+
+/// Watches ONE engine's compiled-model cache across a pass.
+///
+/// Scoped to that engine's own subdirectory, and both halves of that matter:
+///
+/// - **Correctness.** `with_engine_cache` has given each engine its own subdirectory since the
+///   2026-07-27 stale-cache incident, but the measurement kept summing the WHOLE tree — so a rerank
+///   compile running concurrently with an embed pass was reported as that pass's growth. The two engines
+///   hold independent mutexes, so concurrent is the ordinary case right after a restart.
+/// - **Cost.** On the MIGraphX flavour that tree is multi-GB across engine subdirectories, and this is
+///   walked twice per request. One engine's slice is a fraction of it.
+///
+/// The walk itself stays. Measuring only when "a compile could have happened" was tried and recorded as
+/// a lie (`mxr_cache_mb` — the EP saves LAZILY, at the first kernel launch, so a fresh-build flag does
+/// not predict when bytes land, and a build-scoped measurement claimed "served from cache" while the
+/// first pass then compiled for two minutes). On every non-MIGraphX flavour the base is empty and the
+/// whole thing costs a `trim().is_empty()`.
+struct CompileWatch {
+    /// Empty = no cache configured, i.e. a non-migraphx flavour. `mxr_cache_mb` then answers 0 without
+    /// touching the filesystem.
+    dir: String,
+    before: u64,
+}
+
+impl CompileWatch {
+    fn start(base: &str, engine: &str) -> Self {
+        let dir = if base.trim().is_empty() { String::new() } else { engine_cache_dir(base, engine) };
+        Self { before: mxr_cache_mb(&dir), dir }
+    }
+
+    /// Megabytes this engine's cache grew during the pass — the ONLY moment a MIGraphX compile is
+    /// observable, since the EP writes lazily rather than at session build.
+    fn grew_mb(&self) -> u64 {
+        mxr_cache_mb(&self.dir).saturating_sub(self.before)
+    }
+}
+
 fn mxr_cache_mb(base: &str) -> u64 {
     fn tree_bytes(dir: &std::path::Path) -> u64 {
         std::fs::read_dir(dir)
@@ -2601,14 +2703,44 @@ fn dense_dimension(dense: &[Vec<f32>]) -> Option<usize> {
 /// Files a freshly built engine under its rung and reports what the card now holds. The log line is the
 /// operator's only window into the cache's occupancy — an eviction that happened silently would look
 /// exactly like the rebuild-per-crossing behaviour this cache exists to remove.
-fn remember_engine<T>(cache: &mut RungCache<T>, what: &str, cap: usize, engine: T) {
+fn remember_engine<T: Send + 'static>(cache: &mut RungCache<T>, what: &str, cap: usize, engine: T) {
     let capacity = cache.capacity;
-    match cache.insert(cap, engine) {
-        Some((evicted, _)) => tracing::info!(
-            "{what}: built at cap {cap}; rung {evicted} evicted to stay within {capacity} — resident: {:?}",
-            cache.caps()
-        ),
-        None => tracing::info!("{what}: built at cap {cap} — resident rung(s): {:?}", cache.caps()),
+    let Some((rung, evicted)) = cache.insert(cap, engine) else {
+        tracing::info!("{what}: built at cap {cap} — resident rung(s): {:?}", cache.caps());
+        return;
+    };
+    tracing::info!(
+        "{what}: built at cap {cap}; rung {rung} evicted to stay within {capacity} — resident: {:?}",
+        cache.caps()
+    );
+    teardown_off_the_lock(evicted, format!("{what} rung {rung}"));
+}
+
+/// Tears a dropped engine down on a thread of its own.
+///
+/// `RungCache::insert` hands the evicted engine back so the CALLER can choose where it dies — and this
+/// caller holds the engine mutex every queued request is waiting on. An ort session teardown is not
+/// instant: done inline it is paid by whoever is next in line, and it lands in their `queue_wait_ms`,
+/// which is the field the README introduced to stop misattributing waiting. `/unload` has always dropped
+/// outside its locks for exactly this reason (`drain_engines`); the cache eviction path did not, and at
+/// the shipped `EMBED_ENGINE_CACHE_RUNGS=1` it fires on every cap change.
+///
+/// The completion line is not decoration. Off the lock, a slow teardown stops showing up as somebody
+/// else's queue wait — so this becomes the only place that can say it was slow.
+fn teardown_off_the_lock<T: Send + 'static>(engine: T, what: String) {
+    let names_it = what.clone();
+    let spawned = std::thread::Builder::new().name("engine-teardown".to_string()).spawn(move || {
+        let started = Instant::now();
+        drop(engine);
+        tracing::info!("{names_it}: torn down in {:.1}s, off the engine lock", started.elapsed().as_secs_f32());
+    });
+    // Spawn failure drops the closure — and the engine with it — right here. Slow beats leaked, but it
+    // is the behaviour this function exists to avoid, so it is never silent.
+    if let Err(e) = spawned {
+        tracing::warn!(
+            "{what}: no teardown thread could be spawned ({e}) — dropped inline instead, blocking whatever \
+             is queued behind this engine"
+        );
     }
 }
 
@@ -2770,7 +2902,7 @@ fn load_dual(state: &AppState, provider_hint: &str, max_length: usize) -> anyhow
     if state.config.intra_threads > 0 {
         options = options.with_intra_threads(state.config.intra_threads);
     }
-    let built = with_engine_cache(&state.config.mxr_cache_base, "dual", || {
+    let built = with_engine_cache(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE, || {
         let started = std::time::Instant::now();
         let engine = Bgem3DualEmbedding::try_new(options)?;
         tracing::info!(
@@ -2796,7 +2928,7 @@ fn load_rerank(state: &AppState, provider_hint: &str) -> anyhow::Result<TextRera
     if state.config.intra_threads > 0 {
         options = options.with_intra_threads(state.config.intra_threads);
     }
-    let built = with_engine_cache(&state.config.mxr_cache_base, "rerank", || {
+    let built = with_engine_cache(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE, || {
         let started = std::time::Instant::now();
         let engine = TextRerank::try_new(options)?;
         tracing::info!(
@@ -3065,8 +3197,9 @@ mod tests {
     use super::{
         aligned_scores, cache_dir_verdict, compiled_providers, dylib_verdict, effective_provider, engine_cache_dir,
         execution_providers, copy_missing_files, embed_settling, find_tokenizer_file, health, inflight_now,
-        dense_dimension, join_error_text, loaded_now, lock_or_refuse, cap_for, models_now, parse_unload_request,
-        pass_log_message, pin_shape, preflight_provider, record_embed_dimension, rerank_batch,
+        build_router, dense_dimension, join_error_text, mxr_cache_mb, CompileWatch, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE,
+        loaded_now, lock_or_refuse, cap_for, models_now, parse_unload_request,
+        pass_log_message, pin_shape, preflight_provider, record_embed_dimension, remember_engine, rerank_batch,
         required_provider_libraries, ruler_text, should_pin_shape, tokenize, unload, unpin_rows,
         usage_from_counts, wedge_action, with_engine_cache, write_inflight, AppState, Config, EmbedResponse,
         Engines, InFlight, ModelEntry, PassTimings, Patience, Phase, Provenance, RungCache, TokenUsage,
@@ -3076,6 +3209,7 @@ mod tests {
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use tower::ServiceExt;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -3194,6 +3328,7 @@ mod tests {
             mxr_cache_base: String::new(),
             engine_cache_rungs: 2,
             tokenize_max_texts: 4096,
+            max_body_bytes: 2 * 1024 * 1024,
             wedge: test_wedge_policy(),
         }
     }
@@ -4307,6 +4442,156 @@ mod tests {
         assert!(
             Config::from_env().tokenize_max_texts >= 512 * 2,
             "a cap at or below the host's 512-row budget turns a normal pass into a wall of 400s"
+        );
+    }
+
+    // ---------- compile growth is measured per engine ----------
+
+    fn write_mb(path: &Path, mb: usize) {
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the cache dir");
+        std::fs::write(path, vec![0u8; mb * 1024 * 1024]).expect("the fake compiled program");
+    }
+
+    /// A compile by ONE engine must not be reported as growth by the other.
+    ///
+    /// `with_engine_cache` has given each engine its own subdirectory since the 2026-07-27 stale-cache
+    /// incident, but the pass measurement kept summing the WHOLE tree. `Engines.embed` and
+    /// `Engines.rerank` are independent mutexes, so an embed pass running while the rerank engine
+    /// compiles is the ordinary situation right after a restart — and it reported the other engine's
+    /// megabytes as its own, on the one field that exists to say "a compile happened here".
+    #[test]
+    fn a_compile_by_one_engine_is_not_reported_as_growth_by_the_other() {
+        let base = std::env::temp_dir().join(format!("mxr-scope-{}", std::process::id()));
+        write_mb(&base.join(EMBED_CACHE_ENGINE).join("warm.mxr"), 1);
+        write_mb(&base.join(RERANK_CACHE_ENGINE).join("warm.mxr"), 1);
+        let base = base.to_string_lossy().to_string();
+
+        let embed_pass = CompileWatch::start(&base, EMBED_CACHE_ENGINE);
+        // The OTHER engine compiles while this pass runs.
+        write_mb(Path::new(&base).join(RERANK_CACHE_ENGINE).join("fresh.mxr").as_path(), 3);
+
+        assert_eq!(embed_pass.grew_mb(), 0, "another engine's compile is not this pass's growth");
+
+        // ...and this engine's own compile still is.
+        write_mb(Path::new(&base).join(EMBED_CACHE_ENGINE).join("fresh.mxr").as_path(), 2);
+        assert_eq!(embed_pass.grew_mb(), 2, "its own compile is exactly what it reports");
+
+        // The refuted approach, reproduced so the defect stays visible in the suite: summing the whole
+        // tree charges this pass with all 7 MB, 5 of which it did not cause.
+        assert_eq!(mxr_cache_mb(&base), 7, "which is what the pass used to measure");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Every non-MIGraphX flavour configures no cache, and must not pay a filesystem walk to learn that.
+    /// An empty base must stay empty rather than becoming `/dual`, which is a real directory to stat.
+    #[test]
+    fn a_flavour_with_no_cache_never_walks_anything() {
+        let watch = CompileWatch::start("", EMBED_CACHE_ENGINE);
+
+        assert!(watch.dir.is_empty(), "no path was composed from an empty base");
+        assert_eq!(watch.grew_mb(), 0, "and nothing is ever reported");
+    }
+
+    // ---------- the request body limit, stated rather than inherited ----------
+
+    /// The CONFIGURED limit has to be the one actually enforced.
+    ///
+    /// Every route used to run on axum's default 2 MB — a real limit that was never written down, never
+    /// reported, and produced nothing in the log when it fired, because axum rejects the body before any
+    /// handler runs. The body below is far under 2 MB and far over the configured cap, so it separates
+    /// "a limit exists" from "OUR limit is in force": before the layer was applied this request was
+    /// accepted, and the assertion named the status it got instead.
+    #[tokio::test]
+    async fn a_body_beyond_the_configured_limit_is_refused() {
+        let mut config = config("");
+        config.max_body_bytes = 1024;
+        let app = build_router(app_state_with(config));
+
+        let oversized = format!(r#"{{"texts":["{}"],"model":"bge"}}"#, "x".repeat(4096));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/tokenize")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(oversized))
+                    .expect("a well-formed request"),
+            )
+            .await
+            .expect("the router answers");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a 4 KB body must not pass a 1 KB cap just because axum's own default is 2 MB"
+        );
+    }
+
+    /// A body UNDER the cap still goes through — a limit that refuses everything is not a limit.
+    #[tokio::test]
+    async fn a_body_within_the_configured_limit_still_reaches_the_handler() {
+        let mut config = config("");
+        config.max_body_bytes = 1024;
+        let app = build_router(app_state_with(config));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/tokenize")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"texts":["alpha"],"model":"bge"}"#))
+                    .expect("a well-formed request"),
+            )
+            .await
+            .expect("the router answers");
+
+        assert_eq!(response.status(), StatusCode::OK, "the handler ran and answered");
+    }
+
+    /// The cap is on `/health` because a limit a client cannot read is a limit it will guess at. The host
+    /// batches under it (`SidecarClient.RequestByteBudget`) and had to learn the number by bisection.
+    #[tokio::test]
+    async fn health_reports_the_body_limit_it_enforces() {
+        let mut config = config("");
+        config.max_body_bytes = 4096;
+        let state = app_state_with(config);
+
+        let reported = health(State(state.clone())).await.limits.max_body_bytes;
+
+        assert_eq!(reported, state.config.max_body_bytes, "what /health says is what the router enforces");
+    }
+
+    // ---------- teardown must leave the critical path ----------
+
+    /// The evicted engine must not be torn down on the thread holding the engine mutex.
+    ///
+    /// ort teardown is not instant, every queued request waits it out, and the wait then lands in the
+    /// NEXT caller's `queue_wait_ms` — the field the README introduced precisely to stop misattributing
+    /// waiting. `RungCache::insert` hands the engine back so the CALLER can choose where it dies, and
+    /// `remember_engine` used to choose the worst available place. At the shipped default
+    /// `EMBED_ENGINE_CACHE_RUNGS=1` this fires on every cap change.
+    #[test]
+    fn an_evicted_engine_is_dropped_outside_the_lock() {
+        struct DropSpy(mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+
+        let (tell, dropped) = mpsc::channel();
+        let mut cache = RungCache::new(1);
+        cache.insert(256, DropSpy(tell.clone()));
+
+        remember_engine(&mut cache, "embed", 512, DropSpy(tell));
+
+        let torn_down_on = dropped.recv_timeout(Duration::from_secs(5)).expect("the evicted engine is dropped");
+        assert_ne!(
+            torn_down_on,
+            std::thread::current().id(),
+            "the teardown ran on the thread that holds the engine mutex, so everything queued behind it waited"
         );
     }
 

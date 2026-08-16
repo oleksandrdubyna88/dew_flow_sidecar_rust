@@ -115,6 +115,19 @@ without touching an engine lock (`loaded_now` try_locks, exactly as `/health` do
   once. The `tokenizer-only` rows are *derived* from the registry rather than listed, so they cannot drift
   from what `/tokenize` accepts.
 
+### Request limits, and where they are readable
+
+Every route runs under `DefaultBodyLimit::max(MAX_BODY_BYTES)`, set **explicitly** in `build_router`. The
+value is axum's own default (2 MiB), so nothing changed but the fact that it is a decision — an implicit
+framework constant is a limit nobody can find, and this one fails in the worst possible shape: axum
+rejects before any handler runs, so a `413` used to produce **nothing at all** in `bge-sidecar-*.log`,
+while the caller saw only a socket abort because the server rejects while the client is still writing.
+
+Three things close that: the cap is reported on `/health` (`limits.max_body_bytes`, beside
+`limits.tokenize_max_texts`), a `log_body_rejections` middleware writes a `WARN` naming the route and the
+announced size, and `/tokenize` caps its ROW count separately — the body limit does not bound rows, and
+enough short texts fit under 2 MB to be tens of thousands of encodes.
+
 ### `GET /health`
 
 Never blocks and never *computes*: every lock is a `try_lock` (a busy lock reads as "unknown yet", which

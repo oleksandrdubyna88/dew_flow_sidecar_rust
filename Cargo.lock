@@ -232,6 +232,7 @@ dependencies = [
  "sha2",
  "tokenizers",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "windows",

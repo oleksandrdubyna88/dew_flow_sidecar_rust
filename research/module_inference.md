@@ -28,14 +28,14 @@ flowchart TD
     STAMP --> RESIDENT{"rung resident?"}
     RESIDENT -->|no| BUILD["load_validated_dual<br/>⏱ session_build_ms — phase `building`"]
     RESIDENT -->|yes| RUN
-    BUILD --> REMEMBER["remember_engine — LRU insert"]
+    BUILD --> REMEMBER["remember_engine — LRU insert;<br/>evicted rung torn down OFF the lock"]
     REMEMBER --> RUN["embed_settling → engine.embed<br/>⏱ inference_ms — phase `running`"]
-    RUN --> GROWTH["mxr_cache_mb delta ⇒ compile_cache_grew_mb"]
+    RUN --> GROWTH["CompileWatch delta over THIS engine's<br/>cache subdir ⇒ compile_cache_grew_mb"]
     GROWTH --> UNZIP["unzip (dense, sparse) per text"]
     UNZIP --> UNPIN{"was pinned?"}
     UNPIN -->|yes| STRIP["unpin_rows — drop ruler rows"]
     UNPIN -->|no| OUT
-    STRIP --> OUT["EmbedResponse + usage + timings"]
+    STRIP --> OUT["EmbedResponse + dimension + usage + timings"]
 ```
 
 ## Core structures
@@ -48,6 +48,7 @@ flowchart TD
 | `RungCache<T>` | One engine per `max_length` ("rung"), least-recently-**used** eviction, capacity from `EMBED_ENGINE_CACHE_RUNGS` |
 | `Limits` | `max_length` (clamped 16…8192) and `max_batch` (≥ 1), resolved per request over the configured defaults |
 | `PassTimings` | `queue_wait_ms`, `session_build_ms`, `inference_ms`, `compile_cache_grew_mb` |
+| `CompileWatch` | A pass's growth in **one engine's own** cache subdirectory (`EMBED_CACHE_ENGINE` / `RERANK_CACHE_ENGINE`, shared with `with_engine_cache` so builder and measurement cannot drift). Summing the whole tree charged a rerank compile to a concurrent embed pass — the engines hold independent mutexes, so concurrent is the ordinary case after a restart |
 | `TokenUsage` | `token_count[]`, `truncated[]`, effective `max_length`, `token_accounting` |
 | `Bgem3DualEmbedding` | **One** session yielding both BGE-M3 heads per forward pass |
 | `TextRerank` | The `bge-reranker-v2-m3` cross-encoder |
@@ -58,6 +59,7 @@ flowchart TD
 |---|---|
 | `embed_blocking` | Owns capping, token accounting and shape pinning; delegates the pass |
 | `embed_natural` | The pass itself: lock, build if needed, run, time each span |
+| `remember_engine` | Files a built engine under its rung and hands the EVICTED one to `teardown_off_the_lock` — an ort teardown done inline is paid by whoever is queued, and lands in their `queue_wait_ms` |
 | `rerank_blocking` / `score_documents` | The same shape for the cross-encoder; scores come back **in input order** |
 | `cap_for(kind, requested, loaded)` | A `query` may never move the loaded cap — it arrives interleaved with index passes |
 | `pin_shape` / `unpin_rows` | Splice ruler rows to one constant shape, then strip them |

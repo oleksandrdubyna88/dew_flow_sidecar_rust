@@ -14,7 +14,7 @@ Definition of Done.
 | plan | status | scope |
 |---|---|---|
 | [PLAN_sidecar_product.md](PLAN_sidecar_product.md) | engine works and is measured on an R9700; distribution is not built | build recipe as data, self-verification against a reference vector, public-repository hygiene, host ergonomics |
-| [PLAN_reliability_tail.md](PLAN_reliability_tail.md) | partially implemented, 2026-08-16 — items 2 (`/tokenize` off the reactor) and 3 (the ruler) are done; 1, 4, 5, 6, 7, 8 open. **Re-anchored against `d0139b1`**, because the fix commit moved every line it cited | what the 24/7 audit found and the same-day fixes did not take: the MIGraphX cache path race between build and first launch, the twice-per-request cache walk, an engine dropped inside the lock its waiters queue on, and the 4 129-line `main.rs` |
+| [PLAN_reliability_tail.md](PLAN_reliability_tail.md) | partially implemented, 2026-08-16 — items 2, 3, 4, 6, 7 done; **1, 5, 8 open**. The whole verifiable set was closed first, deliberately, before starting the one item this hardware cannot prove | ✔ `/tokenize` off the reactor, the ruler, compile growth measured per engine (it was charging one engine's compile to the other), the evicted engine torn down off the lock, the body limit stated · reported · logged. Open: the MIGraphX cache-path race between build and first kernel launch (**feature-gated — not verifiable here**), two silent-degradation logs, and the **4 744-line** `main.rs`, which the plan now says to split *before* the last hazard rather than after |
 
 Implemented plans live in [`../research/`](../research/).
 
