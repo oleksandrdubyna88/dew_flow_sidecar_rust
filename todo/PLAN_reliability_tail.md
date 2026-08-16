@@ -1,7 +1,7 @@
 # PLAN — the reliability tail the 24/7 audit left open
 
-> Status: **partially implemented, 2026-08-16 — items 2, 3, 4, 6, 7 and 8 are done; items 1 and 5 remain
-> open.** Item 1 (the MIGraphX cache race) is the only correctness hazard left, and it is the one item
+> Status: **partially implemented, 2026-08-16 — items 2, 3, 4, 5, 6, 7 and 8 are done; only item 1
+> remains open.** Item 1 (the MIGraphX cache race) is the only correctness hazard left, and it is the one item
 > that **cannot be verified on this machine** — it is feature-gated behind an AMD toolchain that itself
 > needs an ONNX Runtime built from source. Scope: `src/main.rs` throughout.
 > The CRITICAL/HIGH defects of the same audit — the blocking lock in `/unload`, the invisible
@@ -166,7 +166,26 @@ cache incidents, and the doc comment above is why it is shaped the way it is. If
 **declining this item is a legitimate outcome**: record that the walk is the price of the only honest
 signal there is.
 
-### 5. Two silent-degradation corners — LOW
+### 5. Two silent-degradation corners — LOW · **DONE 2026-08-16**
+
+> Landed with the deduplication pass, because the two turned out to be the same edit: the poisoned-lock
+> corner existed **in triplicate**, and a fix applied to three copies is a fix that gets applied to two.
+>
+> - The three recorders now call one `record`, which **heals** the poison (as the engine mutexes have
+>   since a panicked load made every later request answer "engine poisoned") and **warns** that it did.
+>   Healing is safe here for a reason the engines cannot claim: the cell is an `Option<usize>`, so a
+>   panic mid-write leaves no half-built state, only a stale number the call is about to overwrite.
+>   Test: `a_poisoned_bookkeeping_cell_still_records_and_says_it_was_poisoned`, **RED first** —
+>   `left: None, right: Some(64)`, the write dropped and never recovered.
+> - Both `.expect("just loaded")` now carry the invariant that makes them sound — the same guard
+>   inserted and reads, and `RungCache` capacity is `max(1)` — so the next editor meets it *before*
+>   separating the insert from the read, which is the day it would become a live panic.
+>
+> *Deviation:* the draft asked only for "a comment at minimum; heal it if cheap". Healing was cheap, so
+> both happened, and the log line is what the item was actually about — a degradation nobody can see is
+> the defect, not the degradation itself.
+
+*(Original symptoms, for the record, below.)*
 
 - `inference.rs:273` and `inference.rs:394` — `.expect("just loaded")`. Sound today: the same `MutexGuard` that inserted
   the entry is the only handle that can evict it, and `RungCache` capacity is `max(1)`. It is a
@@ -367,13 +386,10 @@ other repositories — `dew_flow_rag_qln`, then `dew_flow_benchmark`.)*
 *(Items 2, 3, 4, 6 and 7 are done — the verifiable set was closed first, deliberately: everything that
 could be proven on this hardware was proven before starting the one item that cannot be.)*
 
-1. **(1) the cache race** — the only correctness hazard left. The investigation the draft asked for is
-   already answered (see the REVISED note): implement the widened serialization. Feature-gated, and see
-   the honesty clause in the test plan about what can be run here. It now lands in `compile_cache.rs`,
-   208 lines, rather than in a 4 744-line file.
-2. **(5) the two comments/logs** — trivial, any time. Note that the three recorders it names are now
-   together in `bookkeeping.rs`, and they are near-identical: one shared writer would fix all three at
-   once rather than three times.
+1. **(1) the cache race** — all that is left, and the only correctness hazard. The investigation the
+   draft asked for is already answered (see the REVISED note): implement the widened serialization. It
+   now lands in `compile_cache.rs`, ~210 lines, rather than in a 4 744-line file. Feature-gated; see the
+   honesty clause in the test plan about what can be run here.
 
 ## Test plan
 
@@ -388,6 +404,7 @@ idiom to follow — fake clocks and held mutexes rather than a real GPU:
 | 3 | ~~`the_ruler_is_allocated_once`~~ → shipped as `the_ruler_is_allocated_once_and_shared` |
 | 4 | shipped as `a_compile_by_one_engine_is_not_reported_as_growth_by_the_other` + `a_flavour_with_no_cache_never_walks_anything` — the guarantee turned out to be SCOPE, not frequency: the walk stays, it just reads one engine's subdirectory |
 | 5 | `poisoned_bookkeeping_is_logged_rather_than_silent` |
+| 5 | shipped as `a_poisoned_bookkeeping_cell_still_records_and_says_it_was_poisoned` — RED first (`left: None, right: Some(64)`: the write was dropped and never recovered) |
 | 6 | shipped as `an_evicted_engine_is_dropped_outside_the_lock` — RED first (`ThreadId(2)` against `ThreadId(2)`) |
 | 7 | shipped as `a_body_beyond_the_configured_limit_is_refused` (RED first: `200` against `413`) + `a_body_within_the_configured_limit_still_reaches_the_handler` + `health_reports_the_body_limit_it_enforces`; the log half was verified on the wire, not in a test |
 
