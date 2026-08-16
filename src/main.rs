@@ -40,6 +40,7 @@
 
 mod adapters;
 mod logging;
+mod log_segments;
 mod config;
 mod wedge;
 mod engine_cache;
@@ -62,7 +63,8 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::Router;
 
-use crate::logging::*;
+// `logging` is no longer imported here: its one export, day_and_clock, is now used by log_segments,
+// which owns the whole question of which file a line goes to.
 use crate::config::*;
 use crate::wedge::*;
 use crate::state::*;
@@ -92,21 +94,20 @@ pub(crate) async fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (day, clock) = day_and_clock(now);
-    let log_dir = format!("{}/{day}", env_str("SIDECAR_LOG_DIR", "logs"));
-    let log_path = format!(
-        "{log_dir}/bge-sidecar-device{}-{clock}-{}.log",
-        env_parse::<i32>("ORT_DEVICE_ID", 0),
-        std::process::id()
+    // A run that outlives the day continues in a 00-00-00 segment under the next day's folder, same pid —
+    // because "a file per run" and "this process does not restart" are each right and together produce one
+    // file growing for months. Not the rolling-by-day sink the rule forbids: that merges DIFFERENT runs,
+    // these two files belong to ONE. See log_segments::DaySegments.
+    let (segments, log_path) = log_segments::DaySegments::open(
+        &env_str("SIDECAR_LOG_DIR", "logs"),
+        &format!("bge-sidecar-device{}", env_parse::<i32>("ORT_DEVICE_ID", 0)),
+        now,
     );
     // Best-effort: an unwritable directory must never keep the sidecar from starting.
-    let log_file = std::fs::create_dir_all(&log_dir)
-        .ok()
-        .and_then(|_| std::fs::OpenOptions::new().create(true).append(true).open(&log_path).ok());
-    let file_layer = log_file.map(|file| {
+    let file_layer = segments.map(|writer| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file))
+            .with_writer(std::sync::Mutex::new(writer))
     });
     tracing_subscriber::registry()
         .with(filter)
