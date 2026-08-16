@@ -14,6 +14,7 @@ Definition of Done.
 | plan | status | scope |
 |---|---|---|
 | [PLAN_sidecar_product.md](PLAN_sidecar_product.md) | engine works and is measured on an R9700; distribution is not built | build recipe as data, self-verification against a reference vector, public-repository hygiene, host ergonomics |
+| [PLAN_reliability_tail.md](PLAN_reliability_tail.md) | plan only, 2026-08-16 | what the 24/7 audit found and the same-day fixes did not take: the MIGraphX cache path race between build and first launch, `/tokenize` on the reactor, the per-request ruler allocation, and the 2 887-line `main.rs` |
 
 Implemented plans live in [`../research/`](../research/) — most recently
 [PLAN_response_timings.md](../research/PLAN_response_timings.md) (additive `timings` + `request_id`
