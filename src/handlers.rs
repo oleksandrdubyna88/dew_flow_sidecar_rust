@@ -7,8 +7,33 @@ use crate::state::{AppState, Limits};
 use crate::tokens::{BGE_TOKENIZER, count_tokens};
 use crate::wire::{ApiError, EmbedRequest, EmbedResponse, PassTimings, RerankRequest, RerankResponse, TokenUsage, TokenizeRequest, TokenizeResponse, bad_request, engine_error, internal_error, join_error_text};
 
-
 // ---------- handlers ----------
+
+/// Runs one blocking pass and turns its TWO failure modes into the two different HTTP answers they
+/// deserve.
+///
+/// `/embed` and `/rerank` carried an identical copy of this — spawn, clear the activity, unwrap the join,
+/// map the engine error — differing only in the closure and one word in the panic message. The pair had
+/// already started to matter: `set_activity(idle)` has to happen even when the pass FAILED, or the
+/// sidecar reports itself busy forever after one bad request, and that is the kind of line a second copy
+/// eventually loses.
+///
+/// The two failures are not the same thing and must not collapse:
+/// a JoinError means the blocking task PANICKED (a bug here, 500), while an `Err` from the pass is the
+/// engine refusing — which `engine_error` may turn into a 503 the host can retry.
+async fn run_pass<T, F>(state: &Arc<AppState>, what: &str, pass: F) -> Result<Json<T>, ApiError>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let idle = state.clone();
+    let outcome = tokio::task::spawn_blocking(pass).await;
+    set_activity(&idle, "idle");
+    let result = outcome
+        .map_err(|e| internal_error(anyhow::anyhow!("{what} task panicked: {}", join_error_text(e))))?
+        .map_err(engine_error)?;
+    Ok(Json(result))
+}
 
 pub(crate) async fn embed(
     State(state): State<Arc<AppState>>,
@@ -30,16 +55,11 @@ pub(crate) async fn embed(
     }
 
     let limits = Limits::resolve(&state.config, max_length, max_batch);
-    let shared = state.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        embed_blocking(&state, texts, &kind, &provider, limits, &request_id)
+    let pass = state.clone();
+    run_pass(&state, "embed", move || {
+        embed_blocking(&pass, texts, &kind, &provider, limits, &request_id)
     })
-    .await;
-    set_activity(&shared, "idle");
-    let result = outcome
-        .map_err(|e| internal_error(anyhow::anyhow!("embed task panicked: {}", join_error_text(e))))?
-        .map_err(engine_error)?;
-    Ok(Json(result))
+    .await
 }
 
 /// The name this request counts with: its own, or bge when it named none.
@@ -134,16 +154,11 @@ pub(crate) async fn rerank(
     }
 
     let max_batch = rerank_batch(&state.config, max_batch);
-    let shared = state.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        rerank_blocking(&state, query, documents, &provider, max_batch, &request_id)
+    let pass = state.clone();
+    run_pass(&state, "rerank", move || {
+        rerank_blocking(&pass, query, documents, &provider, max_batch, &request_id)
     })
-    .await;
-    set_activity(&shared, "idle");
-    let result = outcome
-        .map_err(|e| internal_error(anyhow::anyhow!("rerank task panicked: {}", join_error_text(e))))?
-        .map_err(engine_error)?;
-    Ok(Json(result))
+    .await
 }
 
 #[cfg(test)]

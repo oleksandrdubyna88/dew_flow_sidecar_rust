@@ -1,8 +1,34 @@
+use std::sync::Mutex;
 use std::time::Instant;
 use crate::engine_cache::{RungCache};
 use crate::state::{AppState};
 
 // ---------- model loading ----------
+
+/// Writes one bookkeeping cell — and heals it, loudly, when a panic left it poisoned.
+///
+/// The three recorders below were three copies of the same six lines, each ending
+/// `let Ok(..) = lock() else { return; }`: no log, no `clear_poison`. One poisoning therefore made
+/// /health stop reporting that field **for the life of the process**, with nothing anywhere saying why —
+/// and being three copies, the fix would have had to be made three times.
+///
+/// Healing matches what the engine mutexes have done since a panicked model load made every later
+/// request answer "engine poisoned": one panic costs one operation, never all of them. It is safe here
+/// for a reason the engines cannot claim — the cell is a `Option<usize>`, so a panic mid-write can leave
+/// no half-built state, only a stale number this call is about to overwrite.
+fn record(cell: &Mutex<Option<usize>>, what: &str, value: usize) {
+    match cell.lock() {
+        Ok(mut slot) => *slot = Some(value),
+        Err(poisoned) => {
+            tracing::warn!(
+                "{what}: bookkeeping lock was poisoned by an earlier panic — healing it and recording \
+                 {value}. /health would otherwise have stopped reporting this field until restart."
+            );
+            *poisoned.into_inner() = Some(value);
+            cell.clear_poison();
+        }
+    }
+}
 
 /// Records the sequence cap this request runs at, so `cap_for` can keep a query on the rung a pass is
 /// using and /health can report it.
@@ -12,30 +38,21 @@ use crate::state::{AppState};
 /// two-rung ladder: a pass crosses the boundary twice and each crossing cost 156-173 s of rebuild (see
 /// `RungCache`). The engines are now kept per rung, so a change is a lookup and this records, nothing more.
 pub(crate) fn record_embed_max_length(state: &AppState, requested: usize) {
-    let Ok(mut loaded) = state.loaded_embed_max_length.lock() else {
-        return; // poisoned bookkeeping: keep serving at whatever is loaded rather than failing the embed
-    };
-    *loaded = Some(requested);
+    record(&state.loaded_embed_max_length, "embed max_length", requested);
 }
 
 /// Same bookkeeping for the BATCH, so /health can report what ran rather than what was configured.
 pub(crate) fn record_max_batch(state: &AppState, used: usize) {
-    let Ok(mut loaded) = state.loaded_max_batch.lock() else {
-        return;
-    };
-    *loaded = Some(used);
+    record(&state.loaded_max_batch, "max_batch", used);
 }
 
 /// The width of the vectors that just came back, so `/models` can state it instead of a caller having
 /// to already know it. Recorded from a real row — see `loaded_embed_dimension`.
 pub(crate) fn record_embed_dimension(state: &AppState, dimension: Option<usize>) {
-    let Some(dimension) = dimension else {
-        return; // an empty batch measured nothing; leave whatever an earlier pass established
-    };
-    let Ok(mut loaded) = state.loaded_embed_dimension.lock() else {
-        return;
-    };
-    *loaded = Some(dimension);
+    // An empty batch measured nothing; leave whatever an earlier pass established.
+    if let Some(dimension) = dimension {
+        record(&state.loaded_embed_dimension, "embed dimension", dimension);
+    }
 }
 
 /// The width of a set of dense vectors, read from a row.
@@ -100,14 +117,8 @@ pub(crate) fn attention_peak_mb(batch: usize, seq: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    
-    
-    
-    
-    
-    
+    use std::sync::Arc;
+    use crate::testing::app_state;
 
     // ---------- the dimension on /embed ----------
     /// The reported width is the width of the rows in the SAME response — the whole point is that a caller
@@ -118,5 +129,35 @@ mod tests {
 
         assert_eq!(dense_dimension(&rows), Some(rows[0].len()));
         assert_eq!(dense_dimension(&[]), None, "an empty batch measured nothing — null, never 0");
+    }
+
+    // ---------- poisoned bookkeeping heals instead of going quiet ----------
+
+    /// A panic anywhere near these cells must cost one write, not every future one.
+    ///
+    /// They used to `let Ok(..) = lock() else { return }` with no log and no `clear_poison` — so a single
+    /// poisoning made /health stop reporting that field **for the life of the process**, with nothing in
+    /// the log saying why. The engine mutexes have healed poison since the day a panicked load made every
+    /// later request answer "engine poisoned"; the bookkeeping beside them did not.
+    #[test]
+    fn a_poisoned_bookkeeping_cell_still_records_and_says_it_was_poisoned() {
+        let state = app_state();
+        let poisoner = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _held = poisoner.loaded_max_batch.lock().expect("fresh lock");
+            panic!("a load panicked while holding the bookkeeping");
+        })
+        .join()
+        .expect_err("the thread panicked, which is the point");
+        assert!(state.loaded_max_batch.is_poisoned(), "the cell is poisoned before we record");
+
+        record_max_batch(&state, 64);
+
+        assert_eq!(
+            *state.loaded_max_batch.lock().unwrap_or_else(|p| p.into_inner()),
+            Some(64),
+            "one panic costs one write, not every write from here on"
+        );
+        assert!(!state.loaded_max_batch.is_poisoned(), "and the cell was healed, as the engine locks are");
     }
 }

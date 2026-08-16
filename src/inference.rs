@@ -12,7 +12,6 @@ use crate::wedge::{EngineWedged, InFlight, InFlightStamp, Patience, Phase, Wedge
 use crate::wire::{EmbedResponse, PassTimings, RerankResponse, SparseVec, TokenUsage};
 use crate::compile_cache::{pass_log_message, CompileWatch, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
 
-
 // ---------- blocking inference ----------
 
 /// The batch a rerank call runs at: the request's value when it carries one, else the configured default.
@@ -270,6 +269,11 @@ pub(crate) fn embed_natural(
     stamp.enter(Phase::Running, format!("embed: embedding {} row(s)", texts.len()));
     // The duration below includes any settling re-runs — that is honest: it is what the caller waited.
     let (compiles, pass) = (CompileWatch::start(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE), Instant::now());
+    // INVARIANT: this rung is resident. Either it already was, or the block above built it and
+    // `remember_engine` filed it — and `guard` is the only handle that can evict, so nothing could have
+    // taken it between those lines. `RungCache` capacity is `max(1)`, so a fresh insert cannot evict
+    // itself either. Separate the insert from this `get_mut` and the `expect` becomes a live panic on
+    // the request path; keep them under one guard and it cannot fire.
     let engine = guard.get_mut(limits.max_length).expect("just loaded");
     // Rows are (dense, sparse) ZIPPED per text, so the settling retry polices one length and a short
     // first run can never shorten one head without the other.
@@ -391,6 +395,8 @@ pub(crate) fn score_documents(
     // so an owned query is what lets `&[String]` documents satisfy it.
     let results = guard
         .as_mut()
+        // Same invariant as the embed path: the caller built into this slot under the very guard it
+        // handed us, and nothing else can empty an `Option<TextRerank>` while it is held.
         .expect("just loaded")
         .rerank(query.to_string(), documents, false, Some(max_batch))?;
     let inference = pass.elapsed();

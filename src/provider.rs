@@ -11,59 +11,110 @@ use crate::wire::{join_error_text};
 /// Builds the ONE session both heads share. Its compiled-model cache slice is `dual/` — its own,
 /// never `dense/` or `sparse/`: a cache hit must always mean "MY program" (the 2026-07-27 stale-cache
 /// incident), and the per-head slices belong to the retired two-session binaries.
-pub(crate) fn load_dual(state: &AppState, provider_hint: &str, max_length: usize) -> anyhow::Result<Bgem3DualEmbedding> {
+/// Everything a session load does around the one line that differs — building the options.
+///
+/// The two loaders below were the same seven steps twice: pin the provider, preflight it, log the
+/// intent, build the options, build the session inside the engine's own cache slice while timing it, log
+/// the duration, record the outcome. Only the options builder genuinely differed, and the two types
+/// (`Bgem3DualInitOptions`, `RerankInitOptions`) share no trait — so the shape that removes the copy is
+/// a closure that receives the resolved provider and returns a session.
+///
+/// The preflight is here rather than only at startup because when `ORT_PROVIDER` is empty the provider
+/// is not known until the first request names it: the check has to run before the first session, not at
+/// the first user-visible failure. Startup already covered the explicit case.
+fn load_session<T>(
+    state: &AppState,
+    provider_hint: &str,
+    model: &str,
+    engine: &str,
+    build: impl FnOnce(&str) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let provider = pin_provider(state, provider_hint);
-    // The hint path's preflight: when ORT_PROVIDER was empty at startup the provider is only known
-    // now, so the same check runs here — before the first session, not at the first user-visible
-    // failure. Startup already covered the explicit case.
     if let Err(error) = preflight_provider(&provider, &exe_dir()) {
-        return record_session_outcome::<Bgem3DualEmbedding>(state, &provider, Err(error));
+        return record_session_outcome::<T>(state, &provider, Err(error));
     }
 
-    tracing::info!("loading {DUAL_MODEL} (provider {provider}, max_length {max_length})");
-    let mut options = Bgem3DualInitOptions::default()
-        .with_max_length(max_length)
-        .with_cache_dir(state.config.cache_dir.clone())
-        .with_execution_providers(execution_providers(&provider, state.config.device_id, state.dml_device_id()));
-    if state.config.intra_threads > 0 {
-        options = options.with_intra_threads(state.config.intra_threads);
-    }
-    let built = with_engine_cache(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE, || {
+    let built = with_engine_cache(&state.config.mxr_cache_base, engine, || {
         let started = std::time::Instant::now();
-        let engine = Bgem3DualEmbedding::try_new(options)?;
+        let session = build(&provider)?;
         tracing::info!(
-            "{DUAL_MODEL}: session ready in {:.1}s (the EP compiles or loads its cache lazily, on the first pass)",
+            "{model}: session ready in {:.1}s (the EP compiles or loads its cache lazily, on the first pass)",
             started.elapsed().as_secs_f32()
         );
-        Ok(engine)
+        Ok(session)
     });
     record_session_outcome(state, &provider, built)
 }
 
-pub(crate) fn load_rerank(state: &AppState, provider_hint: &str) -> anyhow::Result<TextRerank> {
-    let provider = pin_provider(state, provider_hint);
-    if let Err(error) = preflight_provider(&provider, &exe_dir()) {
-        return record_session_outcome::<TextRerank>(state, &provider, Err(error));
+/// Applies the knobs every model shares. `intra_threads` stays conditional: 0 means "let ONNX Runtime
+/// decide", which is not the same as asking it for zero threads.
+fn shared_options<O>(state: &AppState, provider: &str, options: O) -> O
+where
+    O: WithCommonOptions,
+{
+    let options = options
+        .cache_dir(state.config.cache_dir.clone())
+        .providers(execution_providers(provider, state.config.device_id, state.dml_device_id()));
+    match state.config.intra_threads {
+        0 => options,
+        threads => options.threads(threads),
     }
+}
 
-    tracing::info!("loading {RERANK_MODEL} (provider {provider}, max_length {})", state.config.rerank_max_length);
-    let mut options = RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
-        .with_max_length(state.config.rerank_max_length)
-        .with_cache_dir(state.config.cache_dir.clone())
-        .with_execution_providers(execution_providers(&provider, state.config.device_id, state.dml_device_id()));
-    if state.config.intra_threads > 0 {
-        options = options.with_intra_threads(state.config.intra_threads);
+/// The three option setters both fastembed builders happen to have, named once so `shared_options` can
+/// reach them. A trait rather than a macro: the compiler then checks each implementation against the
+/// builder it wraps, and an upstream rename becomes a compile error instead of a silently skipped knob.
+trait WithCommonOptions: Sized {
+    fn cache_dir(self, dir: std::path::PathBuf) -> Self;
+    fn providers(self, providers: Vec<ExecutionProviderDispatch>) -> Self;
+    fn threads(self, threads: usize) -> Self;
+}
+
+impl WithCommonOptions for Bgem3DualInitOptions {
+    fn cache_dir(self, dir: std::path::PathBuf) -> Self {
+        self.with_cache_dir(dir)
     }
-    let built = with_engine_cache(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE, || {
-        let started = std::time::Instant::now();
-        let engine = TextRerank::try_new(options)?;
-        tracing::info!(
-            "{RERANK_MODEL}: session ready in {:.1}s (the EP compiles or loads its cache lazily, on the first pass)",
-            started.elapsed().as_secs_f32()
-        );
-        Ok(engine)
-    });
-    record_session_outcome(state, &provider, built)
+    fn providers(self, providers: Vec<ExecutionProviderDispatch>) -> Self {
+        self.with_execution_providers(providers)
+    }
+    fn threads(self, threads: usize) -> Self {
+        self.with_intra_threads(threads)
+    }
+}
+
+impl WithCommonOptions for RerankInitOptions {
+    fn cache_dir(self, dir: std::path::PathBuf) -> Self {
+        self.with_cache_dir(dir)
+    }
+    fn providers(self, providers: Vec<ExecutionProviderDispatch>) -> Self {
+        self.with_execution_providers(providers)
+    }
+    fn threads(self, threads: usize) -> Self {
+        self.with_intra_threads(threads)
+    }
+}
+
+pub(crate) fn load_dual(state: &AppState, provider_hint: &str, max_length: usize) -> anyhow::Result<Bgem3DualEmbedding> {
+    load_session(state, provider_hint, DUAL_MODEL, EMBED_CACHE_ENGINE, |provider| {
+        tracing::info!("loading {DUAL_MODEL} (provider {provider}, max_length {max_length})");
+        Bgem3DualEmbedding::try_new(shared_options(
+            state,
+            provider,
+            Bgem3DualInitOptions::default().with_max_length(max_length),
+        ))
+    })
+}
+
+pub(crate) fn load_rerank(state: &AppState, provider_hint: &str) -> anyhow::Result<TextRerank> {
+    load_session(state, provider_hint, RERANK_MODEL, RERANK_CACHE_ENGINE, |provider| {
+        tracing::info!("loading {RERANK_MODEL} (provider {provider}, max_length {})", state.config.rerank_max_length);
+        TextRerank::try_new(shared_options(
+            state,
+            provider,
+            RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
+                .with_max_length(state.config.rerank_max_length),
+        ))
+    })
 }
 
 /// The provider all engines pin to: ORT_PROVIDER env wins, else the first request's hint, else auto.
@@ -323,10 +374,7 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::OnceLock;
-    
-    
-    
-    
+
     use crate::testing::*;
     
 
