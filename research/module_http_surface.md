@@ -17,13 +17,13 @@ flowchart LR
     end
     subgraph free["never queues without a ceiling"]
         HEALTH["GET /health<br/>try_lock only"]
-        TOKENIZE["POST /tokenize<br/>pure CPU"]
+        TOKENIZE["POST /tokenize<br/>no session, capped batch"]
         UNLOAD["POST /unload<br/>blocking pool, bounded wait"]
     end
     EMBED --> BLOCKING["spawn_blocking → embed_blocking"]
     RERANK --> BLOCKING2["spawn_blocking → rerank_blocking"]
     HEALTH --> STATE["AppState snapshot"]
-    TOKENIZE --> TOK["tokenizers, no session"]
+    TOKENIZE --> TOK["spawn_blocking: encode via<br/>TokenizerRegistry (loaded at startup)"]
     UNLOAD --> DROP["spawn_blocking: take under the lock,<br/>drop outside it"]
 ```
 
@@ -55,11 +55,23 @@ by score, while the C# consumer pairs by position.
 
 ### `POST /tokenize`
 
-`{ texts[], model: "bge" | "qwen" }` → `{ token_count[], model, available }`. Pure CPU: a vocabulary
-lookup and BPE merges, no session and no GPU, which is what makes it safe to call from inside an index
-pass. An unknown model name is a `400` — a count from the wrong tokenizer is worse than no count. A text
-the tokenizer **refuses** makes the whole answer `available: false` with an empty array: a `0` a caller
-cannot tell from an empty text is worse than an honest "not measured".
+`{ texts[], model }` → `{ token_count[], model, available }`. No session and no GPU, which is what makes
+it safe to call from inside an index pass — it never queues behind the card.
+
+`model` resolves through the **tokenizer registry** (`TokenizerRegistry`, built once at startup), not a
+string match: `bge` (default when the field is absent) and `qwen` today, and a third model is a row plus a
+path rather than a code change. Three refusals, and they are deliberately different answers:
+
+| Situation | Answer |
+|---|---|
+| A name this build does not register | `400`, **naming every registered row** so the caller can correct itself |
+| A registered name whose file is absent or unparseable | `200`, `available: false`, empty array — the name was right, the deployment is missing something |
+| The tokenizer **refuses** one of the texts | the same `available: false` — a `0` a caller cannot tell from an empty text is worse than an honest "not measured" |
+| More than `TOKENIZE_MAX_TEXTS` texts | `400` naming the cap — the encode is CPU work and the body limit does not bound the row count |
+
+The encode itself runs inside `spawn_blocking`, as `/embed`'s always has: "pure CPU" is a claim about the
+GPU, not about the async runtime, and a batch of ten thousand encodes in front of the reactor stalls
+`/health` and `/unload` — the two endpoints an operator reaches for when something is stalled.
 
 ### `GET /health`
 

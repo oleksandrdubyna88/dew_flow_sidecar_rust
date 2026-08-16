@@ -1,8 +1,23 @@
 # PLAN — tokenizers by name, and a model that can describe itself
 
-> Status: **plan only, nothing implemented yet.** Scope: the `/tokenize` handler and its tokenizer
-> loading, one new `/models` read, and the embedding dimension on the wire. **Not in scope:** a second
-> embedding model behind `/embed` — see §5.
+> Status: **step 1 implemented 2026-08-16 — the registry; steps 2 (`GET /models`) and 3 (dimension on
+> `/embed`) remain open.** Scope: the `/tokenize` handler and its tokenizer loading, one new `/models`
+> read, and the embedding dimension on the wire. **Not in scope:** a second embedding model behind
+> `/embed` — see §5.
+>
+> **What step 1 shipped, and its one deviation.** `TokenizerRegistry` / `TokenizerEntry` /
+> `TokenizerSource` replace the two `OnceLock` fields and the two-arm match; rows load at startup;
+> `/tokenize` resolves through the table and an unknown name is refused naming the registered set; the
+> startup log names every row with the file behind it. It landed together with
+> [PLAN_reliability_tail.md](PLAN_reliability_tail.md) item 2, as §6 asked — the encode moved to
+> `spawn_blocking` and gained a `TOKENIZE_MAX_TEXTS` cap in the same change.
+>
+> *Deviation:* item 2's cap was drafted as "matching the one `/embed` already enforces". It is **not**
+> that number. `/embed` does not refuse at `max_batch`, it re-batches internally, and the host assembles
+> `/tokenize` calls of up to 512 rows by design (`SidecarClient.RequestRowBudget`, `dew_flow_rag_qln`) —
+> so a cap at `max_batch` (64) would have refused batches its only caller builds on purpose. Shipped at
+> **4096**, eight times the host's ceiling: a backstop against a pathological caller, never a wall a
+> normal pass walks into. A test asserts the headroom rather than the constant.
 >
 > Sibling half: `dew_flow_rag_qln · todo/PLAN_tokenizer_contract_and_chunk_coverage.md`, whose step 1
 > makes the .NET tokenizer port name its model. This plan makes that name mean something on this side.
@@ -149,13 +164,30 @@ Inline `#[cfg(test)]` tests, as the repository does today.
 
 ## 8. Definition of Done
 
-- [ ] A new tokenizer is a registry row and a file path — no new match arm, no new field.
-- [ ] An unknown tokenizer name is refused naming the registered set.
-- [ ] `bge` and `qwen` answer byte-identically to before.
+- [x] A new tokenizer is a registry row and a file path — no new match arm, no new field.
+- [x] An unknown tokenizer name is refused naming the registered set.
+      (`an_unknown_tokenizer_is_refused_naming_every_registered_name`, three rows — two can be hardcoded,
+      three cannot.)
+- [x] `bge` and `qwen` answer byte-identically to before.
+      (`a_missing_tokenizer_file_degrades_one_name_and_leaves_the_others_answering` — green before the
+      change and after it, which is the whole of what a regression guard is for.)
 - [ ] `GET /models` states kind, dimension, max sequence length and tokenizer per entry, with unknown
       distinct from zero.
 - [ ] `/embed` reports its own dimension.
-- [ ] `README.md` and `research/module_http_surface.md` updated; `todo/README.md` table updated.
+- [x] `README.md` and `research/module_http_surface.md` updated; `todo/README.md` table updated.
+      (Step 1's half; both gain the `/models` shape when step 2 lands.)
+
+### Step 1's test record
+
+| Guarantee | Test | Observed |
+|---|---|---|
+| Tokenizers are read at STARTUP, not on the first request | `a_tokenizer_present_at_startup_still_counts_after_its_file_is_gone` | **RED** first: *"a loader that reads on first use instead answers None here"* → GREEN |
+| A batch past the cap is refused, not encoded | `tokenize_refuses_a_batch_beyond_the_cap` | **RED** first: returned `Ok` having counted all **1025** texts inline → GREEN |
+| The refusal names every registered row | `an_unknown_tokenizer_is_refused_naming_every_registered_name` | ships with the registry — it cannot be expressed before a third row can exist |
+| The default cap clears the host's own row budget | `the_default_batch_cap_leaves_room_above_the_hosts_own_row_budget` | ships with the config field |
+| bge/qwen behaviour unchanged | `a_missing_tokenizer_file_degrades_one_name_and_leaves_the_others_answering` | green on both sides |
+
+Suite: 62 → **67 passed, 0 failed**, no compiler warnings.
 
 ## 9. Open questions
 

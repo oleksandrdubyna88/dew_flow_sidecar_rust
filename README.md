@@ -77,6 +77,8 @@ Absent ⇒ empty echo, unprefixed logs.
 | `EMBED_MAX_LENGTH` | 1024 | Default token cap for both embedding engines — **the VRAM driver, squared in the peak below**. **Overridable per request** (`max_length`); a change evicts the loaded engines so they rebuild at the new cap. |
 | `RERANK_MAX_LENGTH` | 1024 | Token cap for reranker pairs |
 | `MODEL_CACHE_DIR` | `.model-cache` | Where model files download to |
+| `QWEN_TOKENIZER` | `../qwen-tokenizer/tokenizer.json` | The file behind the `qwen` row of the tokenizer registry. **Counting only** — no Qwen model is ever loaded here. |
+| `TOKENIZE_MAX_TEXTS` | 4096 | Texts one `/tokenize` call may carry; past it the call is refused with a `400` naming the cap. A runtime limit, not a memory one — the request body cap does **not** bound the row count, and a 10,000-file pass once sent 52,617 texts in one request. Eight times the host's own per-request row budget (`SidecarClient.RequestRowBudget` = 512), so it is a backstop rather than a wall. |
 | `WEDGE_RUNNING_AFTER_SECONDS` | 900 | A forward pass held longer than this is **wedged** — see below |
 | `WEDGE_BUILDING_AFTER_SECONDS` | 3600 | The same for a session build + canary, which legitimately contains a multi-minute compile |
 | `UNLOAD_LOCK_WAIT_SECONDS` | 30 | How long `/unload` waits for an engine before answering "still loaded" |
@@ -176,9 +178,9 @@ So every `/embed` reply now carries, parallel to `texts`:
 | `max_length` | The **effective** cap they were judged against (after `cap_for`, which forbids a `query` from moving the loaded rung). |
 | `token_accounting` | `false` = NOT MEASURED — the tokenizer would not load, **or it refused one of the texts**. The two arrays are then empty, and a caller must not read "no truncation reported" as "nothing was truncated". |
 
-The counter is BGE-M3's own `tokenizer.json`, read from the model cache on first use purely to count; it
-never feeds inference. A missing file logs a warning at startup and turns accounting off rather than
-failing the sidecar. A text the tokenizer *refuses* does the same for that response: the count used to be
+The counter is BGE-M3's own `tokenizer.json`, resolved through the **tokenizer registry** at startup
+(see below) purely to count; it never feeds inference. A missing file logs a warning at startup and turns
+accounting off rather than failing the sidecar. A text the tokenizer *refuses* does the same for that response: the count used to be
 folded to `0`, which reads as "measured, and definitely not truncated" — the exact inversion of the only
 guarantee this accounting exists to give, on the one signal the host cannot compute for itself.
 
@@ -200,6 +202,41 @@ own count:
 Real text runs at **2.99–3.50 chars/token**. The host had been budgeting 4 — a ~34 % overshoot: 1024
 characters of C# is 300 tokens against a cap of 256, so 44 tokens of every filled chunk were thrown away.
 `EmbedBudget` (host side) now spends the measured floor less a safety margin.
+
+## The tokenizer registry: counting for models this process never loads (2026-08-16)
+
+This sidecar can **count** for a wider set of models than it can **embed**, and that is deliberate. A
+chunker has to size a chunk with the serving model's *own* tokenizer — a chunk fitted to a window the
+model does not have is a chunk that gets truncated — and nothing on the .NET side can read a HuggingFace
+`tokenizer.json` at all (`Microsoft.ML.Tokenizers` has no regex pre-tokenizer and no NFC normalizer).
+Counting therefore happens where the reference implementation already lives.
+
+The names `/tokenize` answers for are a **table, not a match arm**:
+
+| Row | File | Kind |
+|---|---|---|
+| `bge` | discovered under `MODEL_CACHE_DIR` (the snapshot folder is a content hash, so it is found, not hardcoded) | also what `/embed`'s truncation accounting counts with |
+| `qwen` | `QWEN_TOKENIZER` | counting only — no Qwen model is ever loaded |
+
+Three properties are the contract:
+
+- **Registered ≠ available.** An unknown name is a `400` that **names every registered row**, so a caller
+  corrects itself from the answer instead of reading this file. A *registered* name whose file is missing
+  is a `200` with `available: false` — the caller's name was right and the deployment is what is missing,
+  and collapsing the two would send a chunker hunting for a typo while a file was simply absent.
+- **Loaded at startup, never on the first request.** The counters used to be `OnceLock`s filled inside the
+  first `/tokenize` call, so that request paid a directory walk and a multi-MB parse *on the async
+  runtime*, and a model cache swapped under a running sidecar silently changed the answer. The startup log
+  names every row and the file behind it — a count whose tokenizer nobody can name afterwards is a count
+  nobody can reproduce.
+- **The encode runs on the blocking pool, under a cap.** "Pure CPU" is a statement about the card, not
+  about the reactor. `TOKENIZE_MAX_TEXTS` bounds the rows because the body limit does not: enough short
+  texts fit under 2 MB to be tens of thousands of encodes in front of `/health` and `/unload`, which are
+  the two endpoints an operator reaches for when something is stalled.
+
+Adding a third model is a row and a path. Reporting **what** each row is — kind, embedding dimension, max
+sequence length — is `GET /models`, still open in
+[todo/PLAN_tokenizer_registry.md](todo/PLAN_tokenizer_registry.md).
 
 ## AMD on Linux/WSL (ROCm via the MIGraphX EP)
 

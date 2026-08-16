@@ -107,6 +107,12 @@ struct Config {
     cache_dir: PathBuf,
     /// Where Qwen's `tokenizer.json` lives (`QWEN_TOKENIZER`). Counting only — no Qwen model is ever loaded.
     qwen_tokenizer_path: PathBuf,
+    /// The most texts one `/tokenize` call may carry.
+    ///
+    /// Not a memory limit — a RUNTIME limit. The encode is pure CPU, and axum's body cap does not bound
+    /// the ROW count: a 10,000-file pass sent 52,617 texts in one request, and enough of them are short
+    /// that such a batch fits under 2 MB while still being tens of thousands of encodes.
+    tokenize_max_texts: usize,
     /// Force every embedding batch into ONE tensor shape (see `pin_shape`). "auto" (the default)
     /// turns it on only for MIGraphX, the provider that compiles per shape; "1"/"0" force it.
     pin_input_shape: String,
@@ -144,6 +150,11 @@ impl Config {
             // Beside this tool by default (tools/qwen-tokenizer/), because it belongs to the SEMANTIC
             // channel rather than to any model this sidecar loads — it is here only to be counted with.
             qwen_tokenizer_path: PathBuf::from(env_str("QWEN_TOKENIZER", "../qwen-tokenizer/tokenizer.json")),
+            // 4096 — eight times the host's own per-request row budget (`SidecarClient.RequestRowBudget`
+            // = 512, dew_flow_rag_qln), so this is a backstop against a pathological caller and never a
+            // wall a normal pass walks into. A cap at the host's number would refuse batches its only
+            // caller assembles by design.
+            tokenize_max_texts: env_parse("TOKENIZE_MAX_TEXTS", 4096),
             pin_input_shape: env_str("PIN_INPUT_SHAPE", "auto"),
             mxr_cache_base: env_str("ORT_MIGRAPHX_MODEL_CACHE_PATH", ""),
             // 1, not 2: the host ships a SINGLE 256 rung now (RagSettingLimits.PlanFor), so a second slot
@@ -609,19 +620,14 @@ struct AppState {
     loaded_max_batch: Mutex<Option<usize>>,
     /// The DXGI adapter ORT_DEVICE_ID resolves to (None = mapping unavailable — raw id fallback).
     adapter: Option<adapters::ResolvedAdapter>,
-    /// BGE-M3's own tokenizer, read from the model cache on first use purely to COUNT tokens for
-    /// `TokenUsage` — it never feeds inference, which stays entirely fastembed's. `None` means the
-    /// file was not found or would not parse, and every response then says `token_accounting: false`
-    /// rather than quietly reporting zero truncations.
-    token_counter: OnceLock<Option<tokenizers::Tokenizer>>,
-    /// Qwen's tokenizer, for the SEMANTIC channel — which this sidecar never embeds. It lives here anyway
-    /// because this is the only process that already speaks the HuggingFace `tokenizer.json` format
-    /// natively: `Microsoft.ML.Tokenizers` cannot read that format at all (no regex pre-tokenizer, no NFC
-    /// normalizer), so counting in C# would have meant transcribing Qwen's pre-tokenizer regex and its
-    /// byte-level rules by hand — precisely the silent near-miss this accounting exists to prevent. Here
-    /// the reference implementation reads the file verbatim. `None` when the file is absent, and
-    /// `/tokenize` then says so instead of guessing.
-    qwen_counter: OnceLock<Option<tokenizers::Tokenizer>>,
+    /// Every tokenizer this build can COUNT with, resolved at startup — see `TokenizerRegistry`.
+    ///
+    /// Deliberately a wider set than the models this process embeds: the semantic channel runs on Ollama,
+    /// but nothing on that side can read a HuggingFace `tokenizer.json` at all (`Microsoft.ML.Tokenizers`
+    /// has no regex pre-tokenizer and no NFC normalizer), so counting in C# would have meant transcribing
+    /// a pre-tokenizer regex and its byte-level rules by hand — precisely the silent near-miss this
+    /// accounting exists to prevent. Here the reference implementation reads the file verbatim.
+    tokenizers: TokenizerRegistry,
 }
 
 /// The per-request memory envelope: how long a single sequence may get and how many run together.
@@ -657,44 +663,132 @@ impl AppState {
         self.adapter.as_ref().map_or(self.config.device_id, |a| a.dml_device_id)
     }
 
-    /// The token counter, loaded once. Deliberately best-effort: a missing tokenizer must not stop a
-    /// sidecar from embedding, it must only stop it from CLAIMING nothing was truncated.
+    /// BGE-M3's counter — what `/embed`'s own truncation accounting counts with. Resolved through the
+    /// registry so there is exactly ONE place in this process a tokenizer can come from.
     fn token_counter(&self) -> Option<&tokenizers::Tokenizer> {
-        self.token_counter
-            .get_or_init(|| load_token_counter(&self.config.cache_dir))
-            .as_ref()
-    }
-
-    /// Qwen's counter, loaded once from `QWEN_TOKENIZER` (default `../qwen-tokenizer/tokenizer.json`,
-    /// beside this tool). Same best-effort contract: absent means `/tokenize` reports it, never guesses.
-    fn qwen_counter(&self) -> Option<&tokenizers::Tokenizer> {
-        self.qwen_counter
-            .get_or_init(|| load_named_tokenizer("qwen", &self.config.qwen_tokenizer_path))
-            .as_ref()
+        self.tokenizers.entry(BGE_TOKENIZER).and_then(|entry| entry.tokenizer.as_ref())
     }
 }
 
-/// Loads a tokenizer from an explicit file path. Shared by every model this sidecar can COUNT for — which
-/// is deliberately a wider set than the models it embeds: the semantic channel runs on Ollama, but nothing
-/// on that side can read a HuggingFace `tokenizer.json`, so the count has to happen where the reference
-/// implementation already lives.
-fn load_named_tokenizer(name: &str, path: &Path) -> Option<tokenizers::Tokenizer> {
-    if !path.is_file() {
-        tracing::warn!(
-            "no {name} tokenizer at `{}` — /tokenize will report it unavailable for that model rather \
-             than estimate a count",
-            path.display()
-        );
-        return None;
+/// BGE-M3's tokenizer — the one `/embed`'s own truncation accounting counts with.
+const BGE_TOKENIZER: &str = "bge";
+/// Qwen's, for the SEMANTIC channel this sidecar never embeds. Counting only.
+const QWEN_TOKENIZER: &str = "qwen";
+
+/// One row of the registry AS DECLARED, before anything is read from disk.
+///
+/// `consequence` is why this is a struct and not a pair. A missing tokenizer costs different things for
+/// different names — bge's absence turns `/embed`'s truncation accounting off, qwen's only makes one
+/// `/tokenize` name unavailable — and one generic warning would have made the two read identically in
+/// the log, which is the only place an operator ever meets them.
+struct TokenizerSource {
+    name: &'static str,
+    /// `None` = discovery found no file to even try, which is a different fact from "a path that would
+    /// not parse" and is logged as one.
+    path: Option<PathBuf>,
+    consequence: &'static str,
+}
+
+/// A tokenizer name this build answers for, resolved.
+struct TokenizerEntry {
+    name: &'static str,
+    /// The file it was actually loaded from. Recorded rather than inferred: a count whose tokenizer
+    /// nobody can name afterwards is a count nobody can reproduce.
+    source: Option<PathBuf>,
+    /// `None` = registered, but not loadable in THIS deployment. On the wire that is a 200 with
+    /// `available: false`, never a 400 — the caller's name was right and the machine is what is missing.
+    tokenizer: Option<tokenizers::Tokenizer>,
+}
+
+/// Every tokenizer this build can count with.
+///
+/// A table, not a `match`. The two names used to be two hand-written fields resolved by a two-arm string
+/// match, so a third model was a code change in three places and a caller could not discover what this
+/// build counts for. Here a model is a row and a path, and the refusal for an unknown name can NAME the
+/// alternatives instead of repeating a sentence somebody has to remember to edit.
+struct TokenizerRegistry {
+    entries: Vec<TokenizerEntry>,
+}
+
+impl TokenizerRegistry {
+    /// Declares this build's rows and loads every one of them NOW.
+    ///
+    /// Eager on purpose (`todo/PLAN_reliability_tail.md` item 2): the counters used to be `OnceLock`s
+    /// filled by `get_or_init` inside the FIRST `/tokenize` call, so that request paid a directory walk
+    /// and a multi-MB parse on the async runtime — and a model cache swapped under a running sidecar
+    /// silently decided the answer.
+    fn load(config: &Config) -> Self {
+        Self::from_sources(vec![
+            TokenizerSource {
+                name: BGE_TOKENIZER,
+                // The snapshot folder is a content hash that changes when the model is re-pulled, so the
+                // path is discovered rather than hardcoded.
+                path: find_tokenizer_file(&config.cache_dir),
+                consequence: "/embed will report token_accounting: false, and the host cannot then prove \
+                              that no input was silently truncated",
+            },
+            TokenizerSource {
+                name: QWEN_TOKENIZER,
+                path: Some(config.qwen_tokenizer_path.clone()),
+                consequence: "/tokenize will report that name unavailable rather than estimate a count",
+            },
+        ])
     }
-    match tokenizers::Tokenizer::from_file(path) {
-        Ok(t) => {
+
+    fn from_sources(sources: Vec<TokenizerSource>) -> Self {
+        Self { entries: sources.into_iter().map(load_tokenizer_row).collect() }
+    }
+
+    /// The row for a name — whether or not it could be loaded. `None` means the name is not registered
+    /// here at all, which is the only case that is the CALLER's mistake.
+    fn entry(&self, name: &str) -> Option<&TokenizerEntry> {
+        self.entries.iter().find(|entry| entry.name == name)
+    }
+
+    /// Every registered name, in declaration order, quoted — what an unknown-name refusal reports so the
+    /// caller can correct itself rather than guess.
+    fn names(&self) -> String {
+        self.entries.iter().map(|entry| format!("'{}'", entry.name)).collect::<Vec<_>>().join(", ")
+    }
+
+    /// Every row with its file and whether it can answer — the startup summary.
+    ///
+    /// Naming the SOURCE is the point rather than decoration: a count is reproducible only if the file
+    /// behind it can be named afterwards, and a silently updated `tokenizer.json` changes every count
+    /// without changing anything a consumer can see. `GET /models`
+    /// (`todo/PLAN_tokenizer_registry.md` §3.2) will report these same facts on the wire.
+    fn describe(&self) -> String {
+        self.entries
+            .iter()
+            .map(|entry| match (&entry.source, entry.tokenizer.is_some()) {
+                (Some(path), true) => format!("'{}' <- {}", entry.name, path.display()),
+                (Some(path), false) => format!("'{}' UNAVAILABLE (would not parse: {})", entry.name, path.display()),
+                (None, _) => format!("'{}' UNAVAILABLE (no file found)", entry.name),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Reads one declared row.
+///
+/// Best-effort throughout: a name whose file is absent or unparseable is registered-but-unavailable,
+/// never a startup failure. A sidecar that cannot COUNT must still EMBED — the missing tokenizer has to
+/// stop us CLAIMING nothing was truncated, not stop us serving.
+fn load_tokenizer_row(source: TokenizerSource) -> TokenizerEntry {
+    let TokenizerSource { name, path, consequence } = source;
+    let Some(path) = path.filter(|p| p.is_file()) else {
+        tracing::warn!("no {name} tokenizer file found — {consequence}");
+        return TokenizerEntry { name, source: None, tokenizer: None };
+    };
+    match tokenizers::Tokenizer::from_file(&path) {
+        Ok(tokenizer) => {
             tracing::info!("{name} token counting enabled from `{}`", path.display());
-            Some(t)
+            TokenizerEntry { name, source: Some(path), tokenizer: Some(tokenizer) }
         }
         Err(e) => {
-            tracing::warn!("{name} tokenizer at `{}` would not parse ({e}) — counting is off", path.display());
-            None
+            tracing::warn!("{name} tokenizer at `{}` would not parse ({e}) — {consequence}", path.display());
+            TokenizerEntry { name, source: Some(path), tokenizer: None }
         }
     }
 }
@@ -708,27 +802,6 @@ fn find_tokenizer_file(cache_dir: &Path) -> Option<PathBuf> {
         .filter_map(|e| e.ok())
         .map(|e| e.path().join("tokenizer.json"))
         .find(|p| p.is_file())
-}
-
-fn load_token_counter(cache_dir: &Path) -> Option<tokenizers::Tokenizer> {
-    let Some(path) = find_tokenizer_file(cache_dir) else {
-        tracing::warn!(
-            "no BGE-M3 tokenizer.json under `{}` — /embed will report token_accounting: false, and the \
-             host cannot then prove that no input was silently truncated",
-            cache_dir.display()
-        );
-        return None;
-    };
-    match tokenizers::Tokenizer::from_file(&path) {
-        Ok(tokenizer) => {
-            tracing::info!("token accounting enabled from `{}`", path.display());
-            Some(tokenizer)
-        }
-        Err(e) => {
-            tracing::warn!("BGE-M3 tokenizer at `{}` would not parse ({e}) — token accounting is off", path.display());
-            None
-        }
-    }
 }
 
 /// Counts what each text really costs and flags the ones whose tail the cap will discard.
@@ -881,6 +954,15 @@ async fn main() {
         "engine cache: up to {} sequence rung(s) stay resident per head — a cap change is a lookup, not a rebuild (EMBED_ENGINE_CACHE_RUNGS raises it when the two-rung ladder is opted back in)",
         state_config_preview.engine_cache_rungs.max(1)
     );
+    // Every tokenizer is read HERE, before the listener is up — so no request pays a directory walk and
+    // a multi-MB parse, and what this build can count for is in the startup log rather than discovered
+    // by a caller getting a 400.
+    let tokenizers = TokenizerRegistry::load(&config);
+    tracing::info!(
+        "tokenizers registered: {} (up to TOKENIZE_MAX_TEXTS={} texts per call) — an unknown name is refused naming this set",
+        tokenizers.describe(),
+        config.tokenize_max_texts
+    );
     let state = Arc::new(AppState {
         engines: Engines::new(config.engine_cache_rungs),
         config,
@@ -891,8 +973,7 @@ async fn main() {
         loaded_embed_max_length: Mutex::new(None),
         loaded_max_batch: Mutex::new(None),
         adapter,
-        token_counter: OnceLock::new(),
-        qwen_counter: OnceLock::new(),
+        tokenizers,
     });
 
     tracing::info!(
@@ -1229,7 +1310,7 @@ struct TokenizeRequest {
     model: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct TokenizeResponse {
     /// Tokens each text costs, special tokens included, with NO truncation applied — the caller is asking
     /// precisely so it can split BEFORE anything is capped.
@@ -1400,7 +1481,7 @@ struct ModelNames {
     rerank: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct ErrorResponse {
     error: String,
 }
@@ -1674,36 +1755,82 @@ async fn embed(
     Ok(Json(result))
 }
 
-/// Pure CPU: a vocabulary lookup and BPE merges, no session, no GPU, no model weights. That is what makes
-/// it safe to call from an index pass — it never queues behind the card.
+/// The name this request counts with: its own, or bge when it named none.
+fn requested_tokenizer(model: &str) -> String {
+    match model.trim() {
+        "" => BGE_TOKENIZER.to_string(),
+        named => named.to_string(),
+    }
+}
+
+/// Refuses a name this build does not register, NAMING the ones it does.
+///
+/// The refusal is the discoverability: a caller that misspells a tokenizer learns the registered set
+/// from the answer instead of reading this file. Serving the request with the wrong tokenizer would
+/// answer confidently and wrongly, which is the one outcome a chunker cannot detect.
+fn known_tokenizer(state: &AppState, model: &str) -> Result<(), ApiError> {
+    match state.tokenizers.entry(model) {
+        Some(_) => Ok(()),
+        None => Err(bad_request(format!(
+            "unknown tokenizer '{model}' — this sidecar counts for {}. Serving the request with the \
+             wrong tokenizer would answer confidently and wrongly.",
+            state.tokenizers.names()
+        ))),
+    }
+}
+
+/// Refuses a batch past `TOKENIZE_MAX_TEXTS`, stating the cap so the caller can batch to it.
+fn tokenize_batch_within_cap(config: &Config, texts: usize) -> Result<(), ApiError> {
+    if texts <= config.tokenize_max_texts {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "{texts} texts in one /tokenize call, and the cap is {} (TOKENIZE_MAX_TEXTS) — split the batch. \
+         The encode is pure CPU, and the request body limit does not bound the ROW count: enough short \
+         texts fit under it to occupy this process for seconds.",
+        config.tokenize_max_texts
+    )))
+}
+
+/// Counts tokens without embedding: a vocabulary lookup and BPE merges, no session, no GPU, no model
+/// weights. That is what makes it safe to call from an index pass — it never queues behind the card.
+///
+/// The encode runs on the BLOCKING pool even so. "Pure CPU" is a statement about the card, not about the
+/// reactor: a batch of ten thousand encodes in front of the async runtime stalls /health and /unload,
+/// which are the two endpoints an operator reaches for when something is stalled. /embed has always
+/// tokenized inside its own `spawn_blocking`, and this is the same work.
 async fn tokenize(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<TokenizeResponse>, ApiError> {
-    let model = if req.model.trim().is_empty() { "bge" } else { req.model.trim() };
-    let counter = match model {
-        "bge" => state.token_counter(),
-        "qwen" => state.qwen_counter(),
-        other => {
-            return Err(bad_request(format!(
-                "unknown tokenizer '{other}' — this sidecar counts for 'bge' and 'qwen'. Serving the \
-                 request with the wrong tokenizer would answer confidently and wrongly."
-            )))
-        }
-    };
+    let TokenizeRequest { texts, model } = req;
+    let model = requested_tokenizer(&model);
+    known_tokenizer(&state, &model)?;
+    tokenize_batch_within_cap(&state.config, texts.len())?;
 
-    let Some(tokenizer) = counter else {
-        return Ok(Json(TokenizeResponse { token_count: vec![], model: model.to_string(), available: false }));
-    };
+    let shared = state.clone();
+    let counting = model.clone();
+    // Resolved again inside the task rather than carried in: the borrow cannot cross `spawn_blocking`,
+    // and re-reading a two-row table is free next to an `.expect()` that a later refactor could turn
+    // into a panic on the request path.
+    let counted = tokio::task::spawn_blocking(move || {
+        shared
+            .tokenizers
+            .entry(&counting)
+            .and_then(|entry| entry.tokenizer.as_ref())
+            .map(|tokenizer| count_tokens(tokenizer, &texts, "tokenize"))
+    })
+    .await
+    .map_err(|e| internal_error(anyhow::anyhow!("tokenize task panicked: {}", join_error_text(e))))?;
 
     // Same rule as /embed's accounting: one refusal makes the whole answer UNKNOWN rather than zero.
     // A caller asks here precisely so it can split BEFORE anything is capped, and a `0` it cannot tell
-    // from an empty text is worse than an honest "not measured".
-    let Some(token_count) = count_tokens(tokenizer, &req.texts, "tokenize").into_iter().collect::<Option<Vec<usize>>>()
-    else {
-        return Ok(Json(TokenizeResponse { token_count: vec![], model: model.to_string(), available: false }));
+    // from an empty text is worse than an honest "not measured". An unloadable tokenizer folds into the
+    // same answer: both mean NOT MEASURED, and the wire has one way to say that.
+    let Some(token_count) = counted.and_then(|counts| counts.into_iter().collect::<Option<Vec<usize>>>()) else {
+        return Ok(Json(TokenizeResponse { token_count: vec![], model, available: false }));
     };
-    Ok(Json(TokenizeResponse { token_count, model: model.to_string(), available: true }))
+    Ok(Json(TokenizeResponse { token_count, model, available: true }))
 }
 
 async fn rerank(
@@ -2758,14 +2885,16 @@ mod tests {
     use super::{
         aligned_scores, cache_dir_verdict, compiled_providers, dylib_verdict, effective_provider, engine_cache_dir,
         execution_providers, copy_missing_files, embed_settling, find_tokenizer_file, health, inflight_now,
-        join_error_text, loaded_now, lock_or_refuse, cap_for, load_token_counter, parse_unload_request,
+        join_error_text, loaded_now, lock_or_refuse, cap_for, parse_unload_request,
         pass_log_message, pin_shape, preflight_provider, rerank_batch, required_provider_libraries, ruler_text,
-        should_pin_shape, unload, unpin_rows, usage_from_counts, wedge_action, with_engine_cache, write_inflight,
-        AppState, Config, EmbedResponse, Engines, InFlight, PassTimings, Patience, Phase, Provenance,
-        RungCache, TokenUsage, WedgeAction, WedgePolicy, SETTLE_ATTEMPTS,
+        should_pin_shape, tokenize, unload, unpin_rows, usage_from_counts, wedge_action, with_engine_cache,
+        write_inflight, AppState, Config, EmbedResponse, Engines, InFlight, PassTimings, Patience, Phase,
+        Provenance, RungCache, TokenUsage, TokenizeRequest, TokenizerRegistry, TokenizerSource, WedgeAction,
+        WedgePolicy, BGE_TOKENIZER, SETTLE_ATTEMPTS,
     };
     use axum::body::Bytes;
     use axum::extract::State;
+    use axum::http::StatusCode;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -2796,9 +2925,33 @@ mod tests {
     /// A sidecar state with no engines and no GPU behind it. Every reliability test here exercises
     /// the LOCKS and the probe path, never the model, so an empty state is the whole subject.
     fn app_state() -> Arc<AppState> {
+        app_state_with(config(""))
+    }
+
+    /// The same empty state over a CHOSEN config — what the tokenizer tests need, since the whole
+    /// subject there is which files the configuration points at.
+    fn app_state_with(config: Config) -> Arc<AppState> {
+        let tokenizers = TokenizerRegistry::load(&config);
+        app_state_full(config, tokenizers)
+    }
+
+    /// A state registering the given names with NO file behind any of them. Routing — which name is
+    /// known, which is refused, and what the refusal says — is decided before a tokenizer is ever
+    /// touched, so the files are beside the point for those tests.
+    fn app_state_with_tokenizers(names: &[&'static str]) -> Arc<AppState> {
+        let tokenizers = TokenizerRegistry::from_sources(
+            names
+                .iter()
+                .map(|&name| TokenizerSource { name, path: None, consequence: "a test row" })
+                .collect(),
+        );
+        app_state_full(config(""), tokenizers)
+    }
+
+    fn app_state_full(config: Config, tokenizers: TokenizerRegistry) -> Arc<AppState> {
         Arc::new(AppState {
             engines: Engines::new(2),
-            config: config(""),
+            config,
             activity: Mutex::new("idle".to_string()),
             pinned_provider: OnceLock::new(),
             active_provider: Mutex::new(None),
@@ -2806,8 +2959,7 @@ mod tests {
             loaded_embed_max_length: Mutex::new(None),
             loaded_max_batch: Mutex::new(None),
             adapter: None,
-            token_counter: OnceLock::new(),
-            qwen_counter: OnceLock::new(),
+            tokenizers,
         })
     }
 
@@ -2850,11 +3002,16 @@ mod tests {
             intra_threads: 0,
             embed_max_length: 1024,
             rerank_max_length: 1024,
-            cache_dir: PathBuf::from(".model-cache"),
-            qwen_tokenizer_path: PathBuf::from("../qwen-tokenizer/tokenizer.json"),
+            // Deliberately paths that do NOT exist. A unit state must not resolve differently on a
+            // machine that happens to have a model cache beside the source — and now that the registry
+            // loads eagerly, pointing at the real `.model-cache` would parse a 17 MB tokenizer in every
+            // test that builds a state. The tokenizer tests point this at their own fixture.
+            cache_dir: PathBuf::from("no-model-cache-in-tests"),
+            qwen_tokenizer_path: PathBuf::from("no-qwen-tokenizer-in-tests/tokenizer.json"),
             pin_input_shape: "auto".to_string(),
             mxr_cache_base: String::new(),
             engine_cache_rungs: 2,
+            tokenize_max_texts: 4096,
             wedge: test_wedge_policy(),
         }
     }
@@ -3510,9 +3667,15 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
 
         assert!(find_tokenizer_file(&empty).is_none());
-        // ...and the loader degrades to "off" rather than failing the sidecar: a missing tokenizer must
-        // stop us CLAIMING nothing was truncated, never stop us embedding.
-        assert!(load_token_counter(&empty).is_none());
+        // ...and the registry degrades to "off" rather than failing the sidecar: a missing tokenizer must
+        // stop us CLAIMING nothing was truncated, never stop us embedding. The row still EXISTS — the
+        // name stays registered so /tokenize answers `available: false` instead of "no such tokenizer".
+        let mut config = config("");
+        config.cache_dir = empty.clone();
+        let registry = TokenizerRegistry::load(&config);
+        let bge = registry.entry(BGE_TOKENIZER).expect("the row is declared even with no file behind it");
+        assert!(bge.tokenizer.is_none(), "nothing loaded");
+        assert!(bge.source.is_none(), "and there was no file to name");
         std::fs::remove_dir_all(&empty).ok();
     }
 
@@ -3818,4 +3981,149 @@ mod tests {
         assert!(std::ptr::eq(ruler_text(), ruler_text()), "the same buffer, not a fresh copy per request");
         assert!(ruler_text().len() > 100_000, "still long enough to truncate to any cap we allow");
     }
+
+    // ---------- the tokenizer registry ----------
+
+    /// A VALID tokenizer.json, minimal: WordLevel over three words, whitespace pre-tokenizer. The real
+    /// BGE-M3 file is 17 MB and these tests are about WHEN a file is read and WHICH name it answers for,
+    /// never about what the counts are — so the smallest thing the `tokenizers` crate will actually parse
+    /// is the right fixture. Verified to load and encode before anything was built on it.
+    const FIXTURE_TOKENIZER: &[u8] = br#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null,
+  "model": {"type": "WordLevel", "vocab": {"[UNK]": 0, "alpha": 1, "beta": 2}, "unk_token": "[UNK]"}
+}"#;
+
+    /// A model cache holding that fixture in BGE-M3's HuggingFace snapshot layout — the shape
+    /// `find_tokenizer_file` discovers.
+    fn model_cache_with_a_tokenizer(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("bge-reg-{tag}-{}", std::process::id()));
+        let snapshot = root.join("models--BAAI--bge-m3").join("snapshots").join("deadbeef");
+        std::fs::create_dir_all(&snapshot).expect("the fixture cache");
+        std::fs::write(snapshot.join("tokenizer.json"), FIXTURE_TOKENIZER).expect("the fixture file");
+        root
+    }
+
+    /// The pre-warm guarantee, stated as something observable: a tokenizer that was on disk when the
+    /// process started keeps counting even after the file goes away.
+    ///
+    /// It is the only way to assert "loaded at startup" without watching syscalls, and the symptom it
+    /// pins is real — the counter used to be an `OnceLock` filled by `get_or_init` inside the FIRST
+    /// /tokenize call, so the first request of a run paid a directory walk and a file parse on the async
+    /// runtime (PLAN_reliability_tail item 2), and a cache swapped underneath a running sidecar decided
+    /// the answer.
+    #[test]
+    fn a_tokenizer_present_at_startup_still_counts_after_its_file_is_gone() {
+        let cache = model_cache_with_a_tokenizer("startup");
+        let mut config = config("");
+        config.cache_dir = cache.clone();
+
+        let state = app_state_with(config);
+        // The file is what a lazy loader would need at request time. It is gone before the first ask.
+        std::fs::remove_dir_all(&cache).expect("take the file away");
+
+        assert!(
+            state.token_counter().is_some(),
+            "the tokenizer was on disk at startup, so this run counts — a loader that reads on first use \
+             instead answers None here, and the sidecar silently stops accounting for truncation"
+        );
+    }
+
+    /// An unknown name is refused — and the refusal names the set this build actually registered, rather
+    /// than a sentence somebody has to remember to edit. Three rows, because two can be hardcoded and
+    /// three cannot: this is the guarantee that a new tokenizer is a row and not a code change.
+    #[tokio::test]
+    async fn an_unknown_tokenizer_is_refused_naming_every_registered_name() {
+        let state = app_state_with_tokenizers(&["bge", "qwen", "gemma"]);
+
+        let refused = tokenize(State(state), axum::Json(TokenizeRequest {
+            texts: vec!["alpha".to_string()],
+            model: "llama".to_string(),
+        }))
+        .await
+        .expect_err("an unknown tokenizer must be refused, never served by the wrong one");
+
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+        for registered in ["bge", "qwen", "gemma"] {
+            assert!(
+                refused.1.error.contains(registered),
+                "the refusal must name '{registered}' so the caller can correct itself: {}",
+                refused.1.error
+            );
+        }
+    }
+
+    /// A registered name whose file is absent degrades THAT NAME ONLY. The distinction the wire draws is
+    /// between "not a name here" (400, the caller is wrong) and "a name here that cannot answer today"
+    /// (200 with `available: false`, the deployment is wrong) — collapsing the two would send a chunker
+    /// hunting for a typo while a file was simply missing.
+    #[tokio::test]
+    async fn a_missing_tokenizer_file_degrades_one_name_and_leaves_the_others_answering() {
+        let cache = model_cache_with_a_tokenizer("degrade");
+        let mut config = config("");
+        config.cache_dir = cache.clone();
+        config.qwen_tokenizer_path = cache.join("there-is-no-qwen-here.json");
+        let state = app_state_with(config);
+
+        let missing = tokenize(State(state.clone()), axum::Json(TokenizeRequest {
+            texts: vec!["alpha beta".to_string()],
+            model: "qwen".to_string(),
+        }))
+        .await
+        .expect("a registered name is never a 400, however unloadable it is");
+        assert!(!missing.available, "qwen has no file here");
+        assert!(missing.token_count.is_empty(), "and an unavailable counter reports no numbers at all");
+
+        let present = tokenize(State(state), axum::Json(TokenizeRequest {
+            texts: vec!["alpha beta".to_string()],
+            model: "bge".to_string(),
+        }))
+        .await
+        .expect("bge answers");
+        assert!(present.available, "one absent file must not take the whole registry down");
+        assert_eq!(present.token_count, vec![2], "and it really counted");
+
+        std::fs::remove_dir_all(&cache).ok();
+    }
+
+    /// The batch cap: /tokenize used to accept any number of texts and encode them all inline on the
+    /// async runtime. The body limit does NOT bound this — 52,617 texts is a real number from a
+    /// 10,000-file pass, and enough of them are short that the batch fits well under 2 MB while still
+    /// being tens of thousands of encodes in front of the reactor.
+    #[tokio::test]
+    async fn tokenize_refuses_a_batch_beyond_the_cap() {
+        let state = app_state_with_tokenizers(&[BGE_TOKENIZER]);
+        let cap = state.config.tokenize_max_texts;
+
+        let refused = tokenize(State(state), axum::Json(TokenizeRequest {
+            texts: vec!["alpha".to_string(); cap + 1],
+            model: String::new(),
+        }))
+        .await
+        .expect_err("a batch past the cap is refused rather than encoded");
+
+        assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+        assert!(
+            refused.1.error.contains(&cap.to_string()),
+            "the refusal has to state the cap, or the caller cannot batch to it: {}",
+            refused.1.error
+        );
+    }
+
+    /// The cap has to clear the host's own ceiling with room to spare, or the sidecar refuses batches its
+    /// only caller assembles by design (`SidecarClient.RequestRowBudget` = 512, dew_flow_rag_qln).
+    #[test]
+    fn the_default_batch_cap_leaves_room_above_the_hosts_own_row_budget() {
+        assert!(
+            Config::from_env().tokenize_max_texts >= 512 * 2,
+            "a cap at or below the host's 512-row budget turns a normal pass into a wall of 400s"
+        );
+    }
 }
+
