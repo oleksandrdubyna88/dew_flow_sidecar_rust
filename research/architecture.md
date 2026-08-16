@@ -26,7 +26,7 @@ everywhere. The customer's machine builds the flavour it needs.
   `engine_cache` (`RungCache`), `tokens` (the tokenizer registry), `preflight`, `wire` (request/response
   records), `introspection` (`/health`, `/models`, `/unload` — the routes that only READ),
   `handlers` (`/embed`, `/tokenize`, `/rerank` — the routes that COMPUTE), `inference`,
-  `compile_cache` (the MIGraphX cache paths and `with_engine_cache`), `bookkeeping`, `canary`,
+  `compile_cache` (the MIGraphX cache paths, `CompileWatch` and `CachePathLease`), `bookkeeping`, `canary`,
   `provider`, `logging`, and `testing` (shared test fixtures). Plus `src/adapters.rs` (DXGI device
   resolution, Windows-only) and `vendor-fastembed/` (a full vendored copy carrying one marked patch).
   Visibility is `pub(crate)` throughout: a binary crate has no external API to narrow.

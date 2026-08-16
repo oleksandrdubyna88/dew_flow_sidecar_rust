@@ -4,7 +4,7 @@ use std::time::Instant;
 use fastembed::{Bgem3DualEmbedding, Bgem3DualInitOptions, RerankInitOptions, RerankerModel, TextRerank};
 use ort::execution_providers::{ CUDAExecutionProvider, DirectMLExecutionProvider, ExecutionProviderDispatch, MIGraphXExecutionProvider, };
 use crate::config::{Config, DUAL_MODEL, RERANK_MODEL};
-use crate::compile_cache::{with_engine_cache, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
+use crate::compile_cache::{CachePathLease, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
 use crate::state::{AppState};
 use crate::wire::{join_error_text};
 
@@ -22,27 +22,42 @@ use crate::wire::{join_error_text};
 /// The preflight is here rather than only at startup because when `ORT_PROVIDER` is empty the provider
 /// is not known until the first request names it: the check has to run before the first session, not at
 /// the first user-visible failure. Startup already covered the explicit case.
+///
+/// `cache` is EVIDENCE, not data: a session may only be built while its caller holds the compiled-model
+/// cache path for this engine, because the EP will read that path at the first kernel launch — after this
+/// function has long returned. See `CachePathLease`.
 fn load_session<T>(
     state: &AppState,
     provider_hint: &str,
     model: &str,
     engine: &str,
+    cache: &CachePathLease,
     build: impl FnOnce(&str) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    // Checked rather than assumed, and checked FIRST so a mismatch pins nothing and builds nothing: a
+    // lease taken for the other engine would point this build at the other engine's slice — the
+    // 2026-07-27 cross-engine cache mix-up, arriving through the very guard that exists to prevent it.
+    anyhow::ensure!(
+        cache.covers(engine),
+        "internal: building a `{engine}` session while the compiled-model cache path is claimed for \
+         `{}` — hold the lease for the engine you are about to build",
+        cache.engine()
+    );
+
     let provider = pin_provider(state, provider_hint);
     if let Err(error) = preflight_provider(&provider, &exe_dir()) {
         return record_session_outcome::<T>(state, &provider, Err(error));
     }
 
-    let built = with_engine_cache(&state.config.mxr_cache_base, engine, || {
-        let started = std::time::Instant::now();
-        let session = build(&provider)?;
+    let started = std::time::Instant::now();
+    let built = build(&provider);
+    if built.is_ok() {
         tracing::info!(
-            "{model}: session ready in {:.1}s (the EP compiles or loads its cache lazily, on the first pass)",
+            "{model}: session ready in {:.1}s (the EP compiles or loads its cache lazily, on the first \
+             pass — the cache path stays claimed until it has)",
             started.elapsed().as_secs_f32()
         );
-        Ok(session)
-    });
+    }
     record_session_outcome(state, &provider, built)
 }
 
@@ -94,8 +109,13 @@ impl WithCommonOptions for RerankInitOptions {
     }
 }
 
-pub(crate) fn load_dual(state: &AppState, provider_hint: &str, max_length: usize) -> anyhow::Result<Bgem3DualEmbedding> {
-    load_session(state, provider_hint, DUAL_MODEL, EMBED_CACHE_ENGINE, |provider| {
+pub(crate) fn load_dual(
+    state: &AppState,
+    provider_hint: &str,
+    max_length: usize,
+    cache: &CachePathLease,
+) -> anyhow::Result<Bgem3DualEmbedding> {
+    load_session(state, provider_hint, DUAL_MODEL, EMBED_CACHE_ENGINE, cache, |provider| {
         tracing::info!("loading {DUAL_MODEL} (provider {provider}, max_length {max_length})");
         Bgem3DualEmbedding::try_new(shared_options(
             state,
@@ -105,8 +125,8 @@ pub(crate) fn load_dual(state: &AppState, provider_hint: &str, max_length: usize
     })
 }
 
-pub(crate) fn load_rerank(state: &AppState, provider_hint: &str) -> anyhow::Result<TextRerank> {
-    load_session(state, provider_hint, RERANK_MODEL, RERANK_CACHE_ENGINE, |provider| {
+pub(crate) fn load_rerank(state: &AppState, provider_hint: &str, cache: &CachePathLease) -> anyhow::Result<TextRerank> {
+    load_session(state, provider_hint, RERANK_MODEL, RERANK_CACHE_ENGINE, cache, |provider| {
         tracing::info!("loading {RERANK_MODEL} (provider {provider}, max_length {})", state.config.rerank_max_length);
         TextRerank::try_new(shared_options(
             state,
@@ -465,6 +485,27 @@ mod tests {
         // package is the exact mistake this list exists to prevent.
         assert!(required_provider_libraries("dml").is_empty());
         assert!(required_provider_libraries("auto").is_empty());
+    }
+
+    /// A lease taken for the OTHER engine would point this build at the other engine's cache slice —
+    /// the 2026-07-27 cross-engine mix-up, arriving through the guard that exists to prevent it. It has
+    /// to be refused BEFORE anything is pinned or loaded, because the symptom otherwise arrives minutes
+    /// later as mis-shaped output from a program that loaded cleanly.
+    #[test]
+    fn a_session_built_under_another_engines_lease_is_refused() {
+        let state = app_state();
+        let wrong = CachePathLease::hold(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE);
+
+        // let-else rather than `expect_err`: an ort session is not `Debug`, and a test that could only
+        // report this failure by formatting a GPU handle would be a test nobody could run here.
+        let Err(error) = load_dual(&state, "cpu", 128, &wrong) else {
+            panic!("a rerank lease must not be able to build the embed session");
+        };
+
+        let text = format!("{error:#}");
+        assert!(text.contains(EMBED_CACHE_ENGINE), "names the session being built: {text}");
+        assert!(text.contains(RERANK_CACHE_ENGINE), "and the claim actually held: {text}");
+        assert!(state.pinned_provider.get().is_none(), "and refused before pinning a provider");
     }
 
     /// The provenance READER never computes — that is the whole fix. A local cell, so the assertion is

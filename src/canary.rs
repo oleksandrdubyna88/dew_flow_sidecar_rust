@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 use fastembed::Bgem3DualEmbedding;
 use anyhow::Context;
-use crate::compile_cache::engine_cache_dir;
+use crate::compile_cache::CachePathLease;
 use crate::inference::{SETTLE_ATTEMPTS, pin_shape, ruler_text};
 use crate::provider::{load_dual};
 use crate::state::{AppState, Limits};
@@ -110,29 +110,35 @@ pub(crate) fn canary_check(engine: &mut Bgem3DualEmbedding, limits: Limits, pin:
 /// a cached program means the .mxr on disk is bad (defect 1 above), so the engine's cache slice is
 /// wiped and ONE clean recompile gets its own canary. Still failing after that = the engine cannot
 /// be trusted at all — fail the request; never serve unverified embeddings.
+///
+/// The whole of this — build, canary, wipe, rebuild, second canary — runs under the CALLER's cache-path
+/// lease. The canary IS this engine's first kernel launch, which is the moment the MIGraphX EP actually
+/// reads the path; a lease that ended with the build would let the other engine redirect it in between.
+/// See `CachePathLease`.
 pub(crate) fn load_validated_dual(
     state: &AppState,
     provider_hint: &str,
     limits: Limits,
     pin: bool,
+    cache: &CachePathLease,
 ) -> anyhow::Result<Bgem3DualEmbedding> {
-    let mut engine = load_dual(state, provider_hint, limits.max_length)?;
+    let mut engine = load_dual(state, provider_hint, limits.max_length, cache)?;
     let Err(first_failure) = canary_check(&mut engine, limits, pin) else {
         return Ok(engine);
     };
 
-    if state.config.mxr_cache_base.trim().is_empty() {
+    if cache.dir().is_empty() {
         // No compiled-model cache -> nothing to heal by wiping; the failure is the answer.
         return Err(first_failure.context("canary failed with no compiled-model cache configured"));
     }
 
-    let dir = engine_cache_dir(&state.config.mxr_cache_base, "dual");
     tracing::warn!(
-        "canary failed ({first_failure:#}) — wiping `{dir}` and recompiling once: a crash mid-compile leaves a corrupt program that loads and stably produces garbage"
+        "canary failed ({first_failure:#}) — wiping `{}` and recompiling once: a crash mid-compile leaves a corrupt program that loads and stably produces garbage",
+        cache.dir()
     );
     drop(engine);
-    std::fs::remove_dir_all(&dir).ok();
-    let mut rebuilt = load_dual(state, provider_hint, limits.max_length)?;
+    cache.wipe();
+    let mut rebuilt = load_dual(state, provider_hint, limits.max_length, cache)?;
     canary_check(&mut rebuilt, limits, pin)
         .context("canary still failing after a clean recompile — refusing to serve garbage embeddings")?;
     Ok(rebuilt)

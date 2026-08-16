@@ -1,5 +1,8 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
+// The cache subdirectory each engine builds into. Shared by the builder (`CachePathLease`) and the
+// measurement (`CompileWatch`) so the two cannot drift: a measurement pointed at a directory nothing
+// writes to reports every compile as zero, which is indistinguishable from a healthy warm cache.
 pub(crate) const EMBED_CACHE_ENGINE: &str = "dual";
 pub(crate) const RERANK_CACHE_ENGINE: &str = "rerank";
 
@@ -39,6 +42,11 @@ impl CompileWatch {
     }
 }
 
+/// Total size of the MIGraphX compiled-model cache tree in whole MB (0 = cache not configured,
+/// i.e. a non-migraphx flavor). Recursive over the per-engine subdirectories. The EP reads AND
+/// writes the cache LAZILY — at the first kernel launch, not at session build — so growth is
+/// measured across a PASS, never across a session build (which taught us nothing and lied
+/// "served from cache" while the first pass then compiled for two minutes).
 pub(crate) fn mxr_cache_mb(base: &str) -> u64 {
     fn tree_bytes(dir: &std::path::Path) -> u64 {
         std::fs::read_dir(dir)
@@ -80,62 +88,185 @@ pub(crate) fn engine_cache_dir(base: &str, engine: &str) -> String {
     format!("{}/{engine}", base.trim_end_matches('/'))
 }
 
-/// Redirects the EP's cache into the engine's own subdirectory for the duration of a session
-/// build. The path travels via process env (the only knob this ROCm build honors — it ignores the
-/// provider-options fields), so builds are serialized by a lock: two engines building at once
-/// would race the variable. No-op (straight call) when no cache is configured.
-pub(crate) fn with_engine_cache<T>(base: &str, engine: &str, build: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
-    if base.trim().is_empty() {
-        return build();
-    }
+/// Serializes the process-global cache-path variables. Static because what it guards is static: there
+/// is exactly one environment per process, however many engines want to point it somewhere.
+static CACHE_PATH_LOCK: Mutex<()> = Mutex::new(());
 
-    static BUILD_ENV_LOCK: Mutex<()> = Mutex::new(());
-    let _serialized = BUILD_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let dir = engine_cache_dir(base, engine);
-    std::fs::create_dir_all(&dir).ok();
-    std::env::set_var("ORT_MIGRAPHX_MODEL_CACHE_PATH", &dir);
-    std::env::set_var("ORT_MIGRAPHX_CACHE_PATH", &dir);
-    build()
+/// A held claim on the MIGraphX compiled-model cache path, for ONE engine.
+///
+/// **Why the path is an environment variable at all.** It is the only knob this ROCm build honors — the
+/// per-session provider-options fields were tried and are IGNORED. That is a property of this build, not
+/// of the design: a per-session option would remove this hazard class instead of narrowing it, so
+/// **re-test the provider-options fields whenever `ort` or ROCm is bumped**, and update this comment —
+/// it is the only place that finding lives.
+///
+/// **Why the claim outlives the build.** The EP reads and writes that path LAZILY, at the first kernel
+/// launch, not at session build. The predecessor of this type (`with_engine_cache`) released at the end of
+/// the build, so the window between a build returning and its first pass was unprotected —
+/// and `Engines.embed` / `Engines.rerank` are independent mutexes, so an embed build and a rerank build
+/// legitimately run at once on two `spawn_blocking` threads, which is the ordinary situation right after a
+/// restart when the host hits both endpoints. Whichever one set the variable last owned the directory that
+/// BOTH engines then compiled into: the 2026-07-27 stale-cache incident (a session that loaded a program
+/// cached by another engine returned mis-shaped outputs and died on `assertion failed: index < dim`),
+/// whose entire fix was per-engine subdirectories, reopened through a timing gap the lock did not cover.
+///
+/// So the lease is taken by the caller that BUILDS, and held across the build **and that engine's first
+/// pass** — see `embed_natural` and `rerank_blocking`. It costs concurrency between the two engine types
+/// while one of them is cold: minutes, once, and only on a MIGraphX flavour.
+///
+/// **Lock order.** The engine mutex is always taken first and this lease second. Neither path ever takes
+/// the other engine's mutex, so the two cannot cycle.
+///
+/// **Free everywhere else.** With no cache configured — every non-MIGraphX flavour — there is nothing to
+/// claim: no lock is taken and no environment is touched, so holding one across a pass costs nothing.
+pub(crate) struct CachePathLease {
+    engine: &'static str,
+    /// This engine's slice; empty when no cache is configured.
+    dir: String,
+    /// `None` when no cache is configured — there is no process-global state to serialize on.
+    _held: Option<MutexGuard<'static, ()>>,
 }
 
-/// Acquires an engine slot with a CEILING, healing a poisoned mutex and refusing a wedged one.
-///
-/// Three failures meet here, and they need three different answers:
-///
-/// 1. **Poisoned** — a panic inside a model load (fastembed/ort) unwound while the guard was held. The
-///    old `map_err(_ -> "engine poisoned")` failed EVERY later request until a process restart: a live
-///    Fast pass ground through thousands of methods answering "sparse engine poisoned", Succeeded=0.
-///    One panic must cost one request, so clear the poison, drop whatever half-built state it left, and
-///    let the caller reload. Dropping is the conservative choice — the poison says nothing about WHICH
-///    engine the panic touched, nor whether the session itself is broken — but it means a panic in
-///    POST-PROCESSING costs a ~60 s rebuild per request, so the inference paths must return errors
-///    rather than panic (see the shape guard in vendor-fastembed/src/sparse_text_embedding/impl.rs).
-/// 2. **Held by a healthy holder** — a first-ever shape compile is minutes of CORRECT slowness. Wait.
-/// 3. **Held by a WEDGED holder** — a thread stuck inside the ONNX Runtime C++ call. It never panics,
-///    so case 1 can never see it, and the mutex is simply never released. Before this, every caller
-///    queued on `.lock()` forever. Refuse, with the holder's activity and elapsed time in the message.
-///
-/// `Patience` decides how case 2 ends: the inference path waits as long as the holder is alive, /unload
-/// waits a bounded time. A hold that nothing STAMPED falls back to `running_after` under either — the
-/// missing ceiling is the defect, so the fallback has to exist even when the stamp does not.
+impl CachePathLease {
+    pub(crate) fn hold(base: &str, engine: &'static str) -> Self {
+        if base.trim().is_empty() {
+            return Self { engine, dir: String::new(), _held: None };
+        }
+
+        let held = CACHE_PATH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = engine_cache_dir(base, engine);
+        std::fs::create_dir_all(&dir).ok();
+        std::env::set_var("ORT_MIGRAPHX_MODEL_CACHE_PATH", &dir);
+        std::env::set_var("ORT_MIGRAPHX_CACHE_PATH", &dir);
+        Self { engine, dir, _held: Some(held) }
+    }
+
+    pub(crate) fn engine(&self) -> &'static str {
+        self.engine
+    }
+
+    /// This engine's cache slice — empty when none is configured, which is the same test the callers
+    /// used to spell as `config.mxr_cache_base.trim().is_empty()` in three places.
+    pub(crate) fn dir(&self) -> &str {
+        &self.dir
+    }
+
+    pub(crate) fn covers(&self, engine: &str) -> bool {
+        self.engine == engine
+    }
+
+    /// Wipes this engine's slice and re-creates it WITHOUT releasing the claim — the canary's heal path,
+    /// where a corrupt compiled program has to go and exactly one clean recompile takes its place. It
+    /// composes the path here rather than at the call site on purpose: the caller used to spell the engine
+    /// name as a literal `"dual"`, and a name spelled twice is a name that drifts.
+    pub(crate) fn wipe(&self) {
+        if self.dir.is_empty() {
+            return;
+        }
+        std::fs::remove_dir_all(&self.dir).ok();
+        std::fs::create_dir_all(&self.dir).ok();
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
     use crate::testing::*;
 
     /// Dense, sparse, and rerank run the SAME graph at the SAME pinned shape, so the EP's cache
     /// key collides across engines — a sparse session once loaded a program cached by another
     /// engine and died on mis-shaped outputs. Every engine must therefore get its OWN cache slice,
-    /// and an unconfigured cache must stay a plain passthrough.
+    /// and an unconfigured cache must claim nothing at all.
     #[test]
     fn each_engine_gets_its_own_cache_slice() {
         assert_eq!(engine_cache_dir("/cache/device-0", "sparse"), "/cache/device-0/sparse");
         assert_eq!(engine_cache_dir("/cache/device-0/", "dense"), "/cache/device-0/dense");
 
-        let ran = with_engine_cache("", "dense", || Ok::<_, anyhow::Error>(42)).expect("passthrough");
-        assert_eq!(ran, 42, "no cache configured -> the build just runs");
+        let unconfigured = CachePathLease::hold("", EMBED_CACHE_ENGINE);
+        assert!(unconfigured.dir().is_empty(), "no cache configured -> nothing to claim, no lock taken");
+        assert!(unconfigured.covers(EMBED_CACHE_ENGINE), "and it still knows which engine it stands for");
+    }
+
+    /// The MIGraphX EP reads the cache path at its FIRST KERNEL LAUNCH, not at session build — so a claim
+    /// that ends when the build returns protects the wrong interval. `Engines.embed` and `Engines.rerank`
+    /// are independent mutexes, so the other engine's build is legitimately running in that window, and
+    /// whichever set the variable last owned the directory both then compiled into: the 2026-07-27
+    /// stale-cache incident, reopened through a timing gap.
+    #[test]
+    fn a_concurrent_build_cannot_change_the_cache_path_before_the_first_launch() {
+        let base = std::env::temp_dir().join(format!("mxr-race-{}", std::process::id()));
+        let base = base.to_string_lossy().to_string();
+        let building = Arc::new(Barrier::new(2));
+
+        let embed = {
+            let (base, building) = (base.clone(), Arc::clone(&building));
+            std::thread::spawn(move || {
+                let cache = CachePathLease::hold(&base, EMBED_CACHE_ENGINE);
+                building.wait(); // the rerank engine may now start building
+                // The window the old scope left open: the session is built, the first kernel launch —
+                // which is what actually reads the variable — has not happened yet.
+                std::thread::sleep(Duration::from_millis(150));
+                let at_first_launch = std::env::var("ORT_MIGRAPHX_MODEL_CACHE_PATH").unwrap_or_default();
+                drop(cache);
+                at_first_launch
+            })
+        };
+        let rerank = {
+            let (base, building) = (base.clone(), Arc::clone(&building));
+            std::thread::spawn(move || {
+                building.wait();
+                let _cache = CachePathLease::hold(&base, RERANK_CACHE_ENGINE);
+                std::thread::sleep(Duration::from_millis(50));
+            })
+        };
+
+        let seen = embed.join().expect("the embed build");
+        rerank.join().expect("the rerank build");
+
+        assert_eq!(
+            seen,
+            engine_cache_dir(&base, EMBED_CACHE_ENGINE),
+            "the first kernel launch must still read the slice its own session was built under"
+        );
+
+        // The retired narrow scope, reproduced so the defect stays visible in the suite: when the claim
+        // ends with the BUILD, the other engine's build flips the variable before the first launch reads
+        // it — and the launch then compiles into, or loads from, a directory that is not its own.
+        {
+            let _built_under = CachePathLease::hold(&base, EMBED_CACHE_ENGINE);
+        } // <- where `with_engine_cache` returned
+        let _other_engine_builds = CachePathLease::hold(&base, RERANK_CACHE_ENGINE);
+        assert_eq!(
+            std::env::var("ORT_MIGRAPHX_MODEL_CACHE_PATH").unwrap_or_default(),
+            engine_cache_dir(&base, RERANK_CACHE_ENGINE),
+            "which is what an embed engine used to read at its first launch"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The heal path wipes a corrupt compiled program and lets exactly one clean recompile take its
+    /// place — still holding the claim, because dropping it there would hand the fresh compile to
+    /// whichever engine grabbed the variable next.
+    #[test]
+    fn wiping_a_slice_leaves_it_present_and_empty_and_never_touches_the_other_engine() {
+        let base = std::env::temp_dir().join(format!("mxr-wipe-{}", std::process::id()));
+        write_mb(&base.join(EMBED_CACHE_ENGINE).join("corrupt.mxr"), 1);
+        write_mb(&base.join(RERANK_CACHE_ENGINE).join("healthy.mxr"), 1);
+        let base = base.to_string_lossy().to_string();
+
+        let cache = CachePathLease::hold(&base, EMBED_CACHE_ENGINE);
+        cache.wipe();
+
+        assert!(Path::new(cache.dir()).is_dir(), "the slice is re-created, so the recompile has somewhere to land");
+        assert_eq!(mxr_cache_mb(cache.dir()), 0, "and the corrupt program is gone");
+        assert_eq!(mxr_cache_mb(&engine_cache_dir(&base, RERANK_CACHE_ENGINE)), 1, "the other engine is untouched");
+
+        drop(cache);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// MIGraphX compiles and saves LAZILY — on the first pass, not at session build — so the

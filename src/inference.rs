@@ -10,7 +10,7 @@ use crate::state::{AppState, Limits, positive_or};
 use crate::tokens::{token_usage};
 use crate::wedge::{EngineWedged, InFlight, InFlightStamp, Patience, Phase, WedgePolicy, inflight_now};
 use crate::wire::{EmbedResponse, PassTimings, RerankResponse, SparseVec, TokenUsage};
-use crate::compile_cache::{pass_log_message, CompileWatch, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
+use crate::compile_cache::{pass_log_message, CachePathLease, CompileWatch, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
 
 // ---------- blocking inference ----------
 
@@ -259,13 +259,22 @@ pub(crate) fn embed_natural(
     // reads it without ever touching the engine lock. It clears itself on every exit, `?` included.
     let stamp = InFlightStamp::hold(state, &state.engines.embed_inflight);
     let mut session_build_ms = 0u64;
-    if guard.get_mut(limits.max_length).is_none() {
+    // Claimed ONLY when this request builds, and then held through the first pass below: the MIGraphX EP
+    // reads the compiled-model cache path at the first kernel launch, not at session build, so a claim
+    // that ended with the build would leave the rerank engine free to redirect it in between. A resident
+    // engine claims nothing — serializing steady-state passes across the two engine types would cost far
+    // more than the minutes this costs once, while one of them is cold. See `CachePathLease`.
+    let cache_claim = if guard.get_mut(limits.max_length).is_none() {
         stamp.enter(Phase::Building, "embed: building and canary-checking the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
         let building = Instant::now();
-        let built = load_validated_dual(state, provider_hint, limits, retry_short)?;
+        let cache = CachePathLease::hold(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE);
+        let built = load_validated_dual(state, provider_hint, limits, retry_short, &cache)?;
         remember_engine(&mut guard, "embed", limits.max_length, built);
         session_build_ms = building.elapsed().as_millis() as u64;
-    }
+        Some(cache)
+    } else {
+        None
+    };
     stamp.enter(Phase::Running, format!("embed: embedding {} row(s)", texts.len()));
     // The duration below includes any settling re-runs — that is honest: it is what the caller waited.
     let (compiles, pass) = (CompileWatch::start(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE), Instant::now());
@@ -279,6 +288,10 @@ pub(crate) fn embed_natural(
     // first run can never shorten one head without the other.
     let rows = embed_settling("embed", texts.len(), retry_short, || engine.embed(texts.clone(), batch))?;
     let inference = pass.elapsed();
+    // The first kernel launch has happened, so the EP has read the cache path and compiled or loaded
+    // against it. Everything below this line is arithmetic — release the claim rather than holding it
+    // across the unzip and the response.
+    drop(cache_claim);
     let compile_cache_grew_mb = compiles.grew_mb();
     tracing::info!("{}", pass_log_message(
         request_id,
@@ -338,12 +351,19 @@ pub(crate) fn rerank_blocking(
     // the same time, so a shared record would let one overwrite the other's wedge.
     let stamp = InFlightStamp::hold(state, &state.engines.rerank_inflight);
     let mut session_build_ms = 0u64;
-    if guard.is_none() {
+    // The embed path's claim, mirrored — same reason, same lifetime. It is dropped when this function
+    // returns, which is after `score_documents` has run the first pass through BOTH the pinned and the
+    // natural branch below; the embed engine's build cannot redirect the cache path in between.
+    let _cache_claim = if guard.is_none() {
         stamp.enter(Phase::Building, "rerank: building the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
         let building = Instant::now();
-        *guard = Some(load_rerank(state, provider_hint)?);
+        let cache = CachePathLease::hold(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE);
+        *guard = Some(load_rerank(state, provider_hint, &cache)?);
         session_build_ms = building.elapsed().as_millis() as u64;
-    }
+        Some(cache)
+    } else {
+        None
+    };
     stamp.enter(Phase::Running, format!("rerank: scoring {} document(s)", documents.len()));
 
     // Shape pinning, exactly as the embed path does it and for the same provider: fastembed forms
@@ -437,14 +457,26 @@ pub(crate) fn set_activity(state: &AppState, activity: impl Into<String>) {
     }
 }
 
-/// Total size of the MIGraphX compiled-model cache tree in whole MB (0 = cache not configured,
-/// i.e. a non-migraphx flavor). Recursive over the per-engine subdirectories. The EP reads AND
-/// writes the cache LAZILY — at the first kernel launch, not at session build — so growth is
-/// measured across a PASS, never across a session build (which taught us nothing and lied
-/// "served from cache" while the first pass then compiled for two minutes).
-/// The cache subdirectory each engine builds into. Shared by the builder (`with_engine_cache`) and the
-/// measurement (`CompileWatch`) so the two cannot drift: a measurement pointed at a directory nothing
-/// writes to reports every compile as zero, which is indistinguishable from a healthy warm cache.
+/// Acquires an engine slot with a CEILING, healing a poisoned mutex and refusing a wedged one.
+///
+/// Three failures meet here, and they need three different answers:
+///
+/// 1. **Poisoned** — a panic inside a model load (fastembed/ort) unwound while the guard was held. The
+///    old `map_err(_ -> "engine poisoned")` failed EVERY later request until a process restart: a live
+///    Fast pass ground through thousands of methods answering "sparse engine poisoned", Succeeded=0.
+///    One panic must cost one request, so clear the poison, drop whatever half-built state it left, and
+///    let the caller reload. Dropping is the conservative choice — the poison says nothing about WHICH
+///    engine the panic touched, nor whether the session itself is broken — but it means a panic in
+///    POST-PROCESSING costs a ~60 s rebuild per request, so the inference paths must return errors
+///    rather than panic (see the shape guard in vendor-fastembed/src/sparse_text_embedding/impl.rs).
+/// 2. **Held by a healthy holder** — a first-ever shape compile is minutes of CORRECT slowness. Wait.
+/// 3. **Held by a WEDGED holder** — a thread stuck inside the ONNX Runtime C++ call. It never panics,
+///    so case 1 can never see it, and the mutex is simply never released. Before this, every caller
+///    queued on `.lock()` forever. Refuse, with the holder's activity and elapsed time in the message.
+///
+/// `Patience` decides how case 2 ends: the inference path waits as long as the holder is alive, /unload
+/// waits a bounded time. A hold that nothing STAMPED falls back to `running_after` under either — the
+/// missing ceiling is the defect, so the fallback has to exist even when the stamp does not.
 pub(crate) fn lock_or_refuse<'a, S: EngineSlot>(
     engine: &'a Mutex<S>,
     inflight: &Mutex<Option<InFlight>>,

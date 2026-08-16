@@ -2,7 +2,7 @@
 
 > `src/inference.rs` (`embed_blocking`, `embed_natural`, `rerank_blocking`, `score_documents`,
 > `pin_shape`, `embed_settling`, `lock_or_refuse`), `src/engine_cache.rs` (`RungCache`),
-> `src/state.rs` (`Engines`, `Limits`), `src/compile_cache.rs` (`CompileWatch`, `with_engine_cache`)
+> `src/state.rs` (`Engines`, `Limits`), `src/compile_cache.rs` (`CompileWatch`, `CachePathLease`)
 > and `src/bookkeeping.rs` (the recorders, `remember_engine`). The system as it is, 2026-08-16.
 
 ## Purpose
@@ -28,11 +28,13 @@ flowchart TD
     WAIT -->|holder past its ceiling| REFUSE["503 EngineWedged<br/>names the activity + elapsed"]
     WAIT --> STAMP["InFlightStamp — what holds it, since when"]
     STAMP --> RESIDENT{"rung resident?"}
-    RESIDENT -->|no| BUILD["load_validated_dual<br/>⏱ session_build_ms — phase `building`"]
+    RESIDENT -->|no| CLAIM["CachePathLease::hold — this engine's cache slice"]
     RESIDENT -->|yes| RUN
+    CLAIM --> BUILD["load_validated_dual<br/>⏱ session_build_ms — phase `building`"]
     BUILD --> REMEMBER["remember_engine — LRU insert;<br/>evicted rung torn down OFF the lock"]
     REMEMBER --> RUN["embed_settling → engine.embed<br/>⏱ inference_ms — phase `running`"]
-    RUN --> GROWTH["CompileWatch delta over THIS engine's<br/>cache subdir ⇒ compile_cache_grew_mb"]
+    RUN --> RELEASE["drop the lease — the first kernel launch<br/>has read the path"]
+    RELEASE --> GROWTH["CompileWatch delta over THIS engine's<br/>cache subdir ⇒ compile_cache_grew_mb"]
     GROWTH --> UNZIP["unzip (dense, sparse) per text"]
     UNZIP --> UNPIN{"was pinned?"}
     UNPIN -->|yes| STRIP["unpin_rows — drop ruler rows"]
@@ -50,7 +52,8 @@ flowchart TD
 | `RungCache<T>` | One engine per `max_length` ("rung"), least-recently-**used** eviction, capacity from `EMBED_ENGINE_CACHE_RUNGS` |
 | `Limits` | `max_length` (clamped 16…8192) and `max_batch` (≥ 1), resolved per request over the configured defaults |
 | `PassTimings` | `queue_wait_ms`, `session_build_ms`, `inference_ms`, `compile_cache_grew_mb` |
-| `CompileWatch` | A pass's growth in **one engine's own** cache subdirectory (`EMBED_CACHE_ENGINE` / `RERANK_CACHE_ENGINE`, shared with `with_engine_cache` so builder and measurement cannot drift). Summing the whole tree charged a rerank compile to a concurrent embed pass — the engines hold independent mutexes, so concurrent is the ordinary case after a restart |
+| `CompileWatch` | A pass's growth in **one engine's own** cache subdirectory (`EMBED_CACHE_ENGINE` / `RERANK_CACHE_ENGINE`, shared with `CachePathLease` so builder and measurement cannot drift). Summing the whole tree charged a rerank compile to a concurrent embed pass — the engines hold independent mutexes, so concurrent is the ordinary case after a restart |
+| `CachePathLease` | An RAII claim on the process-global MIGraphX cache path, for ONE engine. Taken by the caller that BUILDS and held across that engine's **first pass**, because the EP reads the path at the first kernel launch and not at session build. `load_dual`/`load_rerank` require one by type, and a lease held for the other engine is refused before anything is pinned or loaded. A resident engine claims nothing |
 | `TokenUsage` | `token_count[]`, `truncated[]`, effective `max_length`, `token_accounting` |
 | `Bgem3DualEmbedding` | **One** session yielding both BGE-M3 heads per forward pass |
 | `TextRerank` | The `bge-reranker-v2-m3` cross-encoder |
