@@ -66,9 +66,10 @@ graph TD
 | Route | Body | Answer |
 |---|---|---|
 | `GET /health` | — | `status` (`ok` \| `wedged`), activity, `in_flight[]`, `wedged`, requested/compiled/active provider, `provider_ready`, last provider error, exe and runtime-manifest hashes + `provenance_ready`, loaded models, limits, DXGI adapter |
-| `POST /embed` | `texts[]`, `kind`, `provider?`, `max_length?`, `max_batch?`, `request_id?` | `dense[][]`, `sparse[]`, token accounting, `request_id`, `timings` |
+| `GET /models` | — | one row per model or registered tokenizer: `id`, `name`, `kind` (`dense+sparse` \| `rerank` \| `tokenizer-only`), `dimension` (measured, `null` = unknown), `max_sequence_length`, `tokenizer`, `available` (the engine), `tokenizer_available` (the file) |
+| `POST /embed` | `texts[]`, `kind`, `provider?`, `max_length?`, `max_batch?`, `request_id?` | `dense[][]`, `sparse[]`, `dimension`, token accounting, `request_id`, `timings` |
 | `POST /rerank` | `query`, `documents[]`, `provider?`, `max_batch?`, `request_id?` | `scores[]` in input order, `request_id`, `timings` |
-| `POST /tokenize` | `texts[]`, `model` (`bge` \| `qwen`) | `token_count[]`, `model`, `available` |
+| `POST /tokenize` | `texts[]`, `model` (any registered tokenizer; `bge` by default) | `token_count[]`, `model`, `available` |
 | `POST /unload` | `{}` \| `{embed_max_lengths[], rerank}` | the `/health` body, after dropping engines |
 
 No authentication, no CORS, no protocol versioning. It binds `127.0.0.1` and is a local compute service.
@@ -179,8 +180,11 @@ forever.
 ### Error handling
 
 Handler failures become `ApiError` — a status plus `{ "error": … }`. An unknown tokenizer name is a
-`400` rather than a silent answer from the wrong tokenizer, because a count from the wrong model is
-worse than no count. A poisoned engine mutex is healed by dropping every resident engine and rebuilding.
+`400` **naming every registered one**, rather than a silent answer from the wrong tokenizer, because a
+count from the wrong model is worse than no count — and a refusal that lists the alternatives is the
+difference between a caller guessing and a caller correcting itself. A *registered* name whose file is
+missing is not that error: it answers `200` with `available: false`, because the caller was right and the
+deployment is what is incomplete. A poisoned engine mutex is healed by dropping every resident engine and rebuilding.
 A **wedged** engine — held past its ceiling by an uncancellable ORT call — is a `503` carrying the
 holder's activity and elapsed time, because nothing is wrong with the request and a host that degrades on
 `503` while treating `500` as a hard failure can only act on the difference if it is made.

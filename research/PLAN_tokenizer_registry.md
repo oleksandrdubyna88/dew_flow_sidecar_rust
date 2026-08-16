@@ -1,37 +1,42 @@
 # PLAN — tokenizers by name, and a model that can describe itself
 
-> Status: **step 1 implemented 2026-08-16 — the registry; steps 2 (`GET /models`) and 3 (dimension on
-> `/embed`) remain open.** Scope: the `/tokenize` handler and its tokenizer loading, one new `/models`
-> read, and the embedding dimension on the wire. **Not in scope:** a second embedding model behind
-> `/embed` — see §5.
+> Status: **IMPLEMENTED, 2026-08-16.** All three steps shipped: the tokenizer registry replaces the two
+> `OnceLock` fields and the two-arm match, `GET /models` states kind · dimension · max sequence ·
+> tokenizer per row with unknown as its own state, and `/embed` reports the width of the vectors it just
+> returned. Verified on the wire, not only in tests. The two questions in §9 stay open as questions —
+> they are decisions nobody has needed yet, not unbuilt work.
 >
-> **What step 1 shipped, and its one deviation.** `TokenizerRegistry` / `TokenizerEntry` /
-> `TokenizerSource` replace the two `OnceLock` fields and the two-arm match; rows load at startup;
-> `/tokenize` resolves through the table and an unknown name is refused naming the registered set; the
-> startup log names every row with the file behind it. It landed together with
-> [PLAN_reliability_tail.md](PLAN_reliability_tail.md) item 2, as §6 asked — the encode moved to
-> `spawn_blocking` and gained a `TOKENIZE_MAX_TEXTS` cap in the same change.
+> **Three deviations, all deliberate.**
 >
-> *Deviation:* item 2's cap was drafted as "matching the one `/embed` already enforces". It is **not**
-> that number. `/embed` does not refuse at `max_batch`, it re-batches internally, and the host assembles
-> `/tokenize` calls of up to 512 rows by design (`SidecarClient.RequestRowBudget`, `dew_flow_rag_qln`) —
-> so a cap at `max_batch` (64) would have refused batches its only caller builds on purpose. Shipped at
-> **4096**, eight times the host's ceiling: a backstop against a pathological caller, never a wall a
-> normal pass walks into. A test asserts the headroom rather than the constant.
+> 1. **The `/tokenize` batch cap is not `/embed`'s.** [PLAN_reliability_tail.md](../todo/PLAN_reliability_tail.md)
+>    item 2 drafted it as "matching the one `/embed` already enforces". `/embed` does not *refuse* at
+>    `max_batch`, it re-batches internally, and the host assembles `/tokenize` calls of up to 512 rows by
+>    design (`SidecarClient.RequestRowBudget`, `dew_flow_rag_qln`) — so a cap at 64 would have refused
+>    batches its only caller builds on purpose. Shipped as `TOKENIZE_MAX_TEXTS`, default **4096**: a
+>    backstop against a pathological caller, never a wall a normal pass walks into. The test asserts the
+>    headroom, not the constant.
+> 2. **`/models` carries a `rerank` kind, which §3.2 did not list.** An endpoint named `/models` that
+>    hides a model this build serves is a half-truth, and the same argument that made `kind` exist from
+>    the first version applies to the reranker. Its `dimension` and `tokenizer` are both `null` —
+>    a cross-encoder has no width ever, and this process registers no counter for it. Claiming `bge`
+>    because the two models look related would have been exactly the confident guess this read exists to
+>    remove.
+> 3. **`available` was split into `available` + `tokenizer_available`.** Neither was in the plan; the
+>    first was added for self-sufficiency and immediately proved ambiguous. **Found by reading the real
+>    response, not by a test**: the startup log said `bge token counting enabled from …tokenizer.json`
+>    while `/models` reported that row `available: false` — true of the *engine* and silent about the
+>    tokenizer. "Engine cold, tokenizer ready" is precisely the state a consumer is in while validating a
+>    recipe before a pass, so one flag could not carry both.
 >
-> Sibling half: `dew_flow_rag_qln · todo/PLAN_tokenizer_contract_and_chunk_coverage.md`, whose step 1
-> makes the .NET tokenizer port name its model. This plan makes that name mean something on this side.
+> **Cross-repo:** the consumers' halves are unchanged and still open —
+> `dew_flow_rag_qln · todo/PLAN_tokenizer_contract_and_chunk_coverage.md` (its §5.1 port work, and its
+> open question 2 about a tokenizer hash, which this read now makes answerable) and
+> `dew_flow_benchmark · todo/PLAN_corpus_axis_integrity.md`. Both still name this plan under its old
+> `todo/` path; they are separate repositories and were left as found.
 >
-> Related: [PLAN_sidecar_product.md](PLAN_sidecar_product.md) (the distribution story this does not
-> touch), [../README.md](../README.md) (the current contract).
->
-> **Overlap, named rather than discovered later:** [PLAN_reliability_tail.md](PLAN_reliability_tail.md)
-> item 2 also touches `/tokenize` — it encodes on the async runtime, loads a tokenizer from disk inside
-> the first call's `OnceLock::get_or_init`, and has no batch cap. Its proposed fixes are `spawn_blocking`
-> for the encode, a batch cap matching `/embed`'s, and **pre-warming the tokenizers at startup**. This
-> plan's registry is built at startup, which *is* that pre-warm — so §3.1 subsumes the third fix and
-> leaves the other two where they are. **Whichever lands second must not re-introduce lazy first-call
-> loading**, and the two plans should ideally land together: they are the same twenty lines.
+> Related: [../todo/PLAN_sidecar_product.md](../todo/PLAN_sidecar_product.md) (the distribution story this
+> does not touch), [../README.md](../README.md) (the shipped contract),
+> [module_http_surface.md](module_http_surface.md) (the wire shapes as they now are).
 
 ## 1. The goal, before any solution
 
@@ -136,13 +141,13 @@ What this plan needs from nobody: it is standalone and can ship before or after 
   slots keyed by id, its own reference-vector canary, and a VRAM budget across two loaded engines — a
   larger piece of work that deserves its own plan rather than a field on a request.
 - **SPLADE is not wired.** It is named in §1 only to justify `kind` existing from the start.
-- **No authentication, no versioning, no metrics.** Those remain [PLAN_sidecar_product.md](PLAN_sidecar_product.md)'s.
+- **No authentication, no versioning, no metrics.** Those remain [PLAN_sidecar_product.md](../todo/PLAN_sidecar_product.md)'s.
 
 ## 6. Build order
 
 1. **The registry** — the two present tokenizers become rows, **loaded at startup**; `/tokenize` resolves
    through it; the refusal names the registered set. Behaviour for `bge`/`qwen` is byte-identical.
-   Coordinate with [PLAN_reliability_tail.md](PLAN_reliability_tail.md) item 2, which touches the same
+   Coordinate with [PLAN_reliability_tail.md](../todo/PLAN_reliability_tail.md) item 2, which touches the same
    handler: startup loading removes its first-call disk I/O, and its `spawn_blocking` + batch cap sit on
    top of this unchanged.
 2. **`GET /models`** — the metadata read, with unknown as its own state.
@@ -171,13 +176,14 @@ Inline `#[cfg(test)]` tests, as the repository does today.
 - [x] `bge` and `qwen` answer byte-identically to before.
       (`a_missing_tokenizer_file_degrades_one_name_and_leaves_the_others_answering` — green before the
       change and after it, which is the whole of what a regression guard is for.)
-- [ ] `GET /models` states kind, dimension, max sequence length and tokenizer per entry, with unknown
-      distinct from zero.
-- [ ] `/embed` reports its own dimension.
-- [x] `README.md` and `research/module_http_surface.md` updated; `todo/README.md` table updated.
-      (Step 1's half; both gain the `/models` shape when step 2 lands.)
+- [x] `GET /models` states kind, dimension, max sequence length and tokenizer per entry, with unknown
+      distinct from zero. (Plus `rerank` as a kind and the `available` split — see the deviations.)
+- [x] `/embed` reports its own dimension — measured from the rows in that same response, `null` for an
+      empty batch, never `0`.
+- [x] `README.md`, `research/module_http_surface.md` and `research/architecture.md` updated;
+      `todo/README.md` table updated.
 
-### Step 1's test record
+### The test record
 
 | Guarantee | Test | Observed |
 |---|---|---|
@@ -187,7 +193,29 @@ Inline `#[cfg(test)]` tests, as the repository does today.
 | The default cap clears the host's own row budget | `the_default_batch_cap_leaves_room_above_the_hosts_own_row_budget` | ships with the config field |
 | bge/qwen behaviour unchanged | `a_missing_tokenizer_file_degrades_one_name_and_leaves_the_others_answering` | green on both sides |
 
-Suite: 62 → **67 passed, 0 failed**, no compiler warnings.
+Steps 2 and 3 are new surface rather than defect repair, so their tests ship *with* the feature instead
+of failing before it — stated plainly rather than implying a RED run that did not happen:
+
+| Guarantee | Test |
+|---|---|
+| A counting tokenizer is its own kind, never an embedder | `models_reports_a_counting_tokenizer_as_its_own_kind_never_as_an_embedder` |
+| A tokenizer a model claims is named on that model, once | `a_tokenizer_claimed_by_a_model_is_not_also_listed_on_its_own` |
+| An unmeasured dimension is unknown, not `0` and not a constant | `an_unmeasured_dimension_is_unknown_rather_than_zero_or_a_constant` |
+| A cross-encoder never reports a width | `the_reranker_never_reports_a_dimension` |
+| A registered name with no file is listed, marked unavailable | `a_tokenizer_with_no_file_is_listed_and_marked_unavailable` |
+| A loaded tokenizer is visible behind a cold engine | `a_loaded_tokenizer_is_visible_even_while_its_engine_is_cold` |
+| `/models` answers while an engine is held | `models_answers_while_an_engine_is_held` |
+| The reported width is the width of the rows beside it | `the_reported_dimension_is_the_width_of_the_rows_beside_it` |
+| Unpinning removes rows, never columns | `unpinning_leaves_the_width_untouched` |
+
+Suite: 62 → **76 passed, 0 failed**, no compiler warnings.
+
+**Verified on the wire**, which is where deviation 3 was found — `GET /models` and `POST /tokenize` were
+called against a running binary on port 5399 and their real JSON read. Two guarantees the unit tests do
+not reach: the route is actually mounted, and the refusal a caller receives really does name the
+registered set (`unknown tokenizer 'llama' — this sidecar counts for 'bge', 'qwen'`). `/embed`'s
+`dimension` could not be exercised end-to-end here: it needs a loaded engine and therefore the GPU, so
+what is proven for it is the pure function, the struct-update path and the unpinning invariant.
 
 ## 9. Open questions
 

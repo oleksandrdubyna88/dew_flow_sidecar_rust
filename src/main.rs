@@ -618,6 +618,14 @@ struct AppState {
     /// default rather than as a fact: every request carries the operator's own batch, so the configured
     /// number described an intention nobody was running.
     loaded_max_batch: Mutex<Option<usize>>,
+    /// The width of the dense vectors this process has actually produced — MEASURED from a returned row,
+    /// never a constant.
+    ///
+    /// `None` until an embed has run, and `/models` reports that as UNKNOWN rather than guessing 1024.
+    /// A constant here would be a fact living in two repositories with nothing to keep them equal, and
+    /// the failure it produces is a vector collection created at the wrong width — which does not fail
+    /// until something tries to store into it.
+    loaded_embed_dimension: Mutex<Option<usize>>,
     /// The DXGI adapter ORT_DEVICE_ID resolves to (None = mapping unavailable — raw id fallback).
     adapter: Option<adapters::ResolvedAdapter>,
     /// Every tokenizer this build can COUNT with, resolved at startup — see `TokenizerRegistry`.
@@ -972,6 +980,7 @@ async fn main() {
         last_provider_error: Mutex::new(None),
         loaded_embed_max_length: Mutex::new(None),
         loaded_max_batch: Mutex::new(None),
+        loaded_embed_dimension: Mutex::new(None),
         adapter,
         tokenizers,
     });
@@ -992,6 +1001,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/models", get(models))
         .route("/embed", post(embed))
         .route("/rerank", post(rerank))
         .route("/unload", post(unload))
@@ -1286,6 +1296,12 @@ struct PassTimings {
 struct EmbedResponse {
     dense: Vec<Vec<f32>>,
     sparse: Vec<SparseVec>,
+    /// The width of the dense rows in THIS response, read from one of them.
+    ///
+    /// Free — the length of a row already computed — and it removes the last model constant a caller had
+    /// to already know. A vector store creating a collection from the response it is holding cannot then
+    /// create it at the wrong width. `null` when the batch was empty: never `0`.
+    dimension: Option<usize>,
     #[serde(flatten)]
     usage: TokenUsage,
     /// Echoed from the request; empty when the caller sent none.
@@ -1481,6 +1497,69 @@ struct ModelNames {
     rerank: &'static str,
 }
 
+/// A model serving both an embedding head and a learned-sparse head from ONE forward pass.
+const KIND_DENSE_SPARSE: &str = "dense+sparse";
+/// A cross-encoder: it scores pairs and returns no vectors at all.
+const KIND_RERANK: &str = "rerank";
+/// A tokenizer you can COUNT with and cannot embed with — exactly what the qwen row is here.
+///
+/// A real kind rather than a hack. A consumer that cannot see the difference between "a model you can
+/// embed with" and "a tokenizer you can count with" will eventually ask this process to embed with the
+/// second one, and the clearest moment to prevent that is the read where it chooses.
+const KIND_TOKENIZER_ONLY: &str = "tokenizer-only";
+
+/// What this build can do, per model — `GET /models`.
+#[derive(Serialize, Debug)]
+struct ModelsResponse {
+    models: Vec<ModelEntry>,
+}
+
+/// One thing this build can serve or count with.
+#[derive(Serialize, Debug)]
+struct ModelEntry {
+    /// What a caller names it: `bge-m3`, `bge-reranker-v2-m3`, `qwen`. Short and stable — the long
+    /// descriptive strings `/health` reports under `models` stay there, unchanged, because a consumer
+    /// already reads them as its model id.
+    id: &'static str,
+    /// The full name of what actually loads, for a human reading this response.
+    name: &'static str,
+    /// `dense+sparse` | `rerank` | `tokenizer-only`. Present from the first version deliberately: a
+    /// sparse-only model is already defined in the vendored library and wired to nothing, so the field
+    /// that would have to be retrofitted exists now instead.
+    kind: &'static str,
+    /// The width of the vectors this model produces, MEASURED from a row it returned.
+    ///
+    /// `null` in two situations, and `kind` is what tells them apart: a row that has no vectors at all
+    /// (`rerank`, `tokenizer-only`) never has one, while an embedding row reports `null` until a pass
+    /// has actually produced a vector. Never `0` — see `dense_dimension`.
+    dimension: Option<usize>,
+    /// The cap a pass would run at right now: the loaded one when an engine is resident, else the
+    /// configured default. `null` where the concept does not apply (a counting tokenizer imposes none).
+    max_sequence_length: Option<usize>,
+    /// The registered tokenizer name that counts for this model — the id `/tokenize` takes.
+    ///
+    /// `null` = this process registers no counter for it. That is the reranker's honest answer: its
+    /// tokenizer lives inside the vendored library and is never read here, and claiming `bge` because
+    /// the models look related is the kind of confident guess this endpoint exists to remove.
+    tokenizer: Option<&'static str>,
+    /// Whether this row can answer RIGHT NOW. For a model: an engine is resident (a busy lock reads as
+    /// resident, as `/health` does). For a tokenizer row: its file loaded at startup.
+    available: bool,
+    /// Whether the tokenizer named above can COUNT right now — a fact about the file, and deliberately
+    /// not folded into `available`.
+    ///
+    /// One flag could not carry both. On a model row `available` reports the ENGINE, so a perfectly
+    /// loaded tokenizer behind an unloaded engine was invisible — and "engine cold, tokenizer ready" is
+    /// exactly the state a consumer is in while it validates a recipe *before* starting a pass, which is
+    /// what this endpoint exists for. `null` where the row names no tokenizer.
+    tokenizer_available: Option<bool>,
+}
+
+/// Whether a named tokenizer can count right now. `None` when the row names none.
+fn tokenizer_available(state: &AppState, tokenizer: Option<&str>) -> Option<bool> {
+    tokenizer.map(|name| state.tokenizers.entry(name).is_some_and(|row| row.tokenizer.is_some()))
+}
+
 #[derive(Serialize, Debug)]
 struct ErrorResponse {
     error: String,
@@ -1574,6 +1653,72 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         },
         adapter: state.adapter.clone(),
     })
+}
+
+/// What this build can embed with, rerank with, and count with — one read, answered without touching an
+/// engine lock (`loaded_now` try_locks, exactly as `/health` does).
+///
+/// It exists so a consumer can validate a corpus recipe BEFORE starting a pass rather than discovering a
+/// mismatch in the middle of one. Every fact here is read from what is loaded or configured; nothing is
+/// a constant a second repository would have to keep in step.
+async fn models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
+    Json(ModelsResponse { models: models_now(&state) })
+}
+
+fn models_now(state: &AppState) -> Vec<ModelEntry> {
+    let served = [
+        ModelEntry {
+            id: "bge-m3",
+            name: DUAL_MODEL,
+            kind: KIND_DENSE_SPARSE,
+            dimension: state.loaded_embed_dimension.try_lock().ok().and_then(|d| *d),
+            // What a pass would run at: the resident rung when there is one, else the configured
+            // default. The same resolution the host already performs over /health, moved to the side
+            // that owns the fact.
+            max_sequence_length: Some(
+                state
+                    .loaded_embed_max_length
+                    .try_lock()
+                    .ok()
+                    .and_then(|c| *c)
+                    .unwrap_or(state.config.embed_max_length),
+            ),
+            tokenizer: Some(BGE_TOKENIZER),
+            available: loaded_now(&state.engines.embed),
+            tokenizer_available: tokenizer_available(state, Some(BGE_TOKENIZER)),
+        },
+        ModelEntry {
+            id: "bge-reranker-v2-m3",
+            name: RERANK_MODEL,
+            kind: KIND_RERANK,
+            // A cross-encoder returns scores, not vectors: there is no width to report, ever.
+            dimension: None,
+            max_sequence_length: Some(state.config.rerank_max_length),
+            tokenizer: None,
+            available: loaded_now(&state.engines.rerank),
+            tokenizer_available: None,
+        },
+    ];
+
+    // Then every registered tokenizer that no served model already claimed — which is precisely the
+    // `tokenizer-only` set, derived rather than listed so it cannot drift from the registry.
+    let claimed: Vec<&str> = served.iter().filter_map(|model| model.tokenizer).collect();
+    let counting = state.tokenizers.entries.iter().filter(|entry| !claimed.contains(&entry.name)).map(|entry| {
+        ModelEntry {
+            id: entry.name,
+            name: entry.name,
+            kind: KIND_TOKENIZER_ONLY,
+            dimension: None,
+            max_sequence_length: None,
+            tokenizer: Some(entry.name),
+            // On a tokenizer-only row the two are the same fact, which is the consistency the split
+            // buys: a reader never has to know which kind of row it is holding to read either flag.
+            available: entry.tokenizer.is_some(),
+            tokenizer_available: Some(entry.tokenizer.is_some()),
+        }
+    });
+
+    served.into_iter().chain(counting).collect()
 }
 
 /// Non-blocking engine presence for /health: a busy lock means a load or an inference pass holds
@@ -1736,6 +1881,10 @@ async fn embed(
         return Ok(Json(EmbedResponse {
             dense: vec![],
             sparse: vec![],
+            // An empty batch measured nothing. Reporting the last pass's width here would state a fact
+            // about vectors this response does not contain — /models is where the process's own width
+            // belongs, and it says "unknown" until something has actually been embedded.
+            dimension: None,
             usage: TokenUsage::default(),
             request_id,
             timings: PassTimings::default(),
@@ -2051,8 +2200,13 @@ fn embed_blocking(
             texts.len(), expanded.len(), limits.max_batch, limits.max_length
         );
         let padded = embed_natural(state, expanded, provider_hint, limits, retry_short, request_id)?;
+        let dense = unpin_rows(padded.dense, &positions)?;
         return Ok(EmbedResponse {
-            dense: unpin_rows(padded.dense, &positions)?,
+            // Re-measured from the rows that actually leave, not carried over from the padded batch:
+            // the width is the same either way, and reporting it from anything but the returned vectors
+            // is how a field starts describing something other than what it names.
+            dimension: dense_dimension(&dense),
+            dense,
             sparse: unpin_rows(padded.sparse, &positions)?,
             usage,
             request_id: padded.request_id,
@@ -2125,10 +2279,15 @@ fn embed_natural(
     ));
 
     let (dense, sparse): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    // The width comes from a row this pass actually produced. Recorded here — the one place a real
+    // forward pass has happened — so /models can state it instead of a caller having to know it.
+    let dimension = dense_dimension(&dense);
+    record_embed_dimension(state, dimension);
     // No usage here on purpose: this function also runs over the PINNED batch, whose ruler rows are not
     // the caller's texts. embed_blocking owns the accounting and stamps it on the way out.
     Ok(EmbedResponse {
         dense,
+        dimension,
         sparse: sparse
             .into_iter()
             .map(|s: fastembed::SparseEmbedding| SparseVec {
@@ -2416,6 +2575,27 @@ fn record_max_batch(state: &AppState, used: usize) {
         return;
     };
     *loaded = Some(used);
+}
+
+/// The width of the vectors that just came back, so `/models` can state it instead of a caller having
+/// to already know it. Recorded from a real row — see `loaded_embed_dimension`.
+fn record_embed_dimension(state: &AppState, dimension: Option<usize>) {
+    let Some(dimension) = dimension else {
+        return; // an empty batch measured nothing; leave whatever an earlier pass established
+    };
+    let Ok(mut loaded) = state.loaded_embed_dimension.lock() else {
+        return;
+    };
+    *loaded = Some(dimension);
+}
+
+/// The width of a set of dense vectors, read from a row.
+///
+/// `None` for an empty set — and that is the whole reason this is an `Option` rather than a `usize`:
+/// a `0` is indistinguishable from "a zero-width vector", which is not a thing, and a caller sizing a
+/// collection from it would size it wrong.
+fn dense_dimension(dense: &[Vec<f32>]) -> Option<usize> {
+    dense.first().map(Vec::len)
 }
 
 /// Files a freshly built engine under its rung and reports what the card now holds. The log line is the
@@ -2885,12 +3065,13 @@ mod tests {
     use super::{
         aligned_scores, cache_dir_verdict, compiled_providers, dylib_verdict, effective_provider, engine_cache_dir,
         execution_providers, copy_missing_files, embed_settling, find_tokenizer_file, health, inflight_now,
-        join_error_text, loaded_now, lock_or_refuse, cap_for, parse_unload_request,
-        pass_log_message, pin_shape, preflight_provider, rerank_batch, required_provider_libraries, ruler_text,
-        should_pin_shape, tokenize, unload, unpin_rows, usage_from_counts, wedge_action, with_engine_cache,
-        write_inflight, AppState, Config, EmbedResponse, Engines, InFlight, PassTimings, Patience, Phase,
-        Provenance, RungCache, TokenUsage, TokenizeRequest, TokenizerRegistry, TokenizerSource, WedgeAction,
-        WedgePolicy, BGE_TOKENIZER, SETTLE_ATTEMPTS,
+        dense_dimension, join_error_text, loaded_now, lock_or_refuse, cap_for, models_now, parse_unload_request,
+        pass_log_message, pin_shape, preflight_provider, record_embed_dimension, rerank_batch,
+        required_provider_libraries, ruler_text, should_pin_shape, tokenize, unload, unpin_rows,
+        usage_from_counts, wedge_action, with_engine_cache, write_inflight, AppState, Config, EmbedResponse,
+        Engines, InFlight, ModelEntry, PassTimings, Patience, Phase, Provenance, RungCache, TokenUsage,
+        TokenizeRequest, TokenizerRegistry, TokenizerSource, WedgeAction, WedgePolicy, BGE_TOKENIZER,
+        SETTLE_ATTEMPTS,
     };
     use axum::body::Bytes;
     use axum::extract::State;
@@ -2958,6 +3139,7 @@ mod tests {
             last_provider_error: Mutex::new(None),
             loaded_embed_max_length: Mutex::new(None),
             loaded_max_batch: Mutex::new(None),
+            loaded_embed_dimension: Mutex::new(None),
             adapter: None,
             tokenizers,
         })
@@ -3399,8 +3581,9 @@ mod tests {
     #[test]
     fn the_struct_update_path_keeps_the_inner_timings_and_echo() {
         let inner = EmbedResponse {
-            dense: vec![],
+            dense: vec![vec![0.0f32; 1024]],
             sparse: vec![],
+            dimension: Some(1024),
             usage: TokenUsage::default(),
             request_id: "leg-7/q3".to_string(),
             timings: PassTimings {
@@ -3415,6 +3598,7 @@ mod tests {
 
         assert_eq!(outer.timings.inference_ms, 9, "the inner pass's timing survives the update");
         assert_eq!(outer.request_id, "leg-7/q3", "and so does the caller's echo");
+        assert_eq!(outer.dimension, dense_dimension(&outer.dense), "and the width still describes THESE rows");
     }
 
     /// The common case — a settled session — must cost exactly ONE run. This is the regression that
@@ -4124,6 +4308,152 @@ mod tests {
             Config::from_env().tokenize_max_texts >= 512 * 2,
             "a cap at or below the host's 512-row budget turns a normal pass into a wall of 400s"
         );
+    }
+
+    // ---------- GET /models: what this build can do ----------
+
+    fn model_row<'a>(models: &'a [ModelEntry], id: &str) -> &'a ModelEntry {
+        models.iter().find(|entry| entry.id == id).unwrap_or_else(|| panic!("no '{id}' row in {models:?}"))
+    }
+
+    /// A counting tokenizer is its own KIND, not a model with missing fields. A consumer that cannot see
+    /// the difference between "a model you can embed with" and "a tokenizer you can count with" will
+    /// eventually ask this process to embed with the second one.
+    #[test]
+    fn models_reports_a_counting_tokenizer_as_its_own_kind_never_as_an_embedder() {
+        let state = app_state_with_tokenizers(&[BGE_TOKENIZER, "qwen"]);
+
+        let models = models_now(&state);
+        let qwen = model_row(&models, "qwen");
+
+        assert_eq!(qwen.kind, "tokenizer-only");
+        assert_eq!(qwen.dimension, None, "there is nothing to embed with, so there is no width");
+        assert_eq!(qwen.max_sequence_length, None, "and a counting tokenizer imposes no cap here");
+        assert_eq!(qwen.tokenizer.expect("it IS a tokenizer"), "qwen", "and /tokenize takes exactly this id");
+    }
+
+    /// `bge` is the embedder's tokenizer AND a registered counting name. It must appear ONCE, on the model
+    /// it belongs to — a duplicate row would offer a caller two ways to name one thing.
+    #[test]
+    fn a_tokenizer_claimed_by_a_model_is_not_also_listed_on_its_own() {
+        let state = app_state_with_tokenizers(&[BGE_TOKENIZER, "qwen"]);
+
+        let models = models_now(&state);
+
+        assert_eq!(models.iter().filter(|entry| entry.id == BGE_TOKENIZER).count(), 0, "not a row of its own");
+        assert_eq!(
+            model_row(&models, "bge-m3").tokenizer,
+            Some(BGE_TOKENIZER),
+            "it is named where it is used, on the model it counts for"
+        );
+    }
+
+    /// UNKNOWN is a value. A dimension nobody has measured yet must not read as `0`, and must not be
+    /// guessed from a constant either — a caller sizing a vector collection from a guess sizes it wrong,
+    /// and that failure does not surface until something tries to store into it.
+    #[test]
+    fn an_unmeasured_dimension_is_unknown_rather_than_zero_or_a_constant() {
+        let state = app_state_with_tokenizers(&[BGE_TOKENIZER]);
+
+        let cold = models_now(&state);
+        assert_eq!(model_row(&cold, "bge-m3").dimension, None, "nothing has been embedded on this process");
+
+        // A pass reports a real row, and only then does the field carry a number.
+        record_embed_dimension(&state, dense_dimension(&[vec![0.0f32; 1024]]));
+
+        let warm = models_now(&state);
+        assert_eq!(model_row(&warm, "bge-m3").dimension, Some(1024), "measured from a row, not from a const");
+    }
+
+    /// A cross-encoder returns scores, not vectors — so it never has a width, cold or warm.
+    #[test]
+    fn the_reranker_never_reports_a_dimension() {
+        let state = app_state_with_tokenizers(&[BGE_TOKENIZER]);
+        record_embed_dimension(&state, Some(1024));
+
+        let models = models_now(&state);
+        let rerank = model_row(&models, "bge-reranker-v2-m3");
+
+        assert_eq!(rerank.kind, "rerank");
+        assert_eq!(rerank.dimension, None, "an embedder's width must never leak onto the reranker's row");
+        assert_eq!(rerank.tokenizer, None, "and this process registers no counter for it — null, not a guess");
+    }
+
+    /// "Engine cold, tokenizer ready" is the state a consumer is in while it validates a recipe BEFORE
+    /// starting a pass — so the two facts cannot share one flag.
+    ///
+    /// Found by reading the real response rather than by a test: the log said `bge token counting enabled
+    /// from …tokenizer.json` while `/models` reported the bge-m3 row `available: false`, which is true of
+    /// the engine and says nothing about the tokenizer. One field, two meanings by row kind.
+    #[test]
+    fn a_loaded_tokenizer_is_visible_even_while_its_engine_is_cold() {
+        let cache = model_cache_with_a_tokenizer("cold-engine");
+        let mut config = config("");
+        config.cache_dir = cache.clone();
+        let state = app_state_with(config);
+
+        let models = models_now(&state);
+        let bge = model_row(&models, "bge-m3");
+
+        assert!(!bge.available, "no engine has been built on this state");
+        assert_eq!(bge.tokenizer_available, Some(true), "but the tokenizer counted fine, and that is readable");
+        assert_eq!(
+            model_row(&models, "bge-reranker-v2-m3").tokenizer_available,
+            None,
+            "a row that names no tokenizer reports null, not false"
+        );
+
+        std::fs::remove_dir_all(&cache).ok();
+    }
+
+    /// A registered name whose file is missing is still a ROW, marked unavailable. Hiding it would make a
+    /// deployment problem look like a name that does not exist.
+    #[test]
+    fn a_tokenizer_with_no_file_is_listed_and_marked_unavailable() {
+        let state = app_state_with_tokenizers(&[BGE_TOKENIZER, "qwen"]);
+
+        let models = models_now(&state);
+
+        assert!(!model_row(&models, "qwen").available, "the test rows carry no files");
+    }
+
+    /// /models answers while an engine is held — it is a metadata read, and a read that queues behind the
+    /// model work it describes is the defect `/health` already had fixed (`loaded_now` try_locks).
+    #[test]
+    fn models_answers_while_an_engine_is_held() {
+        let state = app_state_with_tokenizers(&[BGE_TOKENIZER]);
+        let held = HeldEngine::hold(state.clone(), |s| &s.engines.embed);
+
+        let models = models_now(&state);
+
+        assert_eq!(models.len(), 2, "the full answer, not a degraded one");
+        assert!(model_row(&models, "bge-m3").available, "a busy lock reads as resident, exactly as /health does");
+        drop(held);
+    }
+
+    // ---------- the dimension on /embed ----------
+
+    /// The reported width is the width of the rows in the SAME response — the whole point is that a caller
+    /// holding the response cannot get it wrong.
+    #[test]
+    fn the_reported_dimension_is_the_width_of_the_rows_beside_it() {
+        let rows = vec![vec![0.0f32; 1024], vec![0.0f32; 1024]];
+
+        assert_eq!(dense_dimension(&rows), Some(rows[0].len()));
+        assert_eq!(dense_dimension(&[]), None, "an empty batch measured nothing — null, never 0");
+    }
+
+    /// Unpinning removes ruler ROWS, never columns, so the width that leaves is the width that ran. This
+    /// is what lets the pinned path re-measure from the returned rows rather than carrying a number over.
+    #[test]
+    fn unpinning_leaves_the_width_untouched() {
+        let padded = vec![vec![0.0f32; 1024], vec![1.0f32; 1024], vec![2.0f32; 1024]];
+        let wide = dense_dimension(&padded);
+
+        let real = unpin_rows(padded, &[1]).expect("row 1 was the caller's");
+
+        assert_eq!(real.len(), 1, "one row of the caller's survives");
+        assert_eq!(dense_dimension(&real), wide, "and it is exactly as wide as what the engine returned");
     }
 }
 

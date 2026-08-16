@@ -37,7 +37,7 @@ flowchart LR
   "max_length": 0, "max_batch": 0, "request_id": "" }
 
 // response
-{ "dense": [[0.1, …]], "sparse": [{ "indices": [u32], "values": [f32] }],
+{ "dense": [[0.1, …]], "sparse": [{ "indices": [u32], "values": [f32] }], "dimension": 1024,
   "token_count": [123], "truncated": [false], "max_length": 256, "token_accounting": true,
   "request_id": "", "timings": { "queue_wait_ms": 0, "session_build_ms": 0,
                                  "inference_ms": 0, "compile_cache_grew_mb": 0 } }
@@ -46,6 +46,12 @@ flowchart LR
 `kind` is accepted for contract compatibility — BGE-M3 embeds queries and documents identically — but a
 `query` is never allowed to move the loaded sequence cap, because it arrives interleaved with index
 passes.
+
+`dimension` is the width of the dense rows **in this same response**, read from one of them — free, since
+it is the length of a row already computed, and it removes the last model constant a caller had to know
+in advance. A vector store creating a collection from the response it is holding cannot then create it at
+the wrong width. `null` for an empty batch: never `0`. The pinned path re-measures it from the rows that
+actually leave rather than carrying the padded batch's number over.
 
 ### `POST /rerank`
 
@@ -72,6 +78,42 @@ path rather than a code change. Three refusals, and they are deliberately differ
 The encode itself runs inside `spawn_blocking`, as `/embed`'s always has: "pure CPU" is a claim about the
 GPU, not about the async runtime, and a batch of ten thousand encodes in front of the reactor stalls
 `/health` and `/unload` — the two endpoints an operator reaches for when something is stalled.
+
+### `GET /models`
+
+What this build can embed with, rerank with and count with — one read, so a consumer can validate a
+corpus recipe **before** starting a pass instead of discovering a mismatch in the middle of one. Answered
+without touching an engine lock (`loaded_now` try_locks, exactly as `/health` does).
+
+```jsonc
+{ "models": [
+  { "id": "bge-m3", "name": "BAAI/bge-m3 (dense+sparse heads, FP32, one session)",
+    "kind": "dense+sparse", "dimension": null, "max_sequence_length": 256,
+    "tokenizer": "bge", "available": false, "tokenizer_available": true },
+  { "id": "bge-reranker-v2-m3", "name": "bge-reranker-v2-m3", "kind": "rerank",
+    "dimension": null, "max_sequence_length": 1024,
+    "tokenizer": null, "available": false, "tokenizer_available": null },
+  { "id": "qwen", "name": "qwen", "kind": "tokenizer-only",
+    "dimension": null, "max_sequence_length": null,
+    "tokenizer": "qwen", "available": false, "tokenizer_available": false } ] }
+```
+
+- **`kind`** is `dense+sparse` | `rerank` | `tokenizer-only`. The last is a real kind, not a hack: it is
+  exactly what the qwen row is, and a consumer that cannot see the difference between "a model you can
+  embed with" and "a tokenizer you can count with" will eventually ask this process to embed with the
+  second one.
+- **`dimension` is measured, never a constant.** It is the width of a row a pass actually returned, so it
+  is `null` until something has been embedded — *unknown* is a value here, and it is never `0`. `kind`
+  tells the two absences apart: a `rerank` or `tokenizer-only` row has no width ever, an embedding row has
+  none *yet*. A constant would be a fact living in two repositories with nothing keeping them equal, and
+  the failure it produces is a vector collection created at the wrong width.
+- **`available` vs `tokenizer_available`.** The first is the ENGINE (a busy lock reads as resident); the
+  second is the tokenizer FILE. They are split because one flag could not carry both — "engine cold,
+  tokenizer ready" is precisely the state a consumer is in while validating a recipe, and folding them
+  hid it.
+- A tokenizer claimed by a model is named **on that model** and gets no row of its own, so `bge` appears
+  once. The `tokenizer-only` rows are *derived* from the registry rather than listed, so they cannot drift
+  from what `/tokenize` accepts.
 
 ### `GET /health`
 

@@ -43,9 +43,17 @@ Model files (~2.2 GB for bge-m3 FP32 + the reranker) download from Hugging Face 
 
 | Endpoint | Body | Response |
 |---|---|---|
-| `POST /embed` | `{ "texts": ["..."], "kind": "doc"\|"query", "provider": "auto\|cuda\|dml\|migraphx\|cpu"?, "request_id": "..."? }` | `{ "dense": [[f32]], "sparse": [{ "indices": [u32], "values": [f32] }], "token_count": [usize], "truncated": [bool], "max_length": usize, "token_accounting": bool, "request_id": "...", "timings": {...} }` |
+| `POST /embed` | `{ "texts": ["..."], "kind": "doc"\|"query", "provider": "auto\|cuda\|dml\|migraphx\|cpu"?, "request_id": "..."? }` | `{ "dense": [[f32]], "sparse": [{ "indices": [u32], "values": [f32] }], "dimension": usize\|null, "token_count": [usize], "truncated": [bool], "max_length": usize, "token_accounting": bool, "request_id": "...", "timings": {...} }` |
 | `POST /rerank` | `{ "query": "...", "documents": ["..."], "provider": ...?, "request_id": "..."? }` | `{ "scores": [f32] (input order), "request_id": "...", "timings": {...} }` |
+| `POST /tokenize` | `{ "texts": ["..."], "model": "bge"\|"qwen"? }` | `{ "token_count": [usize], "model": "...", "available": bool }` |
+| `GET /models` | — | `{ "models": [{ "id", "name", "kind": "dense+sparse"\|"rerank"\|"tokenizer-only", "dimension": usize\|null, "max_sequence_length": usize\|null, "tokenizer": "..."\|null, "available": bool, "tokenizer_available": bool\|null }] }` |
 | `GET /health` | — | `{ "status": "ok"\|"wedged", "wedged", "in_flight": [...], "provider", "provenance_ready", "loaded": {...}, "models": {...}, "adapter": { "name", "vram_mb", "luid", "requested_device", "dml_device_id" } \| null }` |
+
+`/embed`'s `dimension` is the width of the dense rows in that same response, read from one of them — so a
+caller sizing a vector collection cannot size it wrong. `GET /models` states what this build can do
+before a pass starts: `dimension` there is **measured**, so it is `null` until something has been
+embedded (unknown is a value, never `0`), and `available` reports the engine while `tokenizer_available`
+reports the tokenizer file — "engine cold, tokenizer ready" is a real and useful state.
 
 `kind` is accepted for contract compatibility; BGE-M3 embeds queries and documents identically.
 
@@ -234,9 +242,9 @@ Three properties are the contract:
   texts fit under 2 MB to be tens of thousands of encodes in front of `/health` and `/unload`, which are
   the two endpoints an operator reaches for when something is stalled.
 
-Adding a third model is a row and a path. Reporting **what** each row is — kind, embedding dimension, max
-sequence length — is `GET /models`, still open in
-[todo/PLAN_tokenizer_registry.md](todo/PLAN_tokenizer_registry.md).
+Adding a third model is a row and a path. **What** each row is — kind, embedding dimension, max sequence
+length, and whether it can answer right now — is [`GET /models`](#endpoints), so a consumer validates a
+recipe before a pass rather than discovering a mismatch inside one.
 
 ## AMD on Linux/WSL (ROCm via the MIGraphX EP)
 

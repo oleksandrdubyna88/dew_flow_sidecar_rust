@@ -14,8 +14,8 @@
 >
 > Related: `.claude/rules/shared/common/reliability.md` (the doctrine this audit produced),
 > [README.md](../README.md) (the incident history most of this file's machinery answers),
-> [PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md) (item 2 is that plan's step 1 — see the
-> overlap note there; the two are the same twenty lines and should land together).
+> [PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md) (**implemented** — item 2 was its
+> step 1, and the two landed together as both plans asked, because they were the same twenty lines).
 
 ## Why the line numbers moved, and what it cost
 
@@ -77,7 +77,7 @@ Feature-gated to `migraphx` builds.
 
 ### 2. `/tokenize` does CPU work — and first-call file I/O — on the async runtime — MEDIUM · **DONE 2026-08-16**
 
-> Landed with [PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md) step 1, as this plan's build
+> Landed with [PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md) step 1, as this plan's build
 > order asked — they were the same twenty lines. All three fixes shipped:
 >
 > - **Pre-warm.** `TokenizerRegistry::load` reads every row at startup, before the listener is up. The
@@ -226,7 +226,7 @@ at `d0139b1`:
 | `wedge` | 172–472 | `Phase`, `WedgePolicy`, `InFlight`, `EngineWedged`, `wedge_action`, the watchdog |
 | `engine_cache` | 473–558 | `RungCache`, `EngineSlot` |
 | `state` | 559–680 | `Engines`, `AppState`, `Limits` |
-| `tokens` | 681–789 | tokenizer loading, `count_tokens`, `token_usage`, `usage_from_counts` — **the module [PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md) reshapes** |
+| `tokens` | 681–789 | tokenizer loading, `count_tokens`, `token_usage`, `usage_from_counts` — **the module [PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md) reshaped**, so this range has already moved |
 | `main` | 790–930 | startup, logging init, router |
 | `preflight` | 931–1127 | ORT dylib + MIGraphX cache probes, model-cache seeding |
 | `wire` | 1128–1445 | request/response types, `ApiError` constructors |
@@ -248,7 +248,7 @@ this table's numbers, trust its groupings.
 ## Build order
 
 *(Items 2 and 3 are done. Item 2 went first because it was the same twenty lines as
-[PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md)'s step 1, which is on the critical path of two
+[PLAN_tokenizer_registry.md](../research/PLAN_tokenizer_registry.md)'s step 1, which is on the critical path of two
 other repositories — `dew_flow_rag_qln`, then `dew_flow_benchmark`.)*
 
 1. **(1) the cache race** — the only correctness hazard left here. The investigation the draft asked
