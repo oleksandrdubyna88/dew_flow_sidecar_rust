@@ -14,6 +14,7 @@ Definition of Done.
 | plan | status | scope |
 |---|---|---|
 | [PLAN_sidecar_product.md](PLAN_sidecar_product.md) | engine works and is measured on an R9700; distribution is not built | build recipe as data, self-verification against a reference vector, public-repository hygiene, host ergonomics |
+| [PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md) | plan only, 2026-08-16 | tokenizers by name instead of a two-arm `match`, a `GET /models` read stating kind · dimension · max sequence · tokenizer per entry (with unknown as its own state), and the embedding dimension on `/embed`. Driven by the consumer's need to chunk each embedding model with **its own** tokenizer: `/tokenize` already counts with the model's real `tokenizer.json` and with truncation off, but a third model is a code change in three places and a caller cannot discover what this build can count for. Shares a handler with [PLAN_reliability_tail.md](PLAN_reliability_tail.md) item 2 — startup loading subsumes its pre-warm. Consumer: `dew_flow_rag_qln · todo/PLAN_tokenizer_contract_and_chunk_coverage.md` |
 | [PLAN_reliability_tail.md](PLAN_reliability_tail.md) | partially implemented, 2026-08-16 — item 3 (the ruler) landed with the CRITICAL/HIGH fixes; the rest is open | what the 24/7 audit found and the same-day fixes did not take: the MIGraphX cache path race between build and first launch, `/tokenize` on the reactor, the twice-per-request cache walk, and the 2 887-line `main.rs` |
 
 Implemented plans live in [`../research/`](../research/) — most recently
