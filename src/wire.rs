@@ -76,7 +76,7 @@ pub(crate) struct PassTimings {
     pub(crate) session_build_ms: u64,
     /// The forward pass(es), settling re-runs included — what this request's inference actually cost.
     pub(crate) inference_ms: u64,
-    /// >0 = MIGraphX compiled this input shape during the pass. The EP saves its cache LAZILY, so
+    /// `>0` = MIGraphX compiled this input shape during the pass. The EP saves its cache LAZILY, so
     /// growth measured across the pass is the only moment a compile is observable.
     pub(crate) compile_cache_grew_mb: u64,
 }

@@ -118,7 +118,7 @@ pub(crate) fn pin_shape(texts: &[String], max_batch: usize, ruler: &str) -> (Vec
             positions.push(expanded.len());
             expanded.push(text.clone());
         }
-        while expanded.len() % max_batch != 0 {
+        while !expanded.len().is_multiple_of(max_batch) {
             expanded.push(ruler.to_string());
         }
     }
