@@ -58,3 +58,18 @@ jobs:
       #     if: matrix.os == 'ubuntu-latest'
       #     run: cargo fmt --package bge-sidecar --check
       # (--package, so the vendored fastembed fork stays byte-identical to upstream.)
+
+  # The plan lifecycle, enforced from the shared rules repository rather than four times over — the check
+  # reads markdown, not code, so one implementation serves every consumer (see .claude/rules/shared/README.md).
+  # Only that ONE submodule is fetched: `submodules: true` would drag every other one in for a markdown walk.
+  # Node is preinstalled on the runner, so a Rust repository pays no toolchain for this.
+  plans:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the shared rules
+        run: git submodule update --init --depth 1 .claude/rules/shared
+
+      - name: Plan lifecycle
+        run: node .claude/rules/shared/tools/plan-lifecycle.mjs
