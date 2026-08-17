@@ -14,6 +14,7 @@ Definition of Done.
 | plan | status | scope |
 |---|---|---|
 | [PLAN_sidecar_product.md](PLAN_sidecar_product.md) | engine works and is measured on an R9700; distribution is not built | build recipe as data, self-verification against a reference vector, public-repository hygiene, host ergonomics |
+| [PLAN_vram_per_engine.md](PLAN_vram_per_engine.md) | plan only, 2026-08-17; raised from `dew_flow_rag_qln`, where the item was owned by nobody | how much VRAM each resident engine actually holds — a DXGI delta around the one session funnel, published **only** when no other build overlapped it. The premise it was handed ("the sidecar builds sessions one at a time") is false on the default DirectML flavour, which is the whole difficulty |
 
 Implemented plans live in [`../research/`](../research/).
 
