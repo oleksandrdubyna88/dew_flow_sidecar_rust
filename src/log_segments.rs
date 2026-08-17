@@ -2,10 +2,84 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::logging::day_and_clock;
+use crate::logging::{day_and_clock, day_start};
 
 /// Seconds in a UTC day. The segment boundary, and the only unit this file needs.
 const DAY: u64 = 86_400;
+
+/// How long a day folder is kept. Shared with `RagLogging`, `McpLogging` and `BenchLogging`, whose key is
+/// `Serilog:RetentionDays` — the same answer to the same question, spelled the way each runtime spells
+/// configuration.
+pub(crate) const DEFAULT_RETENTION_DAYS: u64 = 14;
+
+/// Retires day folders past the window, once, at startup. Returns what actually went.
+///
+/// The OTHER half of the never-restarting problem. `DaySegments` bounds any one file to a day; until this,
+/// nothing bounded the total — and a sidecar started once and left alone for months fills a disk with text,
+/// where the failure arrives disguised as an inference error rather than a logging one.
+///
+/// Startup is the right moment rather than a convenient one: it is cheap, it is idempotent, and a process
+/// that never restarts is not producing new folders either. The .NET siblings prune at exactly the same
+/// point, which is what makes "who owns this directory" answerable across the family instead of per repo.
+///
+/// **Best effort, and deliberately unable to surprise anyone.** A folder whose name is not a day is never
+/// expired and therefore never deleted; a folder that refuses to go is skipped rather than fatal. Retention
+/// is not worth failing a start over — the next run tries again.
+///
+/// It covers `logs/` and nothing else. The engine and compile caches are keyed by content and evicted by
+/// their own owners, and a spool, if this process ever writes one, is DRAINED by a consumer that alone
+/// knows which records it has taken.
+pub(crate) fn retire_day_folders(dir_root: &str, retention_days: u64, now: u64) -> Vec<String> {
+    let mut retired = Vec::new();
+    // Zero is the explicit off switch — correct when an operator job owns the folder instead. A misread
+    // setting that silently deleted a month of logs is the worst failure a retention feature has available,
+    // so the ambiguous value does nothing.
+    if retention_days == 0 {
+        return retired;
+    }
+
+    let cutoff = (now / DAY).saturating_sub(retention_days) * DAY;
+    let Ok(entries) = std::fs::read_dir(dir_root) else {
+        // No logs directory yet: the first run of a fresh checkout has nothing to retire.
+        return retired;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Strictly older goes; the boundary day itself stays, because "keep 14 days" that quietly keeps 13
+        // is a window nobody can reason about.
+        let expired = day_folder_start(&name).is_some_and(|start| start < cutoff);
+
+        if expired && entry.path().is_dir() && std::fs::remove_dir_all(entry.path()).is_ok() {
+            retired.push(name);
+        }
+    }
+
+    retired.sort();
+    retired
+}
+
+/// The unix second a day folder's name stands for, or `None` when the name is not one this product wrote.
+///
+/// `None` is the safe answer and every unrecognised shape gets it. Anything under `logs/` that is not a day
+/// folder was put there by a person.
+fn day_folder_start(name: &str) -> Option<u64> {
+    let bytes = name.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+
+    let start = day_start(
+        name[0..4].parse().ok()?,
+        name[5..7].parse().ok()?,
+        name[8..10].parse().ok()?,
+    );
+    let start = u64::try_from(start).ok()?;
+
+    // The round trip IS the validity check — see `logging::day_start`. It costs one format and removes the
+    // need for a second calendar here (leap years, month lengths) that could disagree with the first.
+    (day_and_clock(start).0 == name).then_some(start)
+}
 
 /// The run's log file, continued in a new segment at every UTC midnight the process lives through.
 ///
@@ -205,6 +279,132 @@ mod tests {
         let files = walk(&root);
         assert_eq!(files.len(), 3, "{files:?}");
         assert!(files.iter().all(|f| f.ends_with(&suffix)), "{files:?}");
+    }
+
+    /// 2026-08-16T12:00:00Z. Thirty days back is 2026-07-17, fourteen is 2026-08-02.
+    const NOON: u64 = 1_786_881_600;
+
+    #[test]
+    fn a_day_folder_older_than_the_window_is_retired() {
+        let root = with_days("old", &["2026-06-01", "2026-08-15"]);
+
+        let retired = retire_day_folders(&root, 30, NOON);
+
+        assert_eq!(retired, vec!["2026-06-01".to_string()]);
+        assert_eq!(walk_days(&root), vec!["2026-08-15".to_string()]);
+    }
+
+    #[test]
+    fn the_boundary_day_stays_and_so_does_everything_inside_the_window() {
+        let root = with_days("boundary", &["2026-07-16", "2026-07-17", "2026-08-16"]);
+
+        retire_day_folders(&root, 30, NOON);
+
+        assert_eq!(
+            walk_days(&root),
+            vec!["2026-07-17".to_string(), "2026-08-16".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_family_default_keeps_a_fortnight() {
+        // Pinned rather than implied: this number is shared with three .NET repositories, and a mirror that
+        // drifts is the whole reason the rule exists.
+        let root = with_days("default", &["2026-08-01", "2026-08-02"]);
+
+        let retired = retire_day_folders(&root, DEFAULT_RETENTION_DAYS, NOON);
+
+        assert_eq!(retired, vec!["2026-08-01".to_string()]);
+    }
+
+    #[test]
+    fn a_retention_of_zero_keeps_everything() {
+        let root = with_days("off", &["2020-01-01"]);
+
+        let retired = retire_day_folders(&root, 0, NOON);
+
+        assert!(retired.is_empty(), "zero is the off switch, not a sweep");
+        assert_eq!(walk_days(&root), vec!["2020-01-01".to_string()]);
+    }
+
+    #[test]
+    fn a_folder_whose_name_is_not_a_date_is_never_touched() {
+        // 2020-02-30 is the sharp case: old, date-SHAPED, and not a date. An implementation comparing the
+        // names as strings — which is otherwise sound, since the format sorts chronologically — deletes it.
+        let root = with_days(
+            "bogus",
+            &["2020-01-01", "2020-02-30", "2026-13-45", "keep-this"],
+        );
+
+        retire_day_folders(&root, 30, NOON);
+
+        assert_eq!(
+            walk_days(&root),
+            vec![
+                "2020-02-30".to_string(),
+                "2026-13-45".to_string(),
+                "keep-this".to_string()
+            ],
+            "anything under logs/ that is not a day folder was put there by a person"
+        );
+    }
+
+    #[test]
+    fn a_logs_directory_that_does_not_exist_yet_is_not_an_error() {
+        let root = scratch("absent");
+
+        let retired = retire_day_folders(&root, 30, NOON);
+
+        assert!(retired.is_empty(), "a fresh checkout has nothing to retire");
+    }
+
+    /// Windows only, and not for convenience: an open handle is what makes a directory refuse to go THERE.
+    /// POSIX unlinks a file another process is reading, so the same setup on Linux tests nothing at all — and
+    /// a test that quietly passes for the wrong reason is worse than one that does not run.
+    #[test]
+    #[cfg(windows)]
+    fn a_folder_that_cannot_be_removed_is_skipped_rather_than_fatal() {
+        let root = with_days("held", &["2020-01-01"]);
+
+        // A log viewer holding yesterday's file open is the ordinary case, and it must never stop the
+        // sidecar from starting — the one thing a retention sweep must not cost.
+        //
+        // `share_mode(0)` is what makes the handle actually block the delete. Rust's `File::open` passes
+        // FILE_SHARE_DELETE, so an ordinary open is removed out from under the reader and this test would
+        // have asserted nothing — it failed exactly that way when first written.
+        use std::os::windows::fs::OpenOptionsExt;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(format!("{root}/2020-01-01/line.log"))
+            .expect("open");
+
+        let retired = retire_day_folders(&root, 30, NOON);
+
+        assert!(retired.is_empty(), "a folder that refused is not a folder that went");
+        assert_eq!(walk_days(&root), vec!["2020-01-01".to_string()]);
+        drop(held);
+    }
+
+    fn with_days(name: &str, days: &[&str]) -> String {
+        let root = scratch(name);
+        for day in days {
+            std::fs::create_dir_all(format!("{root}/{day}")).expect("day folder");
+            std::fs::write(format!("{root}/{day}/line.log"), "a line").expect("line");
+        }
+
+        root
+    }
+
+    fn walk_days(root: &str) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        found
     }
 
     /// Writes through `roll_if_due` already having been called, so the tests drive the boundary rather than

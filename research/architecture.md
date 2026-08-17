@@ -184,6 +184,20 @@ forever.
 `RUST_LOG`. The contract mirrors the .NET family rule
 (`.claude/rules/common/logging-serilog.md`) — same path shape, same file-per-run.
 
+Two rules that are each right meet in this process and had to be reconciled (`src/log_segments.rs`).
+**A file per run** is correct because the question asked of a log is almost always "what did THAT run
+do". **This process does not restart** — the orchestrator starts it once and it serves until the machine
+does not. Together they produce one file growing for months. So a run continues in a `00-00-00` segment
+under the next day's folder, same pid and same device id: still one run, which is what keeps it from being
+the rolling-by-day sink the rule forbids — that merges DIFFERENT runs, these files belong to ONE.
+
+**Retention owner: this host, at startup.** Day folders older than `SIDECAR_LOG_RETENTION_DAYS` (14,
+the family default) are removed once, best effort, and the count is logged. Segments bound any one file;
+this bounds the total. A folder whose name is not a valid day is never deleted — the name is checked by
+round-tripping it back through the calendar, so `2026-02-30` stays where a string comparison would have
+removed it. Nothing else here is swept: the engine and compile caches are keyed by content and evicted by
+their own owners.
+
 ### Error handling
 
 Handler failures become `ApiError` — a status plus `{ "error": … }`. An unknown tokenizer name is a

@@ -98,8 +98,11 @@ pub(crate) async fn main() {
     // because "a file per run" and "this process does not restart" are each right and together produce one
     // file growing for months. Not the rolling-by-day sink the rule forbids: that merges DIFFERENT runs,
     // these two files belong to ONE. See log_segments::DaySegments.
+    // Read once: the segment writes into this root and retention below sweeps it, and two reads of the same
+    // variable is two chances for them to disagree about which directory they are talking about.
+    let log_dir = env_str("SIDECAR_LOG_DIR", "logs");
     let (segments, log_path) = log_segments::DaySegments::open(
-        &env_str("SIDECAR_LOG_DIR", "logs"),
+        &log_dir,
         &format!("bge-sidecar-device{}", env_parse::<i32>("ORT_DEVICE_ID", 0)),
         now,
     );
@@ -117,6 +120,20 @@ pub(crate) async fn main() {
         .with(file_layer)
         .init();
     tracing::info!("log file: {log_path} (one per run; SIDECAR_LOG_DIR overrides the directory)");
+
+    // The other half: segments bound any ONE file to a day, this bounds the total. Until now nothing did,
+    // and the sidecar is the process in this product least likely to be restarted — the orchestrator starts
+    // it once and it serves until the machine does not. After `init` so the outcome is logged rather than
+    // silent, and best effort so an unwritable folder costs a line instead of a start.
+    let retention_days = env_parse::<u64>("SIDECAR_LOG_RETENTION_DAYS", log_segments::DEFAULT_RETENTION_DAYS);
+    let retired = log_segments::retire_day_folders(&log_dir, retention_days, now);
+    if !retired.is_empty() {
+        tracing::info!(
+            "retired {} log day-folder(s) older than {retention_days} day(s): {}",
+            retired.len(),
+            retired.join(", ")
+        );
+    }
 
     #[cfg(feature = "migraphx")]
     {

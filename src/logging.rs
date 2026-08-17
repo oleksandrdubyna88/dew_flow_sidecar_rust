@@ -24,3 +24,24 @@ pub(crate) fn day_and_clock(unix_seconds: u64) -> (String, String) {
         format!("{:02}-{:02}-{:02}", secs / 3600, (secs % 3600) / 60, secs % 60),
     )
 }
+
+/// The inverse: the unix second at which a civil day BEGINS.
+///
+/// Its only caller is retention, and the pair is what makes a day-folder name *checkable*. Anything that
+/// does not survive the round trip back through `day_and_clock` is not a name this product wrote — which
+/// is the whole safety property of a routine that deletes directory trees. `2026-13-45` and `2026-02-30`
+/// each name some day arithmetically; neither names itself back.
+///
+/// Hinnant's `days_from_civil`, the companion to the algorithm above. Euclidean division so the era is
+/// right for dates before 1970 — unreachable here, but a calendar that is wrong outside its expected range
+/// is a calendar someone will trust outside it.
+pub(crate) fn day_start(year: i64, month: i64, day: i64) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+
+    (era * 146_097 + doe - 719_468) * 86_400
+}

@@ -49,6 +49,7 @@ Every knob is an environment variable, injected by the AppHost.
 | `ORT_MIGRAPHX_MODEL_CACHE_PATH` | *(empty)* | The compiled-program cache root |
 | `EMBED_ENGINE_CACHE_RUNGS` | 1 | How many sequence caps stay resident |
 | `SIDECAR_LOG_DIR` | `logs` | Log root |
+| `SIDECAR_LOG_RETENTION_DAYS` | 14 | Day folders older than this go at startup; **0 keeps everything** |
 | `RUST_LOG` | — | Level |
 
 `MAX_BATCH` deserves a note: the AppHost passes it as an **empty string**, so the default above is what
