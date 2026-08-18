@@ -184,6 +184,7 @@ LLM ends up sharing the card.
 | `activity` | A multi-minute first-build renders as a dead card in the host UI |
 | `in_flight[].wedged` + `ceiling_seconds` | A stuck inference and a healthy cold compile look identical. The elapsed time alone cannot separate them — the ceiling has to travel with it |
 | `provenance_ready` | An empty hash reads as "unreadable" when it only means "not hashed yet" |
+| `embed_batch_texts` (2026-08-18) | **The caller assumes `max_batch` and computes double.** `pin_shape` spends one row per chunk on a ruler sequence, so `max_batch` texts need `max_batch + 1` rows and spill into a second, near-empty batch. Whether this process pins depends on its PROVIDER, which the caller does not choose and cannot see — a host that guessed was right for every flavour except the one where being wrong costs 2x. Measured on a full aspnetcore pass: 1260 of 1263 calls arrived as exactly `max_batch` texts and each computed 128 rows where 64 would have done |
 
 ## Error handling
 
