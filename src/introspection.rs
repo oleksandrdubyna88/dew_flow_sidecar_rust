@@ -29,6 +29,8 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
     // a readiness probe, and a probe that SHA-256s every provider library beside the exe on its first
     // call reports nothing, slowly, from a reactor thread.
     let provenance = PROVENANCE.get();
+    // Computed before the literal: `requested` is moved into `requested_provider` below.
+    let embed_batch = crate::inference::embed_batch_texts(&state.config, &requested);
     Json(HealthResponse {
         status: if wedged { "wedged" } else { "ok" },
         activity: state.activity.try_lock().map(|a| a.clone()).unwrap_or_else(|_| "busy".to_string()),
@@ -54,6 +56,7 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
         limits: LimitsWire {
             embed_max_length: state.config.embed_max_length,
             max_batch: state.config.max_batch,
+            embed_batch_texts: embed_batch,
             rerank_max_length: state.config.rerank_max_length,
             loaded_embed_max_length: state.loaded_embed_max_length.try_lock().ok().and_then(|g| *g),
             loaded_max_batch: state.loaded_max_batch.try_lock().ok().and_then(|g| *g),

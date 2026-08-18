@@ -266,6 +266,12 @@ pub(crate) struct LimitsWire {
     /// an intention and was read as a fact ("why 15 methods/s when the batch is 126?" — three different
     /// numbers, none of them this one). Read `loaded_max_batch` for what actually happened.
     pub(crate) max_batch: usize,
+    /// How many TEXTS one `/embed` call should carry so the pinned layout forms exactly ONE batch.
+    ///
+    /// Derived here rather than left to the caller: only this process knows whether it pins, which depends
+    /// on the provider. A host that assumed `max_batch` sent one text too many on every call and paid for a
+    /// second, near-empty batch — 2x the rows, measured across a whole aspnetcore pass.
+    pub(crate) embed_batch_texts: usize,
     pub(crate) rerank_max_length: usize,
     /// None = no embedding engine has been built yet, so no cap is committed to.
     pub(crate) loaded_embed_max_length: Option<usize>,

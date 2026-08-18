@@ -33,6 +33,26 @@ pub(crate) fn should_pin_shape(setting: &str, provider: &str) -> bool {
     }
 }
 
+/// How many TEXTS one `/embed` call should carry so the pinned layout forms exactly ONE full batch.
+///
+/// <b>The number a caller must not have to derive.</b> `pin_shape` spends one row per chunk on a ruler,
+/// so `max_batch` texts need `max_batch + 1` rows and spill into a second, near-empty batch — DOUBLE the
+/// work for one text too many. Measured on an aspnetcore pass 2026-08-18: 1260 of 1263 calls arrived as
+/// exactly `max_batch` texts and each computed 128 rows where 64 would have done.
+///
+/// Reported on `/health` rather than left to the caller to work out, because only this process knows
+/// whether it pins at all — that depends on the provider, which the caller does not choose. A host that
+/// guessed `max_batch` was right for every non-MIGraphX flavour and wrong for the one flavour where the
+/// mistake costs 2x.
+pub(crate) fn embed_batch_texts(config: &Config, provider: &str) -> usize {
+    let max_batch = config.max_batch.max(1);
+    if should_pin_shape(&config.pin_input_shape, provider) && max_batch >= 2 {
+        max_batch - 1
+    } else {
+        max_batch
+    }
+}
+
 /// A sequence guaranteed to exceed any `max_length` we allow (8192 tokens max), so the tokenizer
 /// truncates it to EXACTLY the cap. One of these in a batch makes `PaddingStrategy::BatchLongest`
 /// pad the whole batch to the cap — which is how `pin_shape` gets a constant shape.
@@ -627,6 +647,36 @@ mod tests {
     /// retired the throwaway warm-up: it charged an extra full-cap pass on EVERY engine build, which
     /// pushed a pass's first request to ~608s, past the host's 600s HTTP budget, and the pass
     /// "completed" with 0 methods embedded.
+    /// The number a host must send to get ONE batch, and the reason this is reported rather than derived
+    /// by the caller: sending `max_batch` costs a second, near-empty batch. Measured over a whole
+    /// aspnetcore pass 2026-08-18 — 1260 of 1263 calls arrived one text too large and each computed 128
+    /// rows where 64 would have done.
+    #[test]
+    fn one_text_too_many_is_what_doubles_the_work() {
+        let cfg = |batch: usize, pin: &str| {
+            let mut c = crate::testing::config("migraphx");
+            c.max_batch = batch;
+            c.pin_input_shape = pin.to_string();
+            c
+        };
+
+        // Pinning on: one row of every batch belongs to the ruler, so a caller may fill only the rest.
+        assert_eq!(embed_batch_texts(&cfg(64, "auto"), "migraphx"), 63);
+        // And that is exactly the layout that produces a single full batch.
+        let texts: Vec<String> = (0..63).map(|i| i.to_string()).collect();
+        let (rows, _) = pin_shape(&texts, 64, "ruler");
+        assert_eq!(rows.len(), 64, "63 texts + 1 ruler is one batch");
+        let one_more: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+        let (spilled, _) = pin_shape(&one_more, 64, "ruler");
+        assert_eq!(spilled.len(), 128, "one text more doubles the rows — the defect this field prevents");
+
+        // Pinning off, or a provider that takes dynamic shapes: no ruler, so the whole batch is usable.
+        assert_eq!(embed_batch_texts(&cfg(64, "0"), "migraphx"), 64);
+        assert_eq!(embed_batch_texts(&cfg(64, "auto"), "dml"), 64);
+        // A degenerate batch has no room for a ruler; pin_shape declines to pin and so does this.
+        assert_eq!(embed_batch_texts(&cfg(1, "auto"), "migraphx"), 1);
+    }
+
     #[test]
     fn a_settled_session_costs_exactly_one_run() {
         let mut calls = 0;
