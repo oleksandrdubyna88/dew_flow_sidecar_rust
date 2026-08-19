@@ -1,4 +1,4 @@
-use crate::config::{env_str};
+use crate::config::env_str;
 
 // ---------- ONNX Runtime dylib preflight (load-dynamic flavor) ----------
 
@@ -11,7 +11,9 @@ use crate::config::{env_str};
 #[cfg(feature = "migraphx")]
 pub(crate) fn preflight_ort_dylib() {
     let path = env_str("ORT_DYLIB_PATH", "libonnxruntime.so");
-    match probe_ort_dylib(&path).and_then(|(api_ok, version)| dylib_verdict(api_ok, &version, &path)) {
+    match probe_ort_dylib(&path)
+        .and_then(|(api_ok, version)| dylib_verdict(api_ok, &version, &path))
+    {
         Ok(message) => tracing::info!("{message}"),
         Err(message) => {
             tracing::error!("{message}");
@@ -28,11 +30,13 @@ pub(crate) fn preflight_ort_dylib() {
 #[cfg(feature = "migraphx")]
 pub(crate) fn preflight_migraphx_cache() {
     match cache_dir_verdict(&env_str("ORT_MIGRAPHX_MODEL_CACHE_PATH", ""), |dir| {
-        std::fs::create_dir_all(dir).and_then(|()| {
-            let probe = std::path::Path::new(dir).join(".bge-sidecar-write-probe");
-            std::fs::write(&probe, b"probe").map(|()| std::fs::remove_file(&probe).ok().unwrap_or(()))
-        })
-        .map_err(|e| e.to_string())
+        std::fs::create_dir_all(dir)
+            .and_then(|()| {
+                let probe = std::path::Path::new(dir).join(".bge-sidecar-write-probe");
+                std::fs::write(&probe, b"probe")
+                    .map(|()| std::fs::remove_file(&probe).ok().unwrap_or(()))
+            })
+            .map_err(|e| e.to_string())
     }) {
         Ok(message) => tracing::info!("{message}"),
         Err(message) => {
@@ -59,7 +63,9 @@ pub(crate) fn seed_model_cache_from_env(cache_dir: &std::path::Path) {
 
     let seed_path = std::path::PathBuf::from(&seed);
     if !seed_path.is_dir() {
-        tracing::info!("model-cache seed dir `{seed}` does not exist — models will download on first use");
+        tracing::info!(
+            "model-cache seed dir `{seed}` does not exist — models will download on first use"
+        );
         return;
     }
 
@@ -74,7 +80,10 @@ pub(crate) fn seed_model_cache_from_env(cache_dir: &std::path::Path) {
             started.elapsed().as_secs_f32()
         );
     } else {
-        tracing::info!("model cache already seeded: `{}` matches `{seed}`", cache_dir.display());
+        tracing::info!(
+            "model cache already seeded: `{}` matches `{seed}`",
+            cache_dir.display()
+        );
     }
 }
 
@@ -110,7 +119,10 @@ pub(crate) fn copy_missing_files(from: &std::path::Path, to: &std::path::Path) -
         }
 
         let source_size = source.metadata().map(|m| m.len()).unwrap_or(0);
-        let up_to_date = target.metadata().map(|m| m.len() == source_size).unwrap_or(false);
+        let up_to_date = target
+            .metadata()
+            .map(|m| m.len() == source_size)
+            .unwrap_or(false);
         if up_to_date {
             continue;
         }
@@ -123,7 +135,11 @@ pub(crate) fn copy_missing_files(from: &std::path::Path, to: &std::path::Path) -
                 seeded.files += 1;
                 seeded.bytes += bytes;
             }
-            Err(e) => tracing::warn!("model-cache seed: `{}` -> `{}` failed: {e}", source.display(), target.display()),
+            Err(e) => tracing::warn!(
+                "model-cache seed: `{}` -> `{}` failed: {e}",
+                source.display(),
+                target.display()
+            ),
         }
     }
 
@@ -133,13 +149,18 @@ pub(crate) fn copy_missing_files(from: &std::path::Path, to: &std::path::Path) -
 /// Pure verdict for the cache preflight — the writability probe is injected so the message contract
 /// is testable without touching the filesystem.
 #[cfg_attr(not(feature = "migraphx"), allow(dead_code))]
-pub(crate) fn cache_dir_verdict(dir: &str, probe: impl FnOnce(&str) -> Result<(), String>) -> Result<String, String> {
+pub(crate) fn cache_dir_verdict(
+    dir: &str,
+    probe: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<String, String> {
     if dir.trim().is_empty() {
-        return Err("ORT_MIGRAPHX_MODEL_CACHE_PATH is not set. ROCm's MIGraphX EP always saves the \
+        return Err(
+            "ORT_MIGRAPHX_MODEL_CACHE_PATH is not set. ROCm's MIGraphX EP always saves the \
                     compiled model, and with no path it writes to \"\" — the write fails and fails \
                     every /embed with it. Point it at a writable Linux directory (the AppHost sets \
                     Aspire:BgeSidecar:WslMigraphxCacheDir; see README \"AMD on Linux/WSL\")."
-            .to_string());
+                .to_string(),
+        );
     }
     probe(dir)
         .map(|()| format!("MIGraphX compiled-model cache is writable: {dir} (first call per input shape compiles and saves, later ones load)"))
@@ -164,9 +185,10 @@ pub(crate) struct OrtApiBaseAbi {
 pub(crate) fn probe_ort_dylib(path: &str) -> Result<(bool, String), String> {
     let lib = unsafe { libloading::Library::new(path) }
         .map_err(|e| format!("cannot load ONNX Runtime dylib `{path}`: {e}"))?;
-    let get_base: libloading::Symbol<unsafe extern "C" fn() -> *const OrtApiBaseAbi> =
-        unsafe { lib.get(b"OrtGetApiBase") }
-            .map_err(|_| format!("`{path}` exports no OrtGetApiBase — not an ONNX Runtime library"))?;
+    let get_base: libloading::Symbol<unsafe extern "C" fn() -> *const OrtApiBaseAbi> = unsafe {
+        lib.get(b"OrtGetApiBase")
+    }
+    .map_err(|_| format!("`{path}` exports no OrtGetApiBase — not an ONNX Runtime library"))?;
     let base = unsafe { get_base() };
     if base.is_null() {
         return Err(format!("OrtGetApiBase in `{path}` returned null"));
@@ -200,24 +222,28 @@ pub(crate) fn dylib_verdict(api_ok: bool, version: &str, path: &str) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    
-    
-    
-    
+
     use crate::testing::*;
-    
 
     /// The dylib preflight verdict names BOTH versions on mismatch (found + required) so the
     /// operator knows exactly what to rebuild; a dylib that serves our API version passes.
     #[test]
     fn dylib_preflight_names_required_and_found_versions_on_mismatch() {
-        let err = dylib_verdict(false, "1.23.2", "/opt/onnxruntime-migraphx/lib/libonnxruntime.so")
-            .expect_err("older dylib must be rejected");
+        let err = dylib_verdict(
+            false,
+            "1.23.2",
+            "/opt/onnxruntime-migraphx/lib/libonnxruntime.so",
+        )
+        .expect_err("older dylib must be rejected");
         assert!(err.contains("1.23.2"), "names the found version: {err}");
-        assert!(err.contains(&format!("1.{}", ort::MINOR_VERSION)), "names the required version: {err}");
-        assert!(err.contains("--use_migraphx"), "tells the operator how to rebuild: {err}");
+        assert!(
+            err.contains(&format!("1.{}", ort::MINOR_VERSION)),
+            "names the required version: {err}"
+        );
+        assert!(
+            err.contains("--use_migraphx"),
+            "tells the operator how to rebuild: {err}"
+        );
 
         assert!(dylib_verdict(true, "1.24.4", "libonnxruntime.so").is_ok());
     }
@@ -230,12 +256,22 @@ mod tests {
     fn cache_preflight_rejects_an_unset_or_unwritable_path() {
         let unset = cache_dir_verdict("   ", |_| panic!("must not probe when the path is empty"))
             .expect_err("an empty path must be rejected");
-        assert!(unset.contains("ORT_MIGRAPHX_MODEL_CACHE_PATH"), "names the variable: {unset}");
-        assert!(unset.contains("WslMigraphxCacheDir"), "names the AppHost knob: {unset}");
+        assert!(
+            unset.contains("ORT_MIGRAPHX_MODEL_CACHE_PATH"),
+            "names the variable: {unset}"
+        );
+        assert!(
+            unset.contains("WslMigraphxCacheDir"),
+            "names the AppHost knob: {unset}"
+        );
 
-        let denied = cache_dir_verdict("/read-only/cache", |_| Err("Permission denied".to_string()))
-            .expect_err("an unwritable path must be rejected");
-        assert!(denied.contains("/read-only/cache") && denied.contains("Permission denied"), "{denied}");
+        let denied =
+            cache_dir_verdict("/read-only/cache", |_| Err("Permission denied".to_string()))
+                .expect_err("an unwritable path must be rejected");
+        assert!(
+            denied.contains("/read-only/cache") && denied.contains("Permission denied"),
+            "{denied}"
+        );
 
         let ok = cache_dir_verdict("/var/tmp/mgx", |_| Ok(())).expect("a writable path passes");
         assert!(ok.contains("/var/tmp/mgx"), "{ok}");
@@ -253,7 +289,10 @@ mod tests {
         let seeded = copy_missing_files(&from, &to);
 
         assert_eq!((seeded.files, seeded.bytes), (2, 10));
-        assert_eq!(std::fs::read(to.join("m/onnx/model.onnx_data")).unwrap(), b"weights");
+        assert_eq!(
+            std::fs::read(to.join("m/onnx/model.onnx_data")).unwrap(),
+            b"weights"
+        );
     }
 
     /// Later starts must verify and SKIP — re-copying 4.3 GB on every boot would trade the DrvFs tax
@@ -268,7 +307,11 @@ mod tests {
         let seeded = copy_missing_files(&from, &to);
 
         assert_eq!(seeded.files, 0);
-        assert_eq!(std::fs::read(to.join("model.bin")).unwrap(), b"abcde", "a same-size file is never rewritten");
+        assert_eq!(
+            std::fs::read(to.join("model.bin")).unwrap(),
+            b"abcde",
+            "a same-size file is never rewritten"
+        );
     }
 
     /// A size MISMATCH is an interrupted earlier copy and must be repaired, not trusted.
@@ -282,7 +325,10 @@ mod tests {
         let seeded = copy_missing_files(&from, &to);
 
         assert_eq!(seeded.files, 1);
-        assert_eq!(std::fs::read(to.join("model.bin")).unwrap(), b"full-content");
+        assert_eq!(
+            std::fs::read(to.join("model.bin")).unwrap(),
+            b"full-content"
+        );
     }
 
     /// A missing seed dir is a quiet no-op — a fresh distro simply downloads from HF as before.
@@ -292,6 +338,9 @@ mod tests {
         let seeded = copy_missing_files(&from.join("does-not-exist"), &to);
 
         assert_eq!((seeded.files, seeded.bytes), (0, 0));
-        assert!(!to.exists(), "a no-op seed must not create the target either");
+        assert!(
+            !to.exists(),
+            "a no-op seed must not create the target either"
+        );
     }
 }

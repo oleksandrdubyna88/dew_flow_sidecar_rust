@@ -1,10 +1,10 @@
-use std::sync::OnceLock;
-use fastembed::Bgem3DualEmbedding;
-use anyhow::Context;
 use crate::compile_cache::CachePathLease;
-use crate::inference::{SETTLE_ATTEMPTS, pin_shape, ruler_text};
-use crate::provider::{load_dual};
+use crate::inference::{pin_shape, ruler_text, SETTLE_ATTEMPTS};
+use crate::provider::load_dual;
 use crate::state::{AppState, Limits};
+use anyhow::Context;
+use fastembed::Bgem3DualEmbedding;
+use std::sync::OnceLock;
 
 // ---------- the build-time canary ----------
 //
@@ -67,9 +67,14 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// wrong exactly that often. The batch is laid out at the engine's PRODUCTION shape when pinning is
 /// on, so on MIGraphX the canary never compiles a shape of its own — and, as a side effect, it
 /// absorbs the shape's expensive first run before any real batch pays for it.
-pub(crate) fn canary_check(engine: &mut Bgem3DualEmbedding, limits: Limits, pin: bool) -> anyhow::Result<()> {
+pub(crate) fn canary_check(
+    engine: &mut Bgem3DualEmbedding,
+    limits: Limits,
+    pin: bool,
+) -> anyhow::Result<()> {
     let (texts, position) = if pin && limits.max_batch >= 2 {
-        let (expanded, positions) = pin_shape(&[CANARY_TEXT.to_string()], limits.max_batch, ruler_text());
+        let (expanded, positions) =
+            pin_shape(&[CANARY_TEXT.to_string()], limits.max_batch, ruler_text());
         (expanded, positions[0])
     } else {
         (vec![CANARY_TEXT.to_string()], 0)
@@ -139,21 +144,14 @@ pub(crate) fn load_validated_dual(
     drop(engine);
     cache.wipe();
     let mut rebuilt = load_dual(state, provider_hint, limits.max_length, cache)?;
-    canary_check(&mut rebuilt, limits, pin)
-        .context("canary still failing after a clean recompile — refusing to serve garbage embeddings")?;
+    canary_check(&mut rebuilt, limits, pin).context(
+        "canary still failing after a clean recompile — refusing to serve garbage embeddings",
+    )?;
     Ok(rebuilt)
 }
 
 #[cfg(test)]
 mod tests {
-    
-    
-    
-    
-    
-    
-    
-    
 
     /// The corruption detector's arithmetic: identical vectors score 1, unrelated directions score
     /// low, and a dimension mismatch is a FAILED canary (-1), never a panic — the whole point is
@@ -161,10 +159,24 @@ mod tests {
     #[test]
     fn cosine_separates_identity_from_garbage_and_never_panics_on_shape() {
         let v = [0.6f32, 0.8, 0.0];
-        assert!((super::cosine(&v, &v) - 1.0).abs() < 1e-6, "a vector matches itself");
-        assert!(super::cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6, "orthogonal scores ~0");
-        assert_eq!(super::cosine(&v, &[1.0, 0.0]), -1.0, "a dimension mismatch fails, not panics");
-        assert_eq!(super::cosine(&[0.0, 0.0], &[1.0, 0.0]), -1.0, "a zero vector fails, not NaNs");
+        assert!(
+            (super::cosine(&v, &v) - 1.0).abs() < 1e-6,
+            "a vector matches itself"
+        );
+        assert!(
+            super::cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6,
+            "orthogonal scores ~0"
+        );
+        assert_eq!(
+            super::cosine(&v, &[1.0, 0.0]),
+            -1.0,
+            "a dimension mismatch fails, not panics"
+        );
+        assert_eq!(
+            super::cosine(&[0.0, 0.0], &[1.0, 0.0]),
+            -1.0,
+            "a zero vector fails, not NaNs"
+        );
     }
 
     /// The embedded reference must be exactly one bge-m3 dense vector, finite and L2-normalized —
@@ -175,6 +187,9 @@ mod tests {
         assert_eq!(reference.len(), 1024, "bge-m3 dense dim");
         assert!(reference.iter().all(|v| v.is_finite()));
         let norm: f32 = reference.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-3, "the sidecar serves normalized vectors, norm was {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "the sidecar serves normalized vectors, norm was {norm}"
+        );
     }
 }

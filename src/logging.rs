@@ -1,4 +1,3 @@
-
 /// UTC date and clock for the log path, from a unix timestamp.
 ///
 /// Written out rather than pulled from `chrono`: this is the only place the crate needs a calendar date, and
@@ -21,7 +20,12 @@ pub(crate) fn day_and_clock(unix_seconds: u64) -> (String, String) {
 
     (
         format!("{year:04}-{m:02}-{d:02}"),
-        format!("{:02}-{:02}-{:02}", secs / 3600, (secs % 3600) / 60, secs % 60),
+        format!(
+            "{:02}-{:02}-{:02}",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        ),
     )
 }
 

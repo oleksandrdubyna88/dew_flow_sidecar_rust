@@ -31,8 +31,15 @@ pub(crate) struct CompileWatch {
 
 impl CompileWatch {
     pub(crate) fn start(base: &str, engine: &str) -> Self {
-        let dir = if base.trim().is_empty() { String::new() } else { engine_cache_dir(base, engine) };
-        Self { before: mxr_cache_mb(&dir), dir }
+        let dir = if base.trim().is_empty() {
+            String::new()
+        } else {
+            engine_cache_dir(base, engine)
+        };
+        Self {
+            before: mxr_cache_mb(&dir),
+            dir,
+        }
     }
 
     /// Megabytes this engine's cache grew during the pass — the ONLY moment a MIGraphX compile is
@@ -55,7 +62,11 @@ pub(crate) fn mxr_cache_mb(base: &str) -> u64 {
                     .flatten()
                     .map(|e| {
                         let path = e.path();
-                        if path.is_dir() { tree_bytes(&path) } else { e.metadata().map(|m| m.len()).unwrap_or(0) }
+                        if path.is_dir() {
+                            tree_bytes(&path)
+                        } else {
+                            e.metadata().map(|m| m.len()).unwrap_or(0)
+                        }
                     })
                     .sum()
             })
@@ -71,11 +82,22 @@ pub(crate) fn mxr_cache_mb(base: &str) -> u64 {
 /// during the pass — that is the ONLY moment a MIGraphX compile is observable (lazy save).
 /// The caller's `request_id` leads the line when one was sent — two concurrent requests are
 /// otherwise indistinguishable here.
-pub(crate) fn pass_log_message(request_id: &str, action: &str, secs: f32, cache_grew_mb: u64) -> String {
-    let prefix = if request_id.is_empty() { String::new() } else { format!("[{request_id}] ") };
+pub(crate) fn pass_log_message(
+    request_id: &str,
+    action: &str,
+    secs: f32,
+    cache_grew_mb: u64,
+) -> String {
+    let prefix = if request_id.is_empty() {
+        String::new()
+    } else {
+        format!("[{request_id}] ")
+    };
     match cache_grew_mb {
         0 => format!("{prefix}{action} in {secs:.1}s"),
-        grew => format!("{prefix}{action} in {secs:.1}s — compiled and cached this input shape (+{grew} MB)"),
+        grew => format!(
+            "{prefix}{action} in {secs:.1}s — compiled and cached this input shape (+{grew} MB)"
+        ),
     }
 }
 
@@ -130,15 +152,25 @@ pub(crate) struct CachePathLease {
 impl CachePathLease {
     pub(crate) fn hold(base: &str, engine: &'static str) -> Self {
         if base.trim().is_empty() {
-            return Self { engine, dir: String::new(), _held: None };
+            return Self {
+                engine,
+                dir: String::new(),
+                _held: None,
+            };
         }
 
-        let held = CACHE_PATH_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let held = CACHE_PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = engine_cache_dir(base, engine);
         std::fs::create_dir_all(&dir).ok();
         std::env::set_var("ORT_MIGRAPHX_MODEL_CACHE_PATH", &dir);
         std::env::set_var("ORT_MIGRAPHX_CACHE_PATH", &dir);
-        Self { engine, dir, _held: Some(held) }
+        Self {
+            engine,
+            dir,
+            _held: Some(held),
+        }
     }
 
     pub(crate) fn engine(&self) -> &'static str {
@@ -171,10 +203,10 @@ impl CachePathLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::*;
     use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
-    use crate::testing::*;
 
     /// Dense, sparse, and rerank run the SAME graph at the SAME pinned shape, so the EP's cache
     /// key collides across engines — a sparse session once loaded a program cached by another
@@ -182,12 +214,24 @@ mod tests {
     /// and an unconfigured cache must claim nothing at all.
     #[test]
     fn each_engine_gets_its_own_cache_slice() {
-        assert_eq!(engine_cache_dir("/cache/device-0", "sparse"), "/cache/device-0/sparse");
-        assert_eq!(engine_cache_dir("/cache/device-0/", "dense"), "/cache/device-0/dense");
+        assert_eq!(
+            engine_cache_dir("/cache/device-0", "sparse"),
+            "/cache/device-0/sparse"
+        );
+        assert_eq!(
+            engine_cache_dir("/cache/device-0/", "dense"),
+            "/cache/device-0/dense"
+        );
 
         let unconfigured = CachePathLease::hold("", EMBED_CACHE_ENGINE);
-        assert!(unconfigured.dir().is_empty(), "no cache configured -> nothing to claim, no lock taken");
-        assert!(unconfigured.covers(EMBED_CACHE_ENGINE), "and it still knows which engine it stands for");
+        assert!(
+            unconfigured.dir().is_empty(),
+            "no cache configured -> nothing to claim, no lock taken"
+        );
+        assert!(
+            unconfigured.covers(EMBED_CACHE_ENGINE),
+            "and it still knows which engine it stands for"
+        );
     }
 
     /// The MIGraphX EP reads the cache path at its FIRST KERNEL LAUNCH, not at session build — so a claim
@@ -206,10 +250,11 @@ mod tests {
             std::thread::spawn(move || {
                 let cache = CachePathLease::hold(&base, EMBED_CACHE_ENGINE);
                 building.wait(); // the rerank engine may now start building
-                // The window the old scope left open: the session is built, the first kernel launch —
-                // which is what actually reads the variable — has not happened yet.
+                                 // The window the old scope left open: the session is built, the first kernel launch —
+                                 // which is what actually reads the variable — has not happened yet.
                 std::thread::sleep(Duration::from_millis(150));
-                let at_first_launch = std::env::var("ORT_MIGRAPHX_MODEL_CACHE_PATH").unwrap_or_default();
+                let at_first_launch =
+                    std::env::var("ORT_MIGRAPHX_MODEL_CACHE_PATH").unwrap_or_default();
                 drop(cache);
                 at_first_launch
             })
@@ -261,9 +306,20 @@ mod tests {
         let cache = CachePathLease::hold(&base, EMBED_CACHE_ENGINE);
         cache.wipe();
 
-        assert!(Path::new(cache.dir()).is_dir(), "the slice is re-created, so the recompile has somewhere to land");
-        assert_eq!(mxr_cache_mb(cache.dir()), 0, "and the corrupt program is gone");
-        assert_eq!(mxr_cache_mb(&engine_cache_dir(&base, RERANK_CACHE_ENGINE)), 1, "the other engine is untouched");
+        assert!(
+            Path::new(cache.dir()).is_dir(),
+            "the slice is re-created, so the recompile has somewhere to land"
+        );
+        assert_eq!(
+            mxr_cache_mb(cache.dir()),
+            0,
+            "and the corrupt program is gone"
+        );
+        assert_eq!(
+            mxr_cache_mb(&engine_cache_dir(&base, RERANK_CACHE_ENGINE)),
+            1,
+            "the other engine is untouched"
+        );
 
         drop(cache);
         std::fs::remove_dir_all(&base).ok();
@@ -282,7 +338,10 @@ mod tests {
         );
 
         let plain = pass_log_message("", "dense: embedded 32 row(s)", 1.4, 0);
-        assert!(!plain.contains("compiled"), "steady state stays plain timing: {plain}");
+        assert!(
+            !plain.contains("compiled"),
+            "steady state stays plain timing: {plain}"
+        );
     }
 
     /// The request id is a correlation aid: it leads the line when the caller sent one and adds no
@@ -290,7 +349,10 @@ mod tests {
     #[test]
     fn pass_log_prefixes_the_request_id_only_when_one_was_sent() {
         let tagged = pass_log_message("leg-7/q3", "embedded 8 row(s)", 0.4, 0);
-        assert!(tagged.starts_with("[leg-7/q3] "), "the caller's id leads the line: {tagged}");
+        assert!(
+            tagged.starts_with("[leg-7/q3] "),
+            "the caller's id leads the line: {tagged}"
+        );
 
         let untagged = pass_log_message("", "embedded 8 row(s)", 0.4, 0);
         assert!(!untagged.contains('['), "no id, no prefix: {untagged}");
@@ -312,17 +374,41 @@ mod tests {
 
         let embed_pass = CompileWatch::start(&base, EMBED_CACHE_ENGINE);
         // The OTHER engine compiles while this pass runs.
-        write_mb(Path::new(&base).join(RERANK_CACHE_ENGINE).join("fresh.mxr").as_path(), 3);
+        write_mb(
+            Path::new(&base)
+                .join(RERANK_CACHE_ENGINE)
+                .join("fresh.mxr")
+                .as_path(),
+            3,
+        );
 
-        assert_eq!(embed_pass.grew_mb(), 0, "another engine's compile is not this pass's growth");
+        assert_eq!(
+            embed_pass.grew_mb(),
+            0,
+            "another engine's compile is not this pass's growth"
+        );
 
         // ...and this engine's own compile still is.
-        write_mb(Path::new(&base).join(EMBED_CACHE_ENGINE).join("fresh.mxr").as_path(), 2);
-        assert_eq!(embed_pass.grew_mb(), 2, "its own compile is exactly what it reports");
+        write_mb(
+            Path::new(&base)
+                .join(EMBED_CACHE_ENGINE)
+                .join("fresh.mxr")
+                .as_path(),
+            2,
+        );
+        assert_eq!(
+            embed_pass.grew_mb(),
+            2,
+            "its own compile is exactly what it reports"
+        );
 
         // The refuted approach, reproduced so the defect stays visible in the suite: summing the whole
         // tree charges this pass with all 7 MB, 5 of which it did not cause.
-        assert_eq!(mxr_cache_mb(&base), 7, "which is what the pass used to measure");
+        assert_eq!(
+            mxr_cache_mb(&base),
+            7,
+            "which is what the pass used to measure"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -333,7 +419,10 @@ mod tests {
     fn a_flavour_with_no_cache_never_walks_anything() {
         let watch = CompileWatch::start("", EMBED_CACHE_ENGINE);
 
-        assert!(watch.dir.is_empty(), "no path was composed from an empty base");
+        assert!(
+            watch.dir.is_empty(),
+            "no path was composed from an empty base"
+        );
         assert_eq!(watch.grew_mb(), 0, "and nothing is ever reported");
     }
 }

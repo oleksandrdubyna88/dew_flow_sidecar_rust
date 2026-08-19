@@ -37,43 +37,42 @@
 //! translated to the plain EnumAdapters index the legacy EP consumes (see adapters.rs); CUDA
 //! keeps the raw id (its own numbering). /health reports the resolved adapter as ground truth.
 
-
 mod adapters;
-mod logging;
-mod log_segments;
-mod config;
-mod wedge;
-mod engine_cache;
-mod state;
-mod tokens;
-mod preflight;
-mod wire;
-mod handlers;
-mod introspection;
-mod compile_cache;
-mod inference;
 mod bookkeeping;
 mod canary;
+mod compile_cache;
+mod config;
+mod engine_cache;
+mod handlers;
+mod inference;
+mod introspection;
+mod log_segments;
+mod logging;
+mod preflight;
 mod provider;
+mod state;
 mod testing;
+mod tokens;
+mod wedge;
+mod wire;
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::Router;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, OnceLock};
 
 // `logging` is no longer imported here: its one export, day_and_clock, is now used by log_segments,
 // which owns the whole question of which file a line goes to.
+use crate::bookkeeping::*;
 use crate::config::*;
-use crate::wedge::*;
-use crate::state::*;
-use crate::tokens::*;
-use crate::preflight::*;
 use crate::handlers::*;
 use crate::introspection::*;
-use crate::bookkeeping::*;
+use crate::preflight::*;
 use crate::provider::*;
+use crate::state::*;
+use crate::tokens::*;
+use crate::wedge::*;
 
 #[tokio::main]
 pub(crate) async fn main() {
@@ -125,7 +124,10 @@ pub(crate) async fn main() {
     // and the sidecar is the process in this product least likely to be restarted — the orchestrator starts
     // it once and it serves until the machine does not. After `init` so the outcome is logged rather than
     // silent, and best effort so an unwritable folder costs a line instead of a start.
-    let retention_days = env_parse::<u64>("SIDECAR_LOG_RETENTION_DAYS", log_segments::DEFAULT_RETENTION_DAYS);
+    let retention_days = env_parse::<u64>(
+        "SIDECAR_LOG_RETENTION_DAYS",
+        log_segments::DEFAULT_RETENTION_DAYS,
+    );
     let retired = log_segments::retire_day_folders(&log_dir, retention_days, now);
     if !retired.is_empty() {
         tracing::info!(
@@ -180,7 +182,10 @@ pub(crate) async fn main() {
         state_config_preview.embed_max_length,
         state_config_preview.max_batch,
         state_config_preview.rerank_max_length,
-        attention_peak_mb(state_config_preview.max_batch, state_config_preview.embed_max_length)
+        attention_peak_mb(
+            state_config_preview.max_batch,
+            state_config_preview.embed_max_length
+        )
     );
     tracing::info!(
         "engine cache: up to {} sequence rung(s) stay resident per head — a cap change is a lookup, not a rebuild (EMBED_ENGINE_CACHE_RUNGS raises it when the two-rung ladder is opted back in)",
@@ -227,7 +232,9 @@ pub(crate) async fn main() {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!("bge-sidecar listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind failed");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind failed");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -262,7 +269,10 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
 /// aborted by the software in your host machine"), which names neither the size nor the cap, because the
 /// server rejects while the client is still writing. A 10,000-file repository died nine minutes into an
 /// indexing pass this way and it cost an afternoon to find. This is the line that makes it five minutes.
-pub(crate) async fn log_body_rejections(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+pub(crate) async fn log_body_rejections(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
     let route = request.uri().path().to_string();
     let announced = request
         .headers()

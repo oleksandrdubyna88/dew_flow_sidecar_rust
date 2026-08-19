@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use crate::config::{env_parse, env_truthy};
 use crate::inference::set_activity;
-use crate::state::{AppState};
+use crate::state::AppState;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ---------- the wedge detector: this file's one unbounded wait, made observable ----------
 //
@@ -74,7 +74,10 @@ impl WedgePolicy {
             unload_wait: Duration::from_secs(env_parse("UNLOAD_LOCK_WAIT_SECONDS", 30)),
             poll: Duration::from_millis(env_parse("WEDGE_POLL_MS", 50)),
             exit_after_wedged: env_truthy("WEDGE_EXIT").then(|| {
-                Duration::from_secs(env_parse("WEDGE_EXIT_AFTER_SECONDS", running_after.as_secs()))
+                Duration::from_secs(env_parse(
+                    "WEDGE_EXIT_AFTER_SECONDS",
+                    running_after.as_secs(),
+                ))
             }),
         }
     }
@@ -120,7 +123,14 @@ impl<'a> InFlightStamp<'a> {
     pub(crate) fn enter(&self, phase: Phase, label: impl Into<String>) {
         let label = label.into();
         set_activity(self.state, label.clone());
-        write_inflight(self.slot, Some(InFlight { phase, label, since: Instant::now() }));
+        write_inflight(
+            self.slot,
+            Some(InFlight {
+                phase,
+                label,
+                since: Instant::now(),
+            }),
+        );
     }
 }
 
@@ -295,16 +305,14 @@ pub(crate) fn spawn_wedge_watchdog(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use std::sync::Mutex;
     use std::time::Duration;
-    
-    
-    
+
+    use crate::config::Config;
     use crate::testing::*;
-    use crate::config::{Config};
-    
-    use crate::inference::{lock_or_refuse};
+
+    use crate::inference::lock_or_refuse;
 
     /// Poison healing is UNCHANGED by the deadline: a panicked load still costs ONE request, never the
     /// process. Before it existed, a live Fast pass answered "sparse engine poisoned" for hours with
@@ -316,14 +324,29 @@ mod tests {
             let _held = engine.lock().expect("fresh lock");
             panic!("load blew up mid-flight");
         }));
-        assert!(panicked.is_err() && engine.is_poisoned(), "precondition: the panic poisoned the lock");
+        assert!(
+            panicked.is_err() && engine.is_poisoned(),
+            "precondition: the panic poisoned the lock"
+        );
 
         let inflight = Mutex::new(None);
-        let guard = lock_or_refuse(&engine, &inflight, "test", test_wedge_policy(), Patience::UntilTheHolderIsWedged)
-            .expect("a poisoned lock heals rather than refusing");
-        assert!(guard.is_none(), "half-built state is dropped so the caller reloads");
+        let guard = lock_or_refuse(
+            &engine,
+            &inflight,
+            "test",
+            test_wedge_policy(),
+            Patience::UntilTheHolderIsWedged,
+        )
+        .expect("a poisoned lock heals rather than refusing");
+        assert!(
+            guard.is_none(),
+            "half-built state is dropped so the caller reloads"
+        );
         drop(guard);
-        assert!(engine.lock().is_ok(), "poison is cleared for every later request");
+        assert!(
+            engine.lock().is_ok(),
+            "poison is cleared for every later request"
+        );
     }
 
     /// The three verdicts, and the ordering that matters most: the OPT-IN exit is measured from the
@@ -333,9 +356,18 @@ mod tests {
     /// for.
     #[test]
     fn the_wedge_verdict_spares_a_cold_compile_and_never_exits_before_it_reports() {
-        let off = WedgePolicy { exit_after_wedged: None, ..test_wedge_policy() };
-        assert_eq!(wedge_action(Phase::Building, Duration::from_millis(500), off), WedgeAction::Nothing);
-        assert_eq!(wedge_action(Phase::Running, Duration::from_millis(500), off), WedgeAction::Report);
+        let off = WedgePolicy {
+            exit_after_wedged: None,
+            ..test_wedge_policy()
+        };
+        assert_eq!(
+            wedge_action(Phase::Building, Duration::from_millis(500), off),
+            WedgeAction::Nothing
+        );
+        assert_eq!(
+            wedge_action(Phase::Running, Duration::from_millis(500), off),
+            WedgeAction::Report
+        );
         assert_eq!(
             wedge_action(Phase::Building, Duration::from_secs(600), off),
             WedgeAction::Report,
@@ -343,14 +375,23 @@ mod tests {
         );
 
         // Opted in, with an exit ceiling far SHORTER than the build ceiling — the dangerous combination.
-        let on = WedgePolicy { exit_after_wedged: Some(Duration::from_millis(100)), ..test_wedge_policy() };
+        let on = WedgePolicy {
+            exit_after_wedged: Some(Duration::from_millis(100)),
+            ..test_wedge_policy()
+        };
         assert_eq!(
             wedge_action(Phase::Building, Duration::from_millis(550), on),
             WedgeAction::Nothing,
             "a build inside its ceiling is never exited on, however short the exit ceiling is"
         );
-        assert_eq!(wedge_action(Phase::Building, Duration::from_millis(650), on), WedgeAction::Report);
-        assert_eq!(wedge_action(Phase::Building, Duration::from_millis(750), on), WedgeAction::Exit);
+        assert_eq!(
+            wedge_action(Phase::Building, Duration::from_millis(650), on),
+            WedgeAction::Report
+        );
+        assert_eq!(
+            wedge_action(Phase::Building, Duration::from_millis(750), on),
+            WedgeAction::Exit
+        );
     }
 
     /// The shipped ceilings, asserted from the env defaults rather than from the test config: a build
@@ -366,7 +407,14 @@ mod tests {
             shipped.ceiling(Phase::Building) > shipped.ceiling(Phase::Running),
             "a compile is slower than a pass, and conflating them is what would flag correct slowness"
         );
-        assert_eq!(shipped.unload_wait, Duration::from_secs(30), "/unload answers the lease coordinator, not never");
-        assert_eq!(shipped.exit_after_wedged, None, "the process exit is opt-in (WEDGE_EXIT) and OFF by default");
+        assert_eq!(
+            shipped.unload_wait,
+            Duration::from_secs(30),
+            "/unload answers the lease coordinator, not never"
+        );
+        assert_eq!(
+            shipped.exit_after_wedged, None,
+            "the process exit is opt-in (WEDGE_EXIT) and OFF by default"
+        );
     }
 }

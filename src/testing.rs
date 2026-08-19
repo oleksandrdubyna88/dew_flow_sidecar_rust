@@ -6,15 +6,15 @@
 
 #![cfg(test)]
 
-use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
-use crate::config::{Config};
-use crate::engine_cache::{RungCache};
+use crate::config::Config;
+use crate::engine_cache::RungCache;
 use crate::state::{AppState, Engines};
 use crate::tokens::{TokenizerRegistry, TokenizerSource};
 use crate::wedge::{InFlight, Phase, WedgePolicy};
-use crate::wire::{ModelEntry};
+use crate::wire::ModelEntry;
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Wedge ceilings scaled down to milliseconds so the tests measure the RULE rather than the clock.
 /// The shipped values (15 min / 60 min / 30 s) are asserted separately, from the env defaults.
@@ -34,7 +34,9 @@ pub(crate) fn stamped(phase: Phase, label: &str, ago: Duration) -> InFlight {
     InFlight {
         phase,
         label: label.to_string(),
-        since: Instant::now().checked_sub(ago).expect("the process started after the epoch"),
+        since: Instant::now()
+            .checked_sub(ago)
+            .expect("the process started after the epoch"),
     }
 }
 
@@ -58,7 +60,11 @@ pub(crate) fn app_state_with_tokenizers(names: &[&'static str]) -> Arc<AppState>
     let tokenizers = TokenizerRegistry::from_sources(
         names
             .iter()
-            .map(|&name| TokenizerSource { name, path: None, consequence: "a test row" })
+            .map(|&name| TokenizerSource {
+                name,
+                path: None,
+                consequence: "a test row",
+            })
             .collect(),
     );
     app_state_full(config(""), tokenizers)
@@ -89,7 +95,10 @@ pub(crate) struct HeldEngine {
 }
 
 impl HeldEngine {
-    pub(crate) fn hold<S: Send + 'static>(engine: Arc<AppState>, pick: fn(&AppState) -> &Mutex<S>) -> Self {
+    pub(crate) fn hold<S: Send + 'static>(
+        engine: Arc<AppState>,
+        pick: fn(&AppState) -> &Mutex<S>,
+    ) -> Self {
         let (release, released) = mpsc::channel::<()>();
         let (holding, held) = mpsc::channel::<()>();
         let thread = std::thread::spawn(move || {
@@ -98,7 +107,10 @@ impl HeldEngine {
             released.recv().ok();
         });
         held.recv().expect("the engine is held");
-        Self { release, thread: Some(thread) }
+        Self {
+            release,
+            thread: Some(thread),
+        }
     }
 }
 
@@ -175,7 +187,10 @@ pub(crate) const FIXTURE_TOKENIZER: &[u8] = br#"{
 /// `find_tokenizer_file` discovers.
 pub(crate) fn model_cache_with_a_tokenizer(tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("bge-reg-{tag}-{}", std::process::id()));
-    let snapshot = root.join("models--BAAI--bge-m3").join("snapshots").join("deadbeef");
+    let snapshot = root
+        .join("models--BAAI--bge-m3")
+        .join("snapshots")
+        .join("deadbeef");
     std::fs::create_dir_all(&snapshot).expect("the fixture cache");
     std::fs::write(snapshot.join("tokenizer.json"), FIXTURE_TOKENIZER).expect("the fixture file");
     root
@@ -189,5 +204,8 @@ pub(crate) fn write_mb(path: &Path, mb: usize) {
 
 // ---------- GET /models: what this build can do ----------
 pub(crate) fn model_row<'a>(models: &'a [ModelEntry], id: &str) -> &'a ModelEntry {
-    models.iter().find(|entry| entry.id == id).unwrap_or_else(|| panic!("no '{id}' row in {models:?}"))
+    models
+        .iter()
+        .find(|entry| entry.id == id)
+        .unwrap_or_else(|| panic!("no '{id}' row in {models:?}"))
 }

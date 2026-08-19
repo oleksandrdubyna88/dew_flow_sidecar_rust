@@ -1,16 +1,23 @@
+use crate::bookkeeping::{
+    dense_dimension, record_embed_dimension, record_embed_max_length, record_max_batch,
+    remember_engine,
+};
+use crate::canary::load_validated_dual;
+use crate::compile_cache::{
+    pass_log_message, CachePathLease, CompileWatch, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE,
+};
+use crate::config::Config;
+use crate::engine_cache::EngineSlot;
+use crate::provider::{effective_provider, load_rerank};
+use crate::state::{positive_or, AppState, Limits};
+use crate::tokens::token_usage;
+use crate::wedge::{
+    inflight_now, EngineWedged, InFlight, InFlightStamp, Patience, Phase, WedgePolicy,
+};
+use crate::wire::{EmbedResponse, PassTimings, RerankResponse, SparseVec, TokenUsage};
+use fastembed::TextRerank;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
-use fastembed::TextRerank;
-use crate::bookkeeping::{dense_dimension, record_embed_dimension, record_embed_max_length, record_max_batch, remember_engine};
-use crate::canary::{load_validated_dual};
-use crate::config::{Config};
-use crate::engine_cache::{EngineSlot};
-use crate::provider::{effective_provider, load_rerank};
-use crate::state::{AppState, Limits, positive_or};
-use crate::tokens::{token_usage};
-use crate::wedge::{EngineWedged, InFlight, InFlightStamp, Patience, Phase, WedgePolicy, inflight_now};
-use crate::wire::{EmbedResponse, PassTimings, RerankResponse, SparseVec, TokenUsage};
-use crate::compile_cache::{pass_log_message, CachePathLease, CompileWatch, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
 
 // ---------- blocking inference ----------
 
@@ -62,7 +69,9 @@ pub(crate) fn embed_batch_texts(config: &Config, provider: &str) -> usize {
 /// allocation per request for a value that never changes.
 pub(crate) fn ruler_text() -> &'static str {
     static RULER: OnceLock<String> = OnceLock::new();
-    RULER.get_or_init(|| "lorem ipsum dolor sit amet ".repeat(4096)).as_str()
+    RULER
+        .get_or_init(|| "lorem ipsum dolor sit amet ".repeat(4096))
+        .as_str()
 }
 
 /// How many runs of the SAME real batch a request gets before it fails. Measured behaviour is that
@@ -128,9 +137,14 @@ pub(crate) fn embed_settling<T>(
 /// Costs one wasted row per `max_batch - 1` real rows and computes every row at the full cap — far
 /// cheaper than a per-batch recompile. Needs `max_batch >= 2`; with 1 there is no room for a ruler,
 /// so the caller keeps the natural (unpinned) layout.
-pub(crate) fn pin_shape(texts: &[String], max_batch: usize, ruler: &str) -> (Vec<String>, Vec<usize>) {
+pub(crate) fn pin_shape(
+    texts: &[String],
+    max_batch: usize,
+    ruler: &str,
+) -> (Vec<String>, Vec<usize>) {
     let per_chunk = max_batch - 1;
-    let mut expanded: Vec<String> = Vec::with_capacity(texts.len() + texts.len().div_ceil(per_chunk) * 2);
+    let mut expanded: Vec<String> =
+        Vec::with_capacity(texts.len() + texts.len().div_ceil(per_chunk) * 2);
     let mut positions = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(per_chunk) {
         expanded.push(ruler.to_string());
@@ -188,8 +202,15 @@ pub(crate) fn embed_blocking(
     request_id: &str,
 ) -> anyhow::Result<EmbedResponse> {
     // Read the current cap under its own lock and drop it before record_embed_max_length takes it again.
-    let resident = state.loaded_embed_max_length.lock().ok().and_then(|loaded| *loaded);
-    let limits = Limits { max_length: cap_for(kind, limits.max_length, resident), ..limits };
+    let resident = state
+        .loaded_embed_max_length
+        .lock()
+        .ok()
+        .and_then(|loaded| *loaded);
+    let limits = Limits {
+        max_length: cap_for(kind, limits.max_length, resident),
+        ..limits
+    };
     record_embed_max_length(state, limits.max_length);
     record_max_batch(state, limits.max_batch);
 
@@ -221,9 +242,19 @@ pub(crate) fn embed_blocking(
         let (expanded, positions) = pin_shape(&texts, limits.max_batch, ruler_text());
         tracing::info!(
             "embed request: {} text(s), pinned to {} row(s) of ({}, {}) for {provider}",
-            texts.len(), expanded.len(), limits.max_batch, limits.max_length
+            texts.len(),
+            expanded.len(),
+            limits.max_batch,
+            limits.max_length
         );
-        let padded = embed_natural(state, expanded, provider_hint, limits, retry_short, request_id)?;
+        let padded = embed_natural(
+            state,
+            expanded,
+            provider_hint,
+            limits,
+            retry_short,
+            request_id,
+        )?;
         let dense = unpin_rows(padded.dense, &positions)?;
         return Ok(EmbedResponse {
             // Re-measured from the rows that actually leave, not carried over from the padded batch:
@@ -238,7 +269,10 @@ pub(crate) fn embed_blocking(
         });
     }
 
-    Ok(EmbedResponse { usage, ..embed_natural(state, texts, provider_hint, limits, retry_short, request_id)? })
+    Ok(EmbedResponse {
+        usage,
+        ..embed_natural(state, texts, provider_hint, limits, retry_short, request_id)?
+    })
 }
 
 /// The unpinned path: hand the texts to fastembed as they are and let `BatchLongest` decide the
@@ -295,9 +329,15 @@ pub(crate) fn embed_natural(
     } else {
         None
     };
-    stamp.enter(Phase::Running, format!("embed: embedding {} row(s)", texts.len()));
+    stamp.enter(
+        Phase::Running,
+        format!("embed: embedding {} row(s)", texts.len()),
+    );
     // The duration below includes any settling re-runs — that is honest: it is what the caller waited.
-    let (compiles, pass) = (CompileWatch::start(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE), Instant::now());
+    let (compiles, pass) = (
+        CompileWatch::start(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE),
+        Instant::now(),
+    );
     // INVARIANT: this rung is resident. Either it already was, or the block above built it and
     // `remember_engine` filed it — and `guard` is the only handle that can evict, so nothing could have
     // taken it between those lines. `RungCache` capacity is `max(1)`, so a fresh insert cannot evict
@@ -306,19 +346,24 @@ pub(crate) fn embed_natural(
     let engine = guard.get_mut(limits.max_length).expect("just loaded");
     // Rows are (dense, sparse) ZIPPED per text, so the settling retry polices one length and a short
     // first run can never shorten one head without the other.
-    let rows = embed_settling("embed", texts.len(), retry_short, || engine.embed(texts.clone(), batch))?;
+    let rows = embed_settling("embed", texts.len(), retry_short, || {
+        engine.embed(texts.clone(), batch)
+    })?;
     let inference = pass.elapsed();
     // The first kernel launch has happened, so the EP has read the cache path and compiled or loaded
     // against it. Everything below this line is arithmetic — release the claim rather than holding it
     // across the unzip and the response.
     drop(cache_claim);
     let compile_cache_grew_mb = compiles.grew_mb();
-    tracing::info!("{}", pass_log_message(
-        request_id,
-        &format!("embedded {} row(s), dense+sparse in one pass", rows.len()),
-        inference.as_secs_f32(),
-        compile_cache_grew_mb,
-    ));
+    tracing::info!(
+        "{}",
+        pass_log_message(
+            request_id,
+            &format!("embedded {} row(s), dense+sparse in one pass", rows.len()),
+            inference.as_secs_f32(),
+            compile_cache_grew_mb,
+        )
+    );
 
     let (dense, sparse): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
     // The width comes from a row this pass actually produced. Recorded here — the one place a real
@@ -384,7 +429,10 @@ pub(crate) fn rerank_blocking(
     } else {
         None
     };
-    stamp.enter(Phase::Running, format!("rerank: scoring {} document(s)", documents.len()));
+    stamp.enter(
+        Phase::Running,
+        format!("rerank: scoring {} document(s)", documents.len()),
+    );
 
     // Shape pinning, exactly as the embed path does it and for the same provider: fastembed forms
     // (query, document) pairs and pads each chunk to ITS longest member, so under MIGraphX every distinct
@@ -400,21 +448,34 @@ pub(crate) fn rerank_blocking(
         let (expanded, positions) = pin_shape(&documents, max_batch, ruler_text());
         tracing::info!(
             "rerank request: {} document(s), pinned to {} row(s) of ({}, {}) for {provider}",
-            documents.len(), expanded.len(), max_batch, state.config.rerank_max_length
+            documents.len(),
+            expanded.len(),
+            max_batch,
+            state.config.rerank_max_length
         );
-        let (padded, pass) = score_documents(state, &mut guard, &query, &expanded, max_batch, request_id)?;
+        let (padded, pass) =
+            score_documents(state, &mut guard, &query, &expanded, max_batch, request_id)?;
         return Ok(RerankResponse {
             scores: unpin_rows(padded, &positions)?,
             request_id: request_id.to_string(),
-            timings: PassTimings { queue_wait_ms, session_build_ms, ..pass },
+            timings: PassTimings {
+                queue_wait_ms,
+                session_build_ms,
+                ..pass
+            },
         });
     }
 
-    let (scores, pass) = score_documents(state, &mut guard, &query, &documents, max_batch, request_id)?;
+    let (scores, pass) =
+        score_documents(state, &mut guard, &query, &documents, max_batch, request_id)?;
     Ok(RerankResponse {
         scores,
         request_id: request_id.to_string(),
-        timings: PassTimings { queue_wait_ms, session_build_ms, ..pass },
+        timings: PassTimings {
+            queue_wait_ms,
+            session_build_ms,
+            ..pass
+        },
     })
 }
 
@@ -430,7 +491,10 @@ pub(crate) fn score_documents(
     request_id: &str,
 ) -> anyhow::Result<(Vec<f32>, PassTimings)> {
     let count = documents.len();
-    let (compiles, pass) = (CompileWatch::start(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE), std::time::Instant::now());
+    let (compiles, pass) = (
+        CompileWatch::start(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE),
+        std::time::Instant::now(),
+    );
     // query.to_string(): fastembed's `rerank` shares one generic across the query and the document slice,
     // so an owned query is what lets `&[String]` documents satisfy it.
     let results = guard
@@ -441,25 +505,34 @@ pub(crate) fn score_documents(
         .rerank(query.to_string(), documents, false, Some(max_batch))?;
     let inference = pass.elapsed();
     let compile_cache_grew_mb = compiles.grew_mb();
-    tracing::info!("{}", pass_log_message(
-        request_id,
-        &format!("rerank: scored {count} document(s)"),
-        inference.as_secs_f32(),
-        compile_cache_grew_mb,
-    ));
+    tracing::info!(
+        "{}",
+        pass_log_message(
+            request_id,
+            &format!("rerank: scored {count} document(s)"),
+            inference.as_secs_f32(),
+            compile_cache_grew_mb,
+        )
+    );
     let timings = PassTimings {
         queue_wait_ms: 0,
         session_build_ms: 0,
         inference_ms: inference.as_millis() as u64,
         compile_cache_grew_mb,
     };
-    Ok((aligned_scores(count, results.into_iter().map(|r| (r.index, r.score))), timings))
+    Ok((
+        aligned_scores(count, results.into_iter().map(|r| (r.index, r.score))),
+        timings,
+    ))
 }
 
 /// Scores raised back into the DOCUMENT order the HTTP contract promises: `rerank()` returns results
 /// sorted by score, while the C# `CrossEncoderReranker` pairs by position. Sigmoid-normalized to 0..1
 /// for parity with the retired Python sidecar; an out-of-range index is dropped rather than trusted.
-pub(crate) fn aligned_scores(count: usize, results: impl IntoIterator<Item = (usize, f32)>) -> Vec<f32> {
+pub(crate) fn aligned_scores(
+    count: usize,
+    results: impl IntoIterator<Item = (usize, f32)>,
+) -> Vec<f32> {
     let mut scores = vec![0f32; count];
     for (index, raw) in results {
         if index < count {
@@ -519,17 +592,30 @@ pub(crate) fn lock_or_refuse<'a, S: EngineSlot>(
         }
 
         let holder = inflight_now(inflight);
-        let (activity, held_for) = holder
+        let (activity, held_for) = holder.as_ref().map_or_else(
+            || (String::new(), waiting_since.elapsed()),
+            |h| (h.label.clone(), h.since.elapsed()),
+        );
+        let ceiling = holder
             .as_ref()
-            .map_or_else(|| (String::new(), waiting_since.elapsed()), |h| (h.label.clone(), h.since.elapsed()));
-        let ceiling = holder.as_ref().map_or(policy.running_after, |h| policy.ceiling(h.phase));
+            .map_or(policy.running_after, |h| policy.ceiling(h.phase));
         if held_for >= ceiling {
-            anyhow::bail!(EngineWedged { what: what.to_string(), activity, elapsed: held_for, wedged: true });
+            anyhow::bail!(EngineWedged {
+                what: what.to_string(),
+                activity,
+                elapsed: held_for,
+                wedged: true
+            });
         }
         if let Patience::AtMost(limit) = patience {
             let waited = waiting_since.elapsed();
             if waited >= limit {
-                anyhow::bail!(EngineWedged { what: what.to_string(), activity, elapsed: waited, wedged: false });
+                anyhow::bail!(EngineWedged {
+                    what: what.to_string(),
+                    activity,
+                    elapsed: waited,
+                    wedged: false
+                });
             }
         }
         std::thread::sleep(policy.poll);
@@ -551,11 +637,31 @@ mod tests {
     /// own envelope: that is how the operator's setting reaches the card at all.
     #[test]
     fn a_query_runs_at_the_resident_cap_while_a_doc_states_its_own() {
-        assert_eq!(cap_for("query", 1024, Some(256)), 256, "a query must not evict the pair a pass is using");
-        assert_eq!(cap_for("query", 256, Some(1024)), 1024, "and must not drag the cap the other way either");
-        assert_eq!(cap_for("query", 1024, None), 1024, "with nothing loaded there is nothing to preserve");
-        assert_eq!(cap_for("doc", 1024, Some(256)), 1024, "an index pass still sets the envelope it asked for");
-        assert_eq!(cap_for("", 512, Some(256)), 512, "an unset kind is treated as a doc, not as a query");
+        assert_eq!(
+            cap_for("query", 1024, Some(256)),
+            256,
+            "a query must not evict the pair a pass is using"
+        );
+        assert_eq!(
+            cap_for("query", 256, Some(1024)),
+            1024,
+            "and must not drag the cap the other way either"
+        );
+        assert_eq!(
+            cap_for("query", 1024, None),
+            1024,
+            "with nothing loaded there is nothing to preserve"
+        );
+        assert_eq!(
+            cap_for("doc", 1024, Some(256)),
+            1024,
+            "an index pass still sets the envelope it asked for"
+        );
+        assert_eq!(
+            cap_for("", 512, Some(256)),
+            512,
+            "an unset kind is treated as a doc, not as a query"
+        );
     }
 
     /// A rerank runs at the batch the REQUEST carries, falling back to the configured default only when the
@@ -565,7 +671,11 @@ mod tests {
     #[test]
     fn rerank_uses_the_requests_batch_and_falls_back_to_the_configured_default() {
         assert_eq!(rerank_batch(&config(""), 64), 64);
-        assert_eq!(rerank_batch(&config(""), 0), 4, "0 means 'not set' — keep the sidecar's own default");
+        assert_eq!(
+            rerank_batch(&config(""), 0),
+            4,
+            "0 means 'not set' — keep the sidecar's own default"
+        );
         assert_eq!(rerank_batch(&config(""), 1), 1);
     }
 
@@ -576,9 +686,15 @@ mod tests {
     fn rerank_scores_come_back_in_document_order_not_score_order() {
         let scores = aligned_scores(3, [(2usize, 0.0f32), (0, 4.0), (1, -4.0)]);
 
-        assert!(scores[0] > 0.98, "doc 0 got the high raw score, sigmoid-normalized");
+        assert!(
+            scores[0] > 0.98,
+            "doc 0 got the high raw score, sigmoid-normalized"
+        );
         assert!(scores[1] < 0.02, "doc 1 got the low one");
-        assert!((scores[2] - 0.5).abs() < 1e-6, "doc 2's raw 0 sits at the sigmoid midpoint");
+        assert!(
+            (scores[2] - 0.5).abs() < 1e-6,
+            "doc 2's raw 0 sits at the sigmoid midpoint"
+        );
     }
 
     /// An index past the document count is dropped, not trusted: writing through it would panic or, worse,
@@ -588,7 +704,10 @@ mod tests {
         let scores = aligned_scores(2, [(0usize, 1.0f32), (5, 9.9)]);
 
         assert_eq!(scores.len(), 2);
-        assert!((scores[1] - 0.0).abs() < 1e-6, "the out-of-range result left doc 1 unscored");
+        assert!(
+            (scores[1] - 0.0).abs() < 1e-6,
+            "the out-of-range result left doc 1 unscored"
+        );
     }
 
     /// Only MIGraphX recompiles per input shape, so only it pays the padding overhead by default;
@@ -614,10 +733,17 @@ mod tests {
         let texts: Vec<String> = (0..5).map(|i| format!("text{i}")).collect();
         let (expanded, positions) = pin_shape(&texts, 4, ruler);
 
-        assert_eq!(expanded.len() % 4, 0, "layout must be whole batches: {expanded:?}");
+        assert_eq!(
+            expanded.len() % 4,
+            0,
+            "layout must be whole batches: {expanded:?}"
+        );
         assert_eq!(expanded.len(), 8);
         for (n, batch) in expanded.chunks(4).enumerate() {
-            assert!(batch.contains(&ruler.to_string()), "batch {n} has no ruler: {batch:?}");
+            assert!(
+                batch.contains(&ruler.to_string()),
+                "batch {n} has no ruler: {batch:?}"
+            );
         }
         assert_eq!(positions.len(), texts.len(), "every text is addressable");
         for (text, &at) in texts.iter().zip(&positions) {
@@ -668,7 +794,11 @@ mod tests {
         assert_eq!(rows.len(), 64, "63 texts + 1 ruler is one batch");
         let one_more: Vec<String> = (0..64).map(|i| i.to_string()).collect();
         let (spilled, _) = pin_shape(&one_more, 64, "ruler");
-        assert_eq!(spilled.len(), 128, "one text more doubles the rows — the defect this field prevents");
+        assert_eq!(
+            spilled.len(),
+            128,
+            "one text more doubles the rows — the defect this field prevents"
+        );
 
         // Pinning off, or a provider that takes dynamic shapes: no ruler, so the whole batch is usable.
         assert_eq!(embed_batch_texts(&cfg(64, "0"), "migraphx"), 64);
@@ -732,7 +862,10 @@ mod tests {
         .expect_err("short forever");
 
         assert_eq!(calls, SETTLE_ATTEMPTS);
-        assert!(err.to_string().contains("16 of 64"), "the error names the shortfall: {err}");
+        assert!(
+            err.to_string().contains("16 of 64"),
+            "the error names the shortfall: {err}"
+        );
     }
 
     /// Providers without the quirk (CUDA/DirectML/CPU) keep raw single-run semantics: no retries, no
@@ -766,14 +899,24 @@ mod tests {
     #[test]
     fn a_requests_batch_overrides_the_configured_default() {
         assert_eq!(rerank_batch(&config("dml"), 64), 64, "the request wins");
-        assert_eq!(rerank_batch(&config("dml"), 0), config("dml").max_batch, "0 falls back to the config");
+        assert_eq!(
+            rerank_batch(&config("dml"), 0),
+            config("dml").max_batch,
+            "0 falls back to the config"
+        );
     }
 
     /// ~110 KB of constant text, cloned once per chunk of every pinned request. One allocation, shared.
     #[test]
     fn the_ruler_is_allocated_once_and_shared() {
-        assert!(std::ptr::eq(ruler_text(), ruler_text()), "the same buffer, not a fresh copy per request");
-        assert!(ruler_text().len() > 100_000, "still long enough to truncate to any cap we allow");
+        assert!(
+            std::ptr::eq(ruler_text(), ruler_text()),
+            "the same buffer, not a fresh copy per request"
+        );
+        assert!(
+            ruler_text().len() > 100_000,
+            "still long enough to truncate to any cap we allow"
+        );
     }
 
     /// is what lets the pinned path re-measure from the returned rows rather than carrying a number over.
@@ -785,6 +928,10 @@ mod tests {
         let real = unpin_rows(padded, &[1]).expect("row 1 was the caller's");
 
         assert_eq!(real.len(), 1, "one row of the caller's survives");
-        assert_eq!(dense_dimension(&real), wide, "and it is exactly as wide as what the engine returned");
+        assert_eq!(
+            dense_dimension(&real),
+            wide,
+            "and it is exactly as wide as what the engine returned"
+        );
     }
 }

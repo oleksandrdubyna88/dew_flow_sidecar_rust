@@ -137,7 +137,11 @@ impl DaySegments {
 
     fn create(dir_root: &str, day: &str, path: &str) -> Option<File> {
         std::fs::create_dir_all(format!("{dir_root}/{day}")).ok()?;
-        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
     }
 
     /// Swaps to the next day's segment when the clock has passed the boundary.
@@ -166,7 +170,10 @@ impl DaySegments {
 
 impl Write for DaySegments {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         self.roll_if_due(now);
 
         match self.file.as_mut() {
@@ -205,7 +212,10 @@ mod tests {
 
         let (segments, path) = DaySegments::open(&root, "bge-sidecar-device0", AFTERNOON);
 
-        assert!(segments.is_some(), "a writable directory must yield a writer");
+        assert!(
+            segments.is_some(),
+            "a writable directory must yield a writer"
+        );
         assert!(
             path.ends_with(&format!(
                 "2026-08-16/bge-sidecar-device0-15-00-00-{}.log",
@@ -381,7 +391,10 @@ mod tests {
 
         let retired = retire_day_folders(&root, 30, NOON);
 
-        assert!(retired.is_empty(), "a folder that refused is not a folder that went");
+        assert!(
+            retired.is_empty(),
+            "a folder that refused is not a folder that went"
+        );
         assert_eq!(walk_days(&root), vec!["2020-01-01".to_string()]);
         drop(held);
     }

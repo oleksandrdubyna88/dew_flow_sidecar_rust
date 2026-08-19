@@ -1,7 +1,7 @@
+use crate::engine_cache::RungCache;
+use crate::state::AppState;
 use std::sync::Mutex;
 use std::time::Instant;
-use crate::engine_cache::{RungCache};
-use crate::state::{AppState};
 
 // ---------- model loading ----------
 
@@ -38,7 +38,11 @@ fn record(cell: &Mutex<Option<usize>>, what: &str, value: usize) {
 /// two-rung ladder: a pass crosses the boundary twice and each crossing cost 156-173 s of rebuild (see
 /// `RungCache`). The engines are now kept per rung, so a change is a lookup and this records, nothing more.
 pub(crate) fn record_embed_max_length(state: &AppState, requested: usize) {
-    record(&state.loaded_embed_max_length, "embed max_length", requested);
+    record(
+        &state.loaded_embed_max_length,
+        "embed max_length",
+        requested,
+    );
 }
 
 /// Same bookkeeping for the BATCH, so /health can report what ran rather than what was configured.
@@ -67,10 +71,18 @@ pub(crate) fn dense_dimension(dense: &[Vec<f32>]) -> Option<usize> {
 /// Files a freshly built engine under its rung and reports what the card now holds. The log line is the
 /// operator's only window into the cache's occupancy — an eviction that happened silently would look
 /// exactly like the rebuild-per-crossing behaviour this cache exists to remove.
-pub(crate) fn remember_engine<T: Send + 'static>(cache: &mut RungCache<T>, what: &str, cap: usize, engine: T) {
+pub(crate) fn remember_engine<T: Send + 'static>(
+    cache: &mut RungCache<T>,
+    what: &str,
+    cap: usize,
+    engine: T,
+) {
     let capacity = cache.capacity;
     let Some((rung, evicted)) = cache.insert(cap, engine) else {
-        tracing::info!("{what}: built at cap {cap} — resident rung(s): {:?}", cache.caps());
+        tracing::info!(
+            "{what}: built at cap {cap} — resident rung(s): {:?}",
+            cache.caps()
+        );
         return;
     };
     tracing::info!(
@@ -93,11 +105,16 @@ pub(crate) fn remember_engine<T: Send + 'static>(cache: &mut RungCache<T>, what:
 /// else's queue wait — so this becomes the only place that can say it was slow.
 pub(crate) fn teardown_off_the_lock<T: Send + 'static>(engine: T, what: String) {
     let names_it = what.clone();
-    let spawned = std::thread::Builder::new().name("engine-teardown".to_string()).spawn(move || {
-        let started = Instant::now();
-        drop(engine);
-        tracing::info!("{names_it}: torn down in {:.1}s, off the engine lock", started.elapsed().as_secs_f32());
-    });
+    let spawned = std::thread::Builder::new()
+        .name("engine-teardown".to_string())
+        .spawn(move || {
+            let started = Instant::now();
+            drop(engine);
+            tracing::info!(
+                "{names_it}: torn down in {:.1}s, off the engine lock",
+                started.elapsed().as_secs_f32()
+            );
+        });
     // Spawn failure drops the closure — and the engine with it — right here. Slow beats leaked, but it
     // is the behaviour this function exists to avoid, so it is never silent.
     if let Err(e) = spawned {
@@ -117,8 +134,8 @@ pub(crate) fn attention_peak_mb(batch: usize, seq: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::testing::app_state;
+    use std::sync::Arc;
 
     // ---------- the dimension on /embed ----------
     /// The reported width is the width of the rows in the SAME response — the whole point is that a caller
@@ -128,7 +145,11 @@ mod tests {
         let rows = vec![vec![0.0f32; 1024], vec![0.0f32; 1024]];
 
         assert_eq!(dense_dimension(&rows), Some(rows[0].len()));
-        assert_eq!(dense_dimension(&[]), None, "an empty batch measured nothing — null, never 0");
+        assert_eq!(
+            dense_dimension(&[]),
+            None,
+            "an empty batch measured nothing — null, never 0"
+        );
     }
 
     // ---------- poisoned bookkeeping heals instead of going quiet ----------
@@ -149,15 +170,24 @@ mod tests {
         })
         .join()
         .expect_err("the thread panicked, which is the point");
-        assert!(state.loaded_max_batch.is_poisoned(), "the cell is poisoned before we record");
+        assert!(
+            state.loaded_max_batch.is_poisoned(),
+            "the cell is poisoned before we record"
+        );
 
         record_max_batch(&state, 64);
 
         assert_eq!(
-            *state.loaded_max_batch.lock().unwrap_or_else(|p| p.into_inner()),
+            *state
+                .loaded_max_batch
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
             Some(64),
             "one panic costs one write, not every write from here on"
         );
-        assert!(!state.loaded_max_batch.is_poisoned(), "and the cell was healed, as the engine locks are");
+        assert!(
+            !state.loaded_max_batch.is_poisoned(),
+            "and the cell was healed, as the engine locks are"
+        );
     }
 }

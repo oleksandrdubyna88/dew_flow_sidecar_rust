@@ -1,11 +1,15 @@
-use std::sync::Arc;
-use axum::extract::State;
-use axum::Json;
 use crate::config::Config;
 use crate::inference::{embed_blocking, rerank_batch, rerank_blocking, set_activity};
 use crate::state::{AppState, Limits};
-use crate::tokens::{BGE_TOKENIZER, count_tokens};
-use crate::wire::{ApiError, EmbedRequest, EmbedResponse, PassTimings, RerankRequest, RerankResponse, TokenUsage, TokenizeRequest, TokenizeResponse, bad_request, engine_error, internal_error, join_error_text};
+use crate::tokens::{count_tokens, BGE_TOKENIZER};
+use crate::wire::{
+    bad_request, engine_error, internal_error, join_error_text, ApiError, EmbedRequest,
+    EmbedResponse, PassTimings, RerankRequest, RerankResponse, TokenUsage, TokenizeRequest,
+    TokenizeResponse,
+};
+use axum::extract::State;
+use axum::Json;
+use std::sync::Arc;
 
 // ---------- handlers ----------
 
@@ -30,7 +34,12 @@ where
     let outcome = tokio::task::spawn_blocking(pass).await;
     set_activity(&idle, "idle");
     let result = outcome
-        .map_err(|e| internal_error(anyhow::anyhow!("{what} task panicked: {}", join_error_text(e))))?
+        .map_err(|e| {
+            internal_error(anyhow::anyhow!(
+                "{what} task panicked: {}",
+                join_error_text(e)
+            ))
+        })?
         .map_err(engine_error)?;
     Ok(Json(result))
 }
@@ -39,7 +48,14 @@ pub(crate) async fn embed(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<EmbedResponse>, ApiError> {
-    let EmbedRequest { texts, kind, provider, max_length, max_batch, request_id } = req;
+    let EmbedRequest {
+        texts,
+        kind,
+        provider,
+        max_length,
+        max_batch,
+        request_id,
+    } = req;
     if texts.is_empty() {
         return Ok(Json(EmbedResponse {
             dense: vec![],
@@ -128,23 +144,44 @@ pub(crate) async fn tokenize(
             .map(|tokenizer| count_tokens(tokenizer, &texts, "tokenize"))
     })
     .await
-    .map_err(|e| internal_error(anyhow::anyhow!("tokenize task panicked: {}", join_error_text(e))))?;
+    .map_err(|e| {
+        internal_error(anyhow::anyhow!(
+            "tokenize task panicked: {}",
+            join_error_text(e)
+        ))
+    })?;
 
     // Same rule as /embed's accounting: one refusal makes the whole answer UNKNOWN rather than zero.
     // A caller asks here precisely so it can split BEFORE anything is capped, and a `0` it cannot tell
     // from an empty text is worse than an honest "not measured". An unloadable tokenizer folds into the
     // same answer: both mean NOT MEASURED, and the wire has one way to say that.
-    let Some(token_count) = counted.and_then(|counts| counts.into_iter().collect::<Option<Vec<usize>>>()) else {
-        return Ok(Json(TokenizeResponse { token_count: vec![], model, available: false }));
+    let Some(token_count) =
+        counted.and_then(|counts| counts.into_iter().collect::<Option<Vec<usize>>>())
+    else {
+        return Ok(Json(TokenizeResponse {
+            token_count: vec![],
+            model,
+            available: false,
+        }));
     };
-    Ok(Json(TokenizeResponse { token_count, model, available: true }))
+    Ok(Json(TokenizeResponse {
+        token_count,
+        model,
+        available: true,
+    }))
 }
 
 pub(crate) async fn rerank(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RerankRequest>,
 ) -> Result<Json<RerankResponse>, ApiError> {
-    let RerankRequest { query, documents, provider, max_batch, request_id } = req;
+    let RerankRequest {
+        query,
+        documents,
+        provider,
+        max_batch,
+        request_id,
+    } = req;
     if documents.is_empty() {
         return Ok(Json(RerankResponse {
             scores: vec![],
@@ -164,17 +201,17 @@ pub(crate) async fn rerank(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower::ServiceExt;
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-    use axum::extract::State;
-    use axum::http::StatusCode;
     use crate::build_router;
     use crate::testing::*;
-    
-    use crate::inference::{lock_or_refuse};
-    use crate::tokens::{BGE_TOKENIZER};
-    use crate::wedge::{Patience, Phase, inflight_now, write_inflight};
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use tower::ServiceExt;
+
+    use crate::inference::lock_or_refuse;
+    use crate::tokens::BGE_TOKENIZER;
+    use crate::wedge::{inflight_now, write_inflight, Patience, Phase};
     use crate::wire::TokenizeRequest;
 
     /// The request path had no deadline of any kind: every /embed behind a wedged inference queued on
@@ -186,7 +223,11 @@ mod tests {
         let _held = HeldEngine::hold(state.clone(), |s| &s.engines.embed);
         write_inflight(
             &state.engines.embed_inflight,
-            Some(stamped(Phase::Running, "embed: embedding 64 row(s)", Duration::from_secs(30))),
+            Some(stamped(
+                Phase::Running,
+                "embed: embedding 64 row(s)",
+                Duration::from_secs(30),
+            )),
         );
 
         let asked = Instant::now();
@@ -201,10 +242,16 @@ mod tests {
         };
         let waited = asked.elapsed();
 
-        assert!(waited < Duration::from_millis(200), "the refusal is immediate, not another wait: {waited:?}");
+        assert!(
+            waited < Duration::from_millis(200),
+            "the refusal is immediate, not another wait: {waited:?}"
+        );
         let text = format!("{refused:#}");
         assert!(text.contains("WEDGED"), "{text}");
-        assert!(text.contains("embed: embedding 64 row(s)"), "the reason names what is holding it: {text}");
+        assert!(
+            text.contains("embed: embedding 64 row(s)"),
+            "the reason names what is holding it: {text}"
+        );
         assert!(text.contains("/unload"), "and how to recover: {text}");
     }
 
@@ -218,7 +265,11 @@ mod tests {
         // Well inside the 600 ms building ceiling this test config carries.
         write_inflight(
             &state.engines.embed_inflight,
-            Some(stamped(Phase::Building, "embed: building the session", Duration::from_millis(10))),
+            Some(stamped(
+                Phase::Building,
+                "embed: building the session",
+                Duration::from_millis(10),
+            )),
         );
 
         let waiter = state.clone();
@@ -239,7 +290,11 @@ mod tests {
             "a healthy build must NOT be refused — the waiter is supposed to still be waiting"
         );
         drop(held);
-        assert_eq!(outcome.recv_timeout(Duration::from_secs(2)), Ok(true), "and it gets the engine once the build ends");
+        assert_eq!(
+            outcome.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "and it gets the engine once the build ends"
+        );
         thread.join().ok();
     }
 
@@ -261,9 +316,15 @@ mod tests {
             panic!("an unstamped hold cannot be waited on forever either");
         };
 
-        assert!(asked.elapsed() >= state.config.wedge.running_after, "it waited the fallback ceiling out first");
+        assert!(
+            asked.elapsed() >= state.config.wedge.running_after,
+            "it waited the fallback ceiling out first"
+        );
         assert!(format!("{refused:#}").contains("rerank"), "{refused:#}");
-        assert!(inflight_now(&state.engines.rerank_inflight).is_none(), "precondition: nothing had stamped it");
+        assert!(
+            inflight_now(&state.engines.rerank_inflight).is_none(),
+            "precondition: nothing had stamped it"
+        );
     }
 
     /// An unknown name is refused — and the refusal names the set this build actually registered, rather
@@ -273,10 +334,13 @@ mod tests {
     async fn an_unknown_tokenizer_is_refused_naming_every_registered_name() {
         let state = app_state_with_tokenizers(&["bge", "qwen", "gemma"]);
 
-        let refused = tokenize(State(state), axum::Json(TokenizeRequest {
-            texts: vec!["alpha".to_string()],
-            model: "llama".to_string(),
-        }))
+        let refused = tokenize(
+            State(state),
+            axum::Json(TokenizeRequest {
+                texts: vec!["alpha".to_string()],
+                model: "llama".to_string(),
+            }),
+        )
         .await
         .expect_err("an unknown tokenizer must be refused, never served by the wrong one");
 
@@ -302,22 +366,34 @@ mod tests {
         config.qwen_tokenizer_path = cache.join("there-is-no-qwen-here.json");
         let state = app_state_with(config);
 
-        let missing = tokenize(State(state.clone()), axum::Json(TokenizeRequest {
-            texts: vec!["alpha beta".to_string()],
-            model: "qwen".to_string(),
-        }))
+        let missing = tokenize(
+            State(state.clone()),
+            axum::Json(TokenizeRequest {
+                texts: vec!["alpha beta".to_string()],
+                model: "qwen".to_string(),
+            }),
+        )
         .await
         .expect("a registered name is never a 400, however unloadable it is");
         assert!(!missing.available, "qwen has no file here");
-        assert!(missing.token_count.is_empty(), "and an unavailable counter reports no numbers at all");
+        assert!(
+            missing.token_count.is_empty(),
+            "and an unavailable counter reports no numbers at all"
+        );
 
-        let present = tokenize(State(state), axum::Json(TokenizeRequest {
-            texts: vec!["alpha beta".to_string()],
-            model: "bge".to_string(),
-        }))
+        let present = tokenize(
+            State(state),
+            axum::Json(TokenizeRequest {
+                texts: vec!["alpha beta".to_string()],
+                model: "bge".to_string(),
+            }),
+        )
         .await
         .expect("bge answers");
-        assert!(present.available, "one absent file must not take the whole registry down");
+        assert!(
+            present.available,
+            "one absent file must not take the whole registry down"
+        );
         assert_eq!(present.token_count, vec![2], "and it really counted");
 
         std::fs::remove_dir_all(&cache).ok();
@@ -332,10 +408,13 @@ mod tests {
         let state = app_state_with_tokenizers(&[BGE_TOKENIZER]);
         let cap = state.config.tokenize_max_texts;
 
-        let refused = tokenize(State(state), axum::Json(TokenizeRequest {
-            texts: vec!["alpha".to_string(); cap + 1],
-            model: String::new(),
-        }))
+        let refused = tokenize(
+            State(state),
+            axum::Json(TokenizeRequest {
+                texts: vec!["alpha".to_string(); cap + 1],
+                model: String::new(),
+            }),
+        )
         .await
         .expect_err("a batch past the cap is refused rather than encoded");
 
@@ -394,13 +473,18 @@ mod tests {
                     .method("POST")
                     .uri("/tokenize")
                     .header("content-type", "application/json")
-                    .body(axum::body::Body::from(r#"{"texts":["alpha"],"model":"bge"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"texts":["alpha"],"model":"bge"}"#,
+                    ))
                     .expect("a well-formed request"),
             )
             .await
             .expect("the router answers");
 
-        assert_eq!(response.status(), StatusCode::OK, "the handler ran and answered");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the handler ran and answered"
+        );
     }
-
 }

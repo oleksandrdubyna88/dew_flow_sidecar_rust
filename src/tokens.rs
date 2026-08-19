@@ -1,7 +1,7 @@
+use crate::config::Config;
+use crate::state::AppState;
+use crate::wire::TokenUsage;
 use std::path::{Path, PathBuf};
-use crate::config::{Config};
-use crate::state::{AppState};
-use crate::wire::{TokenUsage};
 
 /// BGE-M3's tokenizer — the one `/embed`'s own truncation accounting counts with.
 pub(crate) const BGE_TOKENIZER: &str = "bge";
@@ -57,19 +57,23 @@ impl TokenizerRegistry {
                 // The snapshot folder is a content hash that changes when the model is re-pulled, so the
                 // path is discovered rather than hardcoded.
                 path: find_tokenizer_file(&config.cache_dir),
-                consequence: "/embed will report token_accounting: false, and the host cannot then prove \
+                consequence:
+                    "/embed will report token_accounting: false, and the host cannot then prove \
                               that no input was silently truncated",
             },
             TokenizerSource {
                 name: QWEN_TOKENIZER,
                 path: Some(config.qwen_tokenizer_path.clone()),
-                consequence: "/tokenize will report that name unavailable rather than estimate a count",
+                consequence:
+                    "/tokenize will report that name unavailable rather than estimate a count",
             },
         ])
     }
 
     pub(crate) fn from_sources(sources: Vec<TokenizerSource>) -> Self {
-        Self { entries: sources.into_iter().map(load_tokenizer_row).collect() }
+        Self {
+            entries: sources.into_iter().map(load_tokenizer_row).collect(),
+        }
     }
 
     /// The row for a name — whether or not it could be loaded. `None` means the name is not registered
@@ -81,7 +85,11 @@ impl TokenizerRegistry {
     /// Every registered name, in declaration order, quoted — what an unknown-name refusal reports so the
     /// caller can correct itself rather than guess.
     pub(crate) fn names(&self) -> String {
-        self.entries.iter().map(|entry| format!("'{}'", entry.name)).collect::<Vec<_>>().join(", ")
+        self.entries
+            .iter()
+            .map(|entry| format!("'{}'", entry.name))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Every row with its file and whether it can answer — the startup summary.
@@ -95,7 +103,11 @@ impl TokenizerRegistry {
             .iter()
             .map(|entry| match (&entry.source, entry.tokenizer.is_some()) {
                 (Some(path), true) => format!("'{}' <- {}", entry.name, path.display()),
-                (Some(path), false) => format!("'{}' UNAVAILABLE (would not parse: {})", entry.name, path.display()),
+                (Some(path), false) => format!(
+                    "'{}' UNAVAILABLE (would not parse: {})",
+                    entry.name,
+                    path.display()
+                ),
                 (None, _) => format!("'{}' UNAVAILABLE (no file found)", entry.name),
             })
             .collect::<Vec<_>>()
@@ -109,19 +121,38 @@ impl TokenizerRegistry {
 /// never a startup failure. A sidecar that cannot COUNT must still EMBED — the missing tokenizer has to
 /// stop us CLAIMING nothing was truncated, not stop us serving.
 pub(crate) fn load_tokenizer_row(source: TokenizerSource) -> TokenizerEntry {
-    let TokenizerSource { name, path, consequence } = source;
+    let TokenizerSource {
+        name,
+        path,
+        consequence,
+    } = source;
     let Some(path) = path.filter(|p| p.is_file()) else {
         tracing::warn!("no {name} tokenizer file found — {consequence}");
-        return TokenizerEntry { name, source: None, tokenizer: None };
+        return TokenizerEntry {
+            name,
+            source: None,
+            tokenizer: None,
+        };
     };
     match tokenizers::Tokenizer::from_file(&path) {
         Ok(tokenizer) => {
             tracing::info!("{name} token counting enabled from `{}`", path.display());
-            TokenizerEntry { name, source: Some(path), tokenizer: Some(tokenizer) }
+            TokenizerEntry {
+                name,
+                source: Some(path),
+                tokenizer: Some(tokenizer),
+            }
         }
         Err(e) => {
-            tracing::warn!("{name} tokenizer at `{}` would not parse ({e}) — {consequence}", path.display());
-            TokenizerEntry { name, source: Some(path), tokenizer: None }
+            tracing::warn!(
+                "{name} tokenizer at `{}` would not parse ({e}) — {consequence}",
+                path.display()
+            );
+            TokenizerEntry {
+                name,
+                source: Some(path),
+                tokenizer: None,
+            }
         }
     }
 }
@@ -144,7 +175,10 @@ pub(crate) fn find_tokenizer_file(cache_dir: &Path) -> Option<PathBuf> {
 /// included because they occupy the same window the content competes for.
 pub(crate) fn token_usage(state: &AppState, texts: &[String], max_length: usize) -> TokenUsage {
     let Some(tokenizer) = state.token_counter() else {
-        return TokenUsage { max_length, ..TokenUsage::default() };
+        return TokenUsage {
+            max_length,
+            ..TokenUsage::default()
+        };
     };
     usage_from_counts(count_tokens(tokenizer, texts, "embed"), max_length)
 }
@@ -156,7 +190,11 @@ pub(crate) fn token_usage(state: &AppState, texts: &[String], max_length: usize)
 /// the tokenizer refused was then reported as 0 tokens and `truncated: false` — "measured, and
 /// definitely not truncated", which is the exact inversion of the only guarantee this accounting
 /// exists to give. The host owns no tokenizer, so it has no second opinion to check that against.
-pub(crate) fn count_tokens(tokenizer: &tokenizers::Tokenizer, texts: &[String], what: &str) -> Vec<Option<usize>> {
+pub(crate) fn count_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    texts: &[String],
+    what: &str,
+) -> Vec<Option<usize>> {
     texts
         .iter()
         .map(|text| match tokenizer.encode(text.as_str(), true) {
@@ -182,7 +220,10 @@ pub(crate) fn count_tokens(tokenizer: &tokenizers::Tokenizer, texts: &[String], 
 /// field. Conservative in the right direction: the batch reads as unmeasured, never as proven clean.
 pub(crate) fn usage_from_counts(counts: Vec<Option<usize>>, max_length: usize) -> TokenUsage {
     let Some(measured) = counts.into_iter().collect::<Option<Vec<usize>>>() else {
-        return TokenUsage { max_length, ..TokenUsage::default() };
+        return TokenUsage {
+            max_length,
+            ..TokenUsage::default()
+        };
     };
     TokenUsage {
         truncated: measured.iter().map(|&n| n > max_length).collect(),
@@ -195,14 +236,8 @@ pub(crate) fn usage_from_counts(counts: Vec<Option<usize>>, max_length: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    
-    
-    
-    
+
     use crate::testing::*;
-    
 
     // ---------- token accounting ----------
     // The snapshot folder is a content hash that changes whenever the model is re-pulled, so the path
@@ -211,7 +246,10 @@ mod tests {
     #[test]
     fn the_tokenizer_is_found_by_scanning_the_snapshot_folder() {
         let root = std::env::temp_dir().join(format!("bge-tok-{}", std::process::id()));
-        let snapshot = root.join("models--BAAI--bge-m3").join("snapshots").join("deadbeef");
+        let snapshot = root
+            .join("models--BAAI--bge-m3")
+            .join("snapshots")
+            .join("deadbeef");
         std::fs::create_dir_all(&snapshot).unwrap();
         std::fs::write(snapshot.join("tokenizer.json"), b"{}").unwrap();
 
@@ -233,7 +271,9 @@ mod tests {
         let mut config = config("");
         config.cache_dir = empty.clone();
         let registry = TokenizerRegistry::load(&config);
-        let bge = registry.entry(BGE_TOKENIZER).expect("the row is declared even with no file behind it");
+        let bge = registry
+            .entry(BGE_TOKENIZER)
+            .expect("the row is declared even with no file behind it");
         assert!(bge.tokenizer.is_none(), "nothing loaded");
         assert!(bge.source.is_none(), "and there was no file to name");
         std::fs::remove_dir_all(&empty).ok();
@@ -246,9 +286,18 @@ mod tests {
     fn an_unencodable_text_is_reported_as_unknown_rather_than_zero_tokens() {
         let usage = usage_from_counts(vec![Some(10), None, Some(300)], 256);
 
-        assert!(!usage.token_accounting, "one refusal makes the whole answer UNMEASURED");
-        assert!(usage.token_count.is_empty() && usage.truncated.is_empty(), "and empties the arrays with it");
-        assert_eq!(usage.max_length, 256, "the cap they would have been judged against still travels");
+        assert!(
+            !usage.token_accounting,
+            "one refusal makes the whole answer UNMEASURED"
+        );
+        assert!(
+            usage.token_count.is_empty() && usage.truncated.is_empty(),
+            "and empties the arrays with it"
+        );
+        assert_eq!(
+            usage.max_length, 256,
+            "the cap they would have been judged against still travels"
+        );
 
         // The refuted approach, reproduced so the defect stays visible in the suite: the shipped fold was
         // `.map(|e| e.len()).unwrap_or(0)`, which reported the refused text as 0 tokens and NOT truncated —
@@ -257,7 +306,11 @@ mod tests {
             .into_iter()
             .map(|encoded| encoded.unwrap_or(0))
             .collect();
-        assert_eq!((folded[1], folded[1] > 256), (0, false), "which is exactly what it claimed");
+        assert_eq!(
+            (folded[1], folded[1] > 256),
+            (0, false),
+            "which is exactly what it claimed"
+        );
 
         // A clean batch still measures, truncation flags and all.
         let clean = usage_from_counts(vec![Some(10), Some(300)], 256);

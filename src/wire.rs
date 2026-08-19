@@ -1,9 +1,9 @@
+use crate::adapters;
+use crate::state::AppState;
+use crate::wedge::{inflight_now, EngineWedged, InFlight, WedgePolicy};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use crate::adapters;
-use crate::state::{AppState};
-use crate::wedge::{EngineWedged, InFlight, WedgePolicy, inflight_now};
 
 // ---------- wire types ----------
 
@@ -252,10 +252,15 @@ impl InFlightWire {
 /// Every engine currently held, with its verdict. Reads only the tiny stamp mutexes, never an engine
 /// lock — a probe that queued behind the wedge it is meant to report would be the defect itself.
 pub(crate) fn in_flight_now(state: &AppState) -> Vec<InFlightWire> {
-    [("embed", &state.engines.embed_inflight), ("rerank", &state.engines.rerank_inflight)]
-        .into_iter()
-        .filter_map(|(engine, slot)| inflight_now(slot).map(|holder| InFlightWire::of(engine, &holder, state.config.wedge)))
-        .collect()
+    [
+        ("embed", &state.engines.embed_inflight),
+        ("rerank", &state.engines.rerank_inflight),
+    ]
+    .into_iter()
+    .filter_map(|(engine, slot)| {
+        inflight_now(slot).map(|holder| InFlightWire::of(engine, &holder, state.config.wedge))
+    })
+    .collect()
 }
 
 #[derive(Serialize)]
@@ -358,7 +363,12 @@ pub(crate) struct ModelEntry {
 
 /// Whether a named tokenizer can count right now. `None` when the row names none.
 pub(crate) fn tokenizer_available(state: &AppState, tokenizer: Option<&str>) -> Option<bool> {
-    tokenizer.map(|name| state.tokenizers.entry(name).is_some_and(|row| row.tokenizer.is_some()))
+    tokenizer.map(|name| {
+        state
+            .tokenizers
+            .entry(name)
+            .is_some_and(|row| row.tokenizer.is_some())
+    })
 }
 
 #[derive(Serialize, Debug)]
@@ -370,7 +380,12 @@ pub(crate) type ApiError = (StatusCode, Json<ErrorResponse>);
 
 pub(crate) fn internal_error(err: anyhow::Error) -> ApiError {
     tracing::error!("request failed: {err:#}");
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("{err:#}") }))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: format!("{err:#}"),
+        }),
+    )
 }
 
 /// A caller mistake, not a sidecar failure — refused with the reason so it is fixable from the message.
@@ -384,7 +399,12 @@ pub(crate) fn bad_request(error: String) -> ApiError {
 pub(crate) fn engine_error(err: anyhow::Error) -> ApiError {
     if err.downcast_ref::<EngineWedged>().is_some() {
         tracing::warn!("refusing a request: {err:#}");
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: format!("{err:#}") }));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("{err:#}"),
+            }),
+        );
     }
     internal_error(err)
 }
@@ -407,15 +427,8 @@ pub(crate) fn join_error_text(e: tokio::task::JoinError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    
-    
-    
-    
-    
-    use crate::bookkeeping::{dense_dimension};
-    
+
+    use crate::bookkeeping::dense_dimension;
 
     /// The four field names are a WIRE contract (consumed by the benchmark's telemetry and any other
     /// HTTP caller): renaming one here silently breaks a consumer that deserializes by name.
@@ -454,11 +467,24 @@ mod tests {
             },
         };
 
-        let outer = EmbedResponse { usage: TokenUsage::default(), ..inner };
+        let outer = EmbedResponse {
+            usage: TokenUsage::default(),
+            ..inner
+        };
 
-        assert_eq!(outer.timings.inference_ms, 9, "the inner pass's timing survives the update");
-        assert_eq!(outer.request_id, "leg-7/q3", "and so does the caller's echo");
-        assert_eq!(outer.dimension, dense_dimension(&outer.dense), "and the width still describes THESE rows");
+        assert_eq!(
+            outer.timings.inference_ms, 9,
+            "the inner pass's timing survives the update"
+        );
+        assert_eq!(
+            outer.request_id, "leg-7/q3",
+            "and so does the caller's echo"
+        );
+        assert_eq!(
+            outer.dimension,
+            dense_dimension(&outer.dense),
+            "and the width still describes THESE rows"
+        );
     }
 
     /// The panic PAYLOAD is the only place the real reason survives (a failed expect deep inside

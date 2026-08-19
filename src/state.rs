@@ -1,10 +1,10 @@
-use std::sync::{Mutex, OnceLock};
-use fastembed::{Bgem3DualEmbedding, TextRerank};
 use crate::adapters;
-use crate::config::{Config};
-use crate::engine_cache::{RungCache};
-use crate::tokens::{BGE_TOKENIZER, TokenizerRegistry};
-use crate::wedge::{InFlight};
+use crate::config::Config;
+use crate::engine_cache::RungCache;
+use crate::tokens::{TokenizerRegistry, BGE_TOKENIZER};
+use crate::wedge::InFlight;
+use fastembed::{Bgem3DualEmbedding, TextRerank};
+use std::sync::{Mutex, OnceLock};
 
 /// Lazily-loaded model engines. Each is guarded by its own mutex: the GPU serializes inference
 /// anyway, and the lock makes the first-use load race-free. Loads happen inside spawn_blocking.
@@ -113,12 +113,16 @@ impl AppState {
     /// The index the DirectML EP receives: the mapped plain-enumeration index when the DXGI
     /// resolution succeeded, else the raw configured id (the pre-mapping behaviour).
     pub(crate) fn dml_device_id(&self) -> i32 {
-        self.adapter.as_ref().map_or(self.config.device_id, |a| a.dml_device_id)
+        self.adapter
+            .as_ref()
+            .map_or(self.config.device_id, |a| a.dml_device_id)
     }
 
     /// BGE-M3's counter — what `/embed`'s own truncation accounting counts with. Resolved through the
     /// registry so there is exactly ONE place in this process a tokenizer can come from.
     pub(crate) fn token_counter(&self) -> Option<&tokenizers::Tokenizer> {
-        self.tokenizers.entry(BGE_TOKENIZER).and_then(|entry| entry.tokenizer.as_ref())
+        self.tokenizers
+            .entry(BGE_TOKENIZER)
+            .and_then(|entry| entry.tokenizer.as_ref())
     }
 }

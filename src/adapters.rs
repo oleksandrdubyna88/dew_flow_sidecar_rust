@@ -43,7 +43,11 @@ pub(crate) struct AdapterDesc {
 /// plain-enumeration index the legacy DirectML EP consumes. Pure so the ordering contract is
 /// testable without DXGI. The plain list stays unfiltered: the EP counts software entries too.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn map_device(hp: &[AdapterDesc], plain: &[AdapterDesc], device: usize) -> Option<(usize, AdapterDesc)> {
+pub(crate) fn map_device(
+    hp: &[AdapterDesc],
+    plain: &[AdapterDesc],
+    device: usize,
+) -> Option<(usize, AdapterDesc)> {
     let target = hp.iter().filter(|a| !a.software).nth(device)?;
     let dml_index = plain.iter().position(|p| p.luid == target.luid)?;
     Some((dml_index, target.clone()))
@@ -78,8 +82,8 @@ pub fn resolve(_device_id: i32) -> Option<ResolvedAdapter> {
 mod dxgi {
     use super::AdapterDesc;
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND,
-        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IDXGIAdapter1, IDXGIFactory6,
+        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
+        DXGI_ERROR_NOT_FOUND, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
     };
 
     /// Hardware-and-software adapters in "fastest first" order (the picker's numbering source).
@@ -93,12 +97,17 @@ mod dxgi {
     /// The same adapters in plain enumeration order — the numbering the legacy DirectML EP indexes.
     pub fn enumerate_plain() -> Option<Vec<AdapterDesc>> {
         let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory1() }.ok()?;
-        enumerate("EnumAdapters1", |index| unsafe { factory.EnumAdapters1(index) })
+        enumerate("EnumAdapters1", |index| unsafe {
+            factory.EnumAdapters1(index)
+        })
     }
 
     /// Shared walk: indices until DXGI_ERROR_NOT_FOUND ends the list; any other failure (or an
     /// undescribable adapter) yields None so the caller falls back to the raw device id.
-    fn enumerate(method: &str, get: impl Fn(u32) -> windows::core::Result<IDXGIAdapter1>) -> Option<Vec<AdapterDesc>> {
+    fn enumerate(
+        method: &str,
+        get: impl Fn(u32) -> windows::core::Result<IDXGIAdapter1>,
+    ) -> Option<Vec<AdapterDesc>> {
         let mut adapters = Vec::new();
         for index in 0..64u32 {
             let adapter = match get(index) {
@@ -116,7 +125,11 @@ mod dxgi {
 
     fn describe(adapter: &IDXGIAdapter1) -> Option<AdapterDesc> {
         let desc = unsafe { adapter.GetDesc1() }.ok()?;
-        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        let len = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
         Some(AdapterDesc {
             luid: ((desc.AdapterLuid.HighPart as i64) << 32) | (desc.AdapterLuid.LowPart as i64),
             name: String::from_utf16_lossy(&desc.Description[..len]),
@@ -131,7 +144,12 @@ mod tests {
     use super::{map_device, AdapterDesc};
 
     fn adapter(luid: i64, name: &str, software: bool) -> AdapterDesc {
-        AdapterDesc { luid, name: name.into(), vram_mb: 0, software }
+        AdapterDesc {
+            luid,
+            name: name.into(),
+            vram_mb: 0,
+            software,
+        }
     }
 
     /// The reported defect: plain order lists the iGPU first (it drives the display), the
@@ -139,8 +157,14 @@ mod tests {
     /// PLAIN index, not on plain index 0.
     #[test]
     fn device_zero_maps_to_the_fastest_card_even_when_it_enumerates_second() {
-        let hp = [adapter(2, "Discrete", false), adapter(1, "Integrated", false)];
-        let plain = [adapter(1, "Integrated", false), adapter(2, "Discrete", false)];
+        let hp = [
+            adapter(2, "Discrete", false),
+            adapter(1, "Integrated", false),
+        ];
+        let plain = [
+            adapter(1, "Integrated", false),
+            adapter(2, "Discrete", false),
+        ];
 
         let (dml, chosen) = map_device(&hp, &plain, 0).expect("device 0 must resolve");
         assert_eq!(dml, 1);
@@ -155,8 +179,14 @@ mod tests {
     /// numbering, but they DO occupy an index in the plain order the DirectML EP counts.
     #[test]
     fn software_adapter_is_skipped_in_device_numbering_but_counted_in_plain_order() {
-        let hp = [adapter(9, "Basic Render", true), adapter(2, "Discrete", false)];
-        let plain = [adapter(9, "Basic Render", true), adapter(2, "Discrete", false)];
+        let hp = [
+            adapter(9, "Basic Render", true),
+            adapter(2, "Discrete", false),
+        ];
+        let plain = [
+            adapter(9, "Basic Render", true),
+            adapter(2, "Discrete", false),
+        ];
 
         let (dml, chosen) = map_device(&hp, &plain, 0).expect("device 0 must resolve");
         assert_eq!(dml, 1);

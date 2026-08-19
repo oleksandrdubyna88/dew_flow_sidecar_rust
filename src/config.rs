@@ -1,5 +1,5 @@
+use crate::wedge::WedgePolicy;
 use std::path::PathBuf;
-use crate::wedge::{WedgePolicy};
 
 pub(crate) const DENSE_MODEL: &str = "BAAI/bge-m3 (dense, FP32)";
 pub(crate) const SPARSE_MODEL: &str = "BAAI/bge-m3 (learned sparse, FP32)";
@@ -76,7 +76,10 @@ impl Config {
             cache_dir: PathBuf::from(env_str("MODEL_CACHE_DIR", ".model-cache")),
             // Beside this tool by default (tools/qwen-tokenizer/), because it belongs to the SEMANTIC
             // channel rather than to any model this sidecar loads — it is here only to be counted with.
-            qwen_tokenizer_path: PathBuf::from(env_str("QWEN_TOKENIZER", "../qwen-tokenizer/tokenizer.json")),
+            qwen_tokenizer_path: PathBuf::from(env_str(
+                "QWEN_TOKENIZER",
+                "../qwen-tokenizer/tokenizer.json",
+            )),
             // 4096 — eight times the host's own per-request row budget (`SidecarClient.RequestRowBudget`
             // = 512, dew_flow_rag_qln), so this is a backstop against a pathological caller and never a
             // wall a normal pass walks into. A cap at the host's number would refuse batches its only
@@ -99,29 +102,31 @@ impl Config {
 }
 
 pub(crate) fn env_str(key: &str, default: &str) -> String {
-    std::env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub(crate) fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// An opt-in switch, spelled the way every other boolean knob here is (`PIN_INPUT_SHAPE`). Absent
 /// or unrecognised means OFF — a switch whose default is "maybe" is not a switch.
 pub(crate) fn env_truthy(key: &str) -> bool {
-    matches!(env_str(key, "").trim().to_lowercase().as_str(), "1" | "true" | "on" | "yes")
+    matches!(
+        env_str(key, "").trim().to_lowercase().as_str(),
+        "1" | "true" | "on" | "yes"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    
-    
-    
-    
-    
 
     /// The cap has to clear the host's own ceiling with room to spare, or the sidecar refuses batches its
     /// only caller assembles by design (`SidecarClient.RequestRowBudget` = 512, dew_flow_rag_qln).

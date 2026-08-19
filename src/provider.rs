@@ -1,12 +1,17 @@
+use crate::compile_cache::{CachePathLease, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
+use crate::config::{Config, DUAL_MODEL, RERANK_MODEL};
+use crate::state::AppState;
+use crate::wire::join_error_text;
+use fastembed::{
+    Bgem3DualEmbedding, Bgem3DualInitOptions, RerankInitOptions, RerankerModel, TextRerank,
+};
+use ort::execution_providers::{
+    CUDAExecutionProvider, DirectMLExecutionProvider, ExecutionProviderDispatch,
+    MIGraphXExecutionProvider,
+};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
-use fastembed::{Bgem3DualEmbedding, Bgem3DualInitOptions, RerankInitOptions, RerankerModel, TextRerank};
-use ort::execution_providers::{ CUDAExecutionProvider, DirectMLExecutionProvider, ExecutionProviderDispatch, MIGraphXExecutionProvider, };
-use crate::config::{Config, DUAL_MODEL, RERANK_MODEL};
-use crate::compile_cache::{CachePathLease, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
-use crate::state::{AppState};
-use crate::wire::{join_error_text};
 
 /// Builds the ONE session both heads share. Its compiled-model cache slice is `dual/` — its own,
 /// never `dense/` or `sparse/`: a cache hit must always mean "MY program" (the 2026-07-27 stale-cache
@@ -69,7 +74,11 @@ where
 {
     let options = options
         .cache_dir(state.config.cache_dir.clone())
-        .providers(execution_providers(provider, state.config.device_id, state.dml_device_id()));
+        .providers(execution_providers(
+            provider,
+            state.config.device_id,
+            state.dml_device_id(),
+        ));
     match state.config.intra_threads {
         0 => options,
         threads => options.threads(threads),
@@ -115,26 +124,47 @@ pub(crate) fn load_dual(
     max_length: usize,
     cache: &CachePathLease,
 ) -> anyhow::Result<Bgem3DualEmbedding> {
-    load_session(state, provider_hint, DUAL_MODEL, EMBED_CACHE_ENGINE, cache, |provider| {
-        tracing::info!("loading {DUAL_MODEL} (provider {provider}, max_length {max_length})");
-        Bgem3DualEmbedding::try_new(shared_options(
-            state,
-            provider,
-            Bgem3DualInitOptions::default().with_max_length(max_length),
-        ))
-    })
+    load_session(
+        state,
+        provider_hint,
+        DUAL_MODEL,
+        EMBED_CACHE_ENGINE,
+        cache,
+        |provider| {
+            tracing::info!("loading {DUAL_MODEL} (provider {provider}, max_length {max_length})");
+            Bgem3DualEmbedding::try_new(shared_options(
+                state,
+                provider,
+                Bgem3DualInitOptions::default().with_max_length(max_length),
+            ))
+        },
+    )
 }
 
-pub(crate) fn load_rerank(state: &AppState, provider_hint: &str, cache: &CachePathLease) -> anyhow::Result<TextRerank> {
-    load_session(state, provider_hint, RERANK_MODEL, RERANK_CACHE_ENGINE, cache, |provider| {
-        tracing::info!("loading {RERANK_MODEL} (provider {provider}, max_length {})", state.config.rerank_max_length);
-        TextRerank::try_new(shared_options(
-            state,
-            provider,
-            RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
-                .with_max_length(state.config.rerank_max_length),
-        ))
-    })
+pub(crate) fn load_rerank(
+    state: &AppState,
+    provider_hint: &str,
+    cache: &CachePathLease,
+) -> anyhow::Result<TextRerank> {
+    load_session(
+        state,
+        provider_hint,
+        RERANK_MODEL,
+        RERANK_CACHE_ENGINE,
+        cache,
+        |provider| {
+            tracing::info!(
+                "loading {RERANK_MODEL} (provider {provider}, max_length {})",
+                state.config.rerank_max_length
+            );
+            TextRerank::try_new(shared_options(
+                state,
+                provider,
+                RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
+                    .with_max_length(state.config.rerank_max_length),
+            ))
+        },
+    )
 }
 
 /// The provider all engines pin to: ORT_PROVIDER env wins, else the first request's hint, else auto.
@@ -142,7 +172,10 @@ pub(crate) fn load_rerank(state: &AppState, provider_hint: &str, cache: &CachePa
 /// <para>This is the REQUEST. It says nothing about whether a session can be built on it — that is
 /// `AppState::active_provider`, written only after one succeeds.</para>
 pub(crate) fn pin_provider(state: &AppState, hint: &str) -> String {
-    state.pinned_provider.get_or_init(|| effective_provider(&state.config, hint)).clone()
+    state
+        .pinned_provider
+        .get_or_init(|| effective_provider(&state.config, hint))
+        .clone()
 }
 
 /// The execution providers compiled into THIS binary flavor. Derived from the cargo features rather
@@ -168,7 +201,10 @@ pub(crate) fn compiled_providers() -> Vec<&'static str> {
 /// inference with `Error 126`, minutes into a user's search rather than at startup.
 pub(crate) fn required_provider_libraries(provider: &str) -> &'static [&'static str] {
     match provider {
-        "cuda" => &["onnxruntime_providers_shared.dll", "onnxruntime_providers_cuda.dll"],
+        "cuda" => &[
+            "onnxruntime_providers_shared.dll",
+            "onnxruntime_providers_cuda.dll",
+        ],
         _ => &[],
     }
 }
@@ -227,7 +263,13 @@ pub(crate) fn sha256_file(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = sha2::Sha256::new();
     std::io::copy(&mut file, &mut hasher).ok()?;
-    Some(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 /// Build provenance: what binary is answering, and which provider libraries stand behind it.
@@ -243,7 +285,10 @@ pub(crate) static PROVENANCE: OnceLock<Provenance> = OnceLock::new();
 /// Hashes the executable and the libraries beside it. Blocking and unbounded by design: on a
 /// CUDA/DirectML deployment this is hundreds of MB to gigabytes (cuDNN alone is often >500 MB).
 pub(crate) fn compute_provenance() -> Provenance {
-    Provenance { exe_sha256: compute_exe_sha256(), runtime_manifest_sha256: compute_runtime_manifest_sha256() }
+    Provenance {
+        exe_sha256: compute_exe_sha256(),
+        runtime_manifest_sha256: compute_runtime_manifest_sha256(),
+    }
 }
 
 /// Starts the hashing off the request path.
@@ -316,7 +361,9 @@ pub(crate) fn compute_runtime_manifest_sha256() -> String {
         .filter(|path| {
             path.extension()
                 .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("dll") || ext.eq_ignore_ascii_case("so"))
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("dll") || ext.eq_ignore_ascii_case("so")
+                })
         })
         .filter_map(|path| {
             let name = path.file_name()?.to_str()?.to_ascii_lowercase();
@@ -342,7 +389,11 @@ pub(crate) fn compute_runtime_manifest_sha256() -> String {
 /// Records the OUTCOME of a session build. Success promotes the provider to `active`; failure stores
 /// the reason and leaves `active` untouched, so `provider_ready` can never be true on a provider that
 /// has not actually served anything.
-pub(crate) fn record_session_outcome<T>(state: &AppState, provider: &str, built: anyhow::Result<T>) -> anyhow::Result<T> {
+pub(crate) fn record_session_outcome<T>(
+    state: &AppState,
+    provider: &str,
+    built: anyhow::Result<T>,
+) -> anyhow::Result<T> {
     match built {
         Ok(engine) => {
             if let Ok(mut active) = state.active_provider.lock() {
@@ -363,7 +414,11 @@ pub(crate) fn record_session_outcome<T>(state: &AppState, provider: &str, built:
 }
 
 pub(crate) fn effective_provider(config: &Config, hint: &str) -> String {
-    let value = if config.provider.is_empty() { hint } else { &config.provider };
+    let value = if config.provider.is_empty() {
+        hint
+    } else {
+        &config.provider
+    };
     match value.trim().to_lowercase().as_str() {
         p @ ("cuda" | "dml" | "migraphx" | "cpu") => p.to_string(),
         _ => "auto".to_string(),
@@ -376,7 +431,11 @@ pub(crate) fn effective_provider(config: &Config, hint: &str) -> String {
 /// configured id (their own numbering — HIP device order for MIGraphX, so pin the discrete card
 /// with HIP_VISIBLE_DEVICES when an iGPU is present); DirectML gets the DXGI-mapped
 /// plain-enumeration index (see adapters.rs).
-pub(crate) fn execution_providers(provider: &str, cuda_device_id: i32, dml_device_id: i32) -> Vec<ExecutionProviderDispatch> {
+pub(crate) fn execution_providers(
+    provider: &str,
+    cuda_device_id: i32,
+    dml_device_id: i32,
+) -> Vec<ExecutionProviderDispatch> {
     let cuda = CUDAExecutionProvider::default().with_device_id(cuda_device_id);
     let dml = DirectMLExecutionProvider::default().with_device_id(dml_device_id);
     let migraphx = MIGraphXExecutionProvider::default().with_device_id(cuda_device_id);
@@ -396,7 +455,6 @@ mod tests {
     use std::sync::OnceLock;
 
     use crate::testing::*;
-    
 
     /// ORT_PROVIDER wins over the request hint; every supported token round-trips; unknown tokens
     /// (including the retired "rocm") degrade to auto instead of failing the load.
@@ -428,7 +486,10 @@ mod tests {
     #[test]
     fn compiled_providers_always_include_cpu_and_match_the_build_flavor() {
         let compiled = compiled_providers();
-        assert!(compiled.contains(&"cpu"), "ort falls through to CPU, so it is always available");
+        assert!(
+            compiled.contains(&"cpu"),
+            "ort falls through to CPU, so it is always available"
+        );
         assert_eq!(compiled.contains(&"cuda"), cfg!(feature = "cuda"));
         assert_eq!(compiled.contains(&"dml"), cfg!(feature = "dml"));
         assert_eq!(compiled.contains(&"migraphx"), cfg!(feature = "migraphx"));
@@ -448,7 +509,10 @@ mod tests {
             .expect_err("an EP absent from the binary must be refused");
         let text = format!("{error:#}");
         assert!(text.contains("built without it"), "{text}");
-        assert!(text.contains("--features"), "the message must say how to fix it: {text}");
+        assert!(
+            text.contains("--features"),
+            "the message must say how to fix it: {text}"
+        );
     }
 
     #[test]
@@ -463,7 +527,10 @@ mod tests {
             .expect_err("CUDA without its provider DLLs beside the exe cannot serve anything");
         let text = format!("{error:#}");
         assert!(text.contains("onnxruntime_providers_shared.dll"), "{text}");
-        assert!(text.contains("EXECUTABLE'S directory"), "PATH is not where ORT looks: {text}");
+        assert!(
+            text.contains("EXECUTABLE'S directory"),
+            "PATH is not where ORT looks: {text}"
+        );
 
         std::fs::remove_dir_all(&empty).ok();
     }
@@ -479,7 +546,10 @@ mod tests {
     fn cuda_declares_exactly_the_two_provider_libraries_ort_resolves_beside_the_exe() {
         assert_eq!(
             required_provider_libraries("cuda"),
-            ["onnxruntime_providers_shared.dll", "onnxruntime_providers_cuda.dll"]
+            [
+                "onnxruntime_providers_shared.dll",
+                "onnxruntime_providers_cuda.dll"
+            ]
         );
         // `..._shared.dll` is the one the live failure named (Error 126) — dropping it from the
         // package is the exact mistake this list exists to prevent.
@@ -503,9 +573,18 @@ mod tests {
         };
 
         let text = format!("{error:#}");
-        assert!(text.contains(EMBED_CACHE_ENGINE), "names the session being built: {text}");
-        assert!(text.contains(RERANK_CACHE_ENGINE), "and the claim actually held: {text}");
-        assert!(state.pinned_provider.get().is_none(), "and refused before pinning a provider");
+        assert!(
+            text.contains(EMBED_CACHE_ENGINE),
+            "names the session being built: {text}"
+        );
+        assert!(
+            text.contains(RERANK_CACHE_ENGINE),
+            "and the claim actually held: {text}"
+        );
+        assert!(
+            state.pinned_provider.get().is_none(),
+            "and refused before pinning a provider"
+        );
     }
 
     /// The provenance READER never computes — that is the whole fix. A local cell, so the assertion is
@@ -516,9 +595,12 @@ mod tests {
 
         assert!(cell.get().is_none(), "a fresh cell holds nothing");
 
-        cell.set(Provenance { exe_sha256: "abc".to_string(), runtime_manifest_sha256: "def".to_string() })
-            .map_err(|_| "already set")
-            .expect("the startup task sets it once");
+        cell.set(Provenance {
+            exe_sha256: "abc".to_string(),
+            runtime_manifest_sha256: "def".to_string(),
+        })
+        .map_err(|_| "already set")
+        .expect("the startup task sets it once");
         assert_eq!(cell.get().map(|p| p.exe_sha256.as_str()), Some("abc"));
     }
 }

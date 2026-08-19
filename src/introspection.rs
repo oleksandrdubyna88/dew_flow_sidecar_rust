@@ -1,17 +1,20 @@
-use std::sync::{Arc, Mutex};
+use crate::config::{DENSE_MODEL, DUAL_MODEL, RERANK_MODEL, SPARSE_MODEL};
+use crate::engine_cache::EngineSlot;
+use crate::inference::lock_or_refuse;
+use crate::provider::{compiled_providers, effective_provider, PROVENANCE};
+use crate::state::AppState;
+use crate::tokens::BGE_TOKENIZER;
+use crate::wedge::Patience;
+use crate::wire::{
+    in_flight_now, join_error_text, tokenizer_available, HealthResponse, LimitsWire, LoadedModels,
+    ModelEntry, ModelNames, ModelsResponse, KIND_DENSE_SPARSE, KIND_RERANK, KIND_TOKENIZER_ONLY,
+};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::Json;
 use fastembed::Bgem3DualEmbedding;
 use serde::Deserialize;
-use crate::config::{DENSE_MODEL, DUAL_MODEL, RERANK_MODEL, SPARSE_MODEL};
-use crate::engine_cache::{EngineSlot};
-use crate::inference::lock_or_refuse;
-use crate::provider::{PROVENANCE, compiled_providers, effective_provider};
-use crate::state::AppState;
-use crate::tokens::BGE_TOKENIZER;
-use crate::wedge::{Patience};
-use crate::wire::{HealthResponse, KIND_DENSE_SPARSE, KIND_RERANK, KIND_TOKENIZER_ONLY, LimitsWire, LoadedModels, ModelEntry, ModelNames, ModelsResponse, in_flight_now, join_error_text, tokenizer_available};
+use std::sync::{Arc, Mutex};
 
 pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let requested = state
@@ -21,8 +24,16 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
         .unwrap_or_else(|| effective_provider(&state.config, ""));
     // try_lock, never lock: /health must not queue behind a multi-minute engine build — the same rule
     // `loaded_now` follows. A busy lock reads as "unknown yet", which is honest.
-    let active = state.active_provider.try_lock().ok().and_then(|a| a.clone());
-    let last_error = state.last_provider_error.try_lock().ok().and_then(|e| e.clone());
+    let active = state
+        .active_provider
+        .try_lock()
+        .ok()
+        .and_then(|a| a.clone());
+    let last_error = state
+        .last_provider_error
+        .try_lock()
+        .ok()
+        .and_then(|e| e.clone());
     let in_flight = in_flight_now(&state);
     let wedged = in_flight.iter().any(|held| held.wedged);
     // Read, never compute: the hashes are prewarmed on the blocking pool at startup. This endpoint is
@@ -33,7 +44,11 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
     let embed_batch = crate::inference::embed_batch_texts(&state.config, &requested);
     Json(HealthResponse {
         status: if wedged { "wedged" } else { "ok" },
-        activity: state.activity.try_lock().map(|a| a.clone()).unwrap_or_else(|_| "busy".to_string()),
+        activity: state
+            .activity
+            .try_lock()
+            .map(|a| a.clone())
+            .unwrap_or_else(|_| "busy".to_string()),
         provider: active.clone().unwrap_or_else(|| requested.clone()),
         requested_provider: requested,
         compiled_providers: compiled_providers(),
@@ -41,7 +56,9 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
         active_provider: active,
         last_provider_error: last_error,
         exe_sha256: provenance.map(|p| p.exe_sha256.clone()).unwrap_or_default(),
-        runtime_manifest_sha256: provenance.map(|p| p.runtime_manifest_sha256.clone()).unwrap_or_default(),
+        runtime_manifest_sha256: provenance
+            .map(|p| p.runtime_manifest_sha256.clone())
+            .unwrap_or_default(),
         provenance_ready: provenance.is_some(),
         in_flight,
         wedged,
@@ -52,15 +69,28 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
             sparse: loaded_now(&state.engines.embed),
             rerank: loaded_now(&state.engines.rerank),
         },
-        models: ModelNames { dense: DENSE_MODEL, sparse: SPARSE_MODEL, rerank: RERANK_MODEL },
+        models: ModelNames {
+            dense: DENSE_MODEL,
+            sparse: SPARSE_MODEL,
+            rerank: RERANK_MODEL,
+        },
         limits: LimitsWire {
             embed_max_length: state.config.embed_max_length,
             max_batch: state.config.max_batch,
             embed_batch_texts: embed_batch,
             rerank_max_length: state.config.rerank_max_length,
-            loaded_embed_max_length: state.loaded_embed_max_length.try_lock().ok().and_then(|g| *g),
+            loaded_embed_max_length: state
+                .loaded_embed_max_length
+                .try_lock()
+                .ok()
+                .and_then(|g| *g),
             loaded_max_batch: state.loaded_max_batch.try_lock().ok().and_then(|g| *g),
-            resident_embed_max_lengths: state.engines.embed.try_lock().map(|g| g.caps()).unwrap_or_default(),
+            resident_embed_max_lengths: state
+                .engines
+                .embed
+                .try_lock()
+                .map(|g| g.caps())
+                .unwrap_or_default(),
             max_body_bytes: state.config.max_body_bytes,
             tokenize_max_texts: state.config.tokenize_max_texts,
         },
@@ -75,7 +105,9 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
 /// mismatch in the middle of one. Every fact here is read from what is loaded or configured; nothing is
 /// a constant a second repository would have to keep in step.
 pub(crate) async fn models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
-    Json(ModelsResponse { models: models_now(&state) })
+    Json(ModelsResponse {
+        models: models_now(&state),
+    })
 }
 
 pub(crate) fn models_now(state: &AppState) -> Vec<ModelEntry> {
@@ -84,7 +116,11 @@ pub(crate) fn models_now(state: &AppState) -> Vec<ModelEntry> {
             id: "bge-m3",
             name: DUAL_MODEL,
             kind: KIND_DENSE_SPARSE,
-            dimension: state.loaded_embed_dimension.try_lock().ok().and_then(|d| *d),
+            dimension: state
+                .loaded_embed_dimension
+                .try_lock()
+                .ok()
+                .and_then(|d| *d),
             // What a pass would run at: the resident rung when there is one, else the configured
             // default. The same resolution the host already performs over /health, moved to the side
             // that owns the fact.
@@ -116,20 +152,25 @@ pub(crate) fn models_now(state: &AppState) -> Vec<ModelEntry> {
     // Then every registered tokenizer that no served model already claimed — which is precisely the
     // `tokenizer-only` set, derived rather than listed so it cannot drift from the registry.
     let claimed: Vec<&str> = served.iter().filter_map(|model| model.tokenizer).collect();
-    let counting = state.tokenizers.entries.iter().filter(|entry| !claimed.contains(&entry.name)).map(|entry| {
-        ModelEntry {
-            id: entry.name,
-            name: entry.name,
-            kind: KIND_TOKENIZER_ONLY,
-            dimension: None,
-            max_sequence_length: None,
-            tokenizer: Some(entry.name),
-            // On a tokenizer-only row the two are the same fact, which is the consistency the split
-            // buys: a reader never has to know which kind of row it is holding to read either flag.
-            available: entry.tokenizer.is_some(),
-            tokenizer_available: Some(entry.tokenizer.is_some()),
-        }
-    });
+    let counting = state
+        .tokenizers
+        .entries
+        .iter()
+        .filter(|entry| !claimed.contains(&entry.name))
+        .map(|entry| {
+            ModelEntry {
+                id: entry.name,
+                name: entry.name,
+                kind: KIND_TOKENIZER_ONLY,
+                dimension: None,
+                max_sequence_length: None,
+                tokenizer: Some(entry.name),
+                // On a tokenizer-only row the two are the same fact, which is the consistency the split
+                // buys: a reader never has to know which kind of row it is holding to read either flag.
+                available: entry.tokenizer.is_some(),
+                tokenizer_available: Some(entry.tokenizer.is_some()),
+            }
+        });
 
     served.into_iter().chain(counting).collect()
 }
@@ -186,7 +227,10 @@ pub(crate) fn parse_unload_request(body: &[u8]) -> Option<UnloadRequest> {
 /// is needed: the next /embed or /rerank lazily re-creates the engines through the same first-use
 /// path, on the provider already pinned in `active_provider`. Responds with the same shape as
 /// /health so the caller can assert what is (still) loaded.
-pub(crate) async fn unload(State(state): State<Arc<AppState>>, body: Bytes) -> Json<HealthResponse> {
+pub(crate) async fn unload(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Json<HealthResponse> {
     let Some(req) = parse_unload_request(&body) else {
         return health(State(state)).await;
     };
@@ -206,10 +250,17 @@ pub(crate) async fn unload(State(state): State<Arc<AppState>>, body: Bytes) -> J
             Drained::default()
         });
 
-    let resident: Vec<usize> = state.engines.embed.try_lock().map(|g| g.caps()).unwrap_or_default();
+    let resident: Vec<usize> = state
+        .engines
+        .embed
+        .try_lock()
+        .map(|g| g.caps())
+        .unwrap_or_default();
     tracing::info!(
         "unloaded engines (embed rung(s) {:?}, rerank: {}) — resident rung(s) now: {:?}",
-        drained.embed_rungs, drained.rerank, resident
+        drained.embed_rungs,
+        drained.rerank,
+        resident
     );
     if !drained.refused.is_empty() {
         // Loud, because a PARTIAL handover read as a complete one is how an exclusive LLM ends up
@@ -249,12 +300,21 @@ pub(crate) fn drain_engines(state: &AppState, req: &UnloadRequest) -> Drained {
     // EVERY resident rung goes on a full drain, not just the current one — a rung left behind would keep
     // holding the card the lease is handing to an exclusive LLM.
     if req.is_full_drain() || !req.embed_max_lengths.is_empty() {
-        match lock_or_refuse(&state.engines.embed, &state.engines.embed_inflight, "embed", policy, patience) {
+        match lock_or_refuse(
+            &state.engines.embed,
+            &state.engines.embed_inflight,
+            "embed",
+            policy,
+            patience,
+        ) {
             Ok(mut guard) => {
                 let taken: Vec<(usize, Bgem3DualEmbedding)> = if req.is_full_drain() {
                     guard.drain()
                 } else {
-                    req.embed_max_lengths.iter().filter_map(|&cap| guard.remove(cap).map(|e| (cap, e))).collect()
+                    req.embed_max_lengths
+                        .iter()
+                        .filter_map(|&cap| guard.remove(cap).map(|e| (cap, e)))
+                        .collect()
                 };
                 drop(guard);
                 drained.embed_rungs = taken.iter().map(|(cap, _)| *cap).collect();
@@ -268,7 +328,13 @@ pub(crate) fn drain_engines(state: &AppState, req: &UnloadRequest) -> Drained {
     }
 
     if req.is_full_drain() || req.rerank == Some(true) {
-        match lock_or_refuse(&state.engines.rerank, &state.engines.rerank_inflight, "rerank", policy, patience) {
+        match lock_or_refuse(
+            &state.engines.rerank,
+            &state.engines.rerank_inflight,
+            "rerank",
+            policy,
+            patience,
+        ) {
             Ok(mut guard) => {
                 let taken = guard.take();
                 drop(guard);
@@ -288,15 +354,15 @@ pub(crate) fn drain_engines(state: &AppState, req: &UnloadRequest) -> Drained {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bookkeeping::{dense_dimension, record_embed_dimension};
+    use crate::engine_cache::RungCache;
+    use crate::testing::*;
+    use crate::tokens::BGE_TOKENIZER;
+    use crate::wedge::{write_inflight, Phase};
+    use axum::extract::State;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
-    use axum::extract::State;
-    use crate::testing::*;
-    use crate::bookkeeping::{dense_dimension, record_embed_dimension};
-    use crate::engine_cache::{RungCache};
-    use crate::tokens::{BGE_TOKENIZER};
-    use crate::wedge::{Phase, write_inflight};
-    
+
     /// /unload hands the whole card to an exclusive local LLM. A rung left behind would keep holding VRAM
     /// while the host believes the sidecar released it — and the host asserts on `loaded: {false,…}`.
     #[test]
@@ -306,7 +372,10 @@ mod tests {
         let drained = cache.drain();
 
         assert_eq!(drained.len(), 2, "both rungs come out");
-        assert!(cache.caps().is_empty() && !loaded_now(&Mutex::new(cache)), "and /health reports nothing loaded");
+        assert!(
+            cache.caps().is_empty() && !loaded_now(&Mutex::new(cache)),
+            "and /health reports nothing loaded"
+        );
     }
 
     /// /health must never queue behind the engine mutex: a lock held by a (possibly hung) model
@@ -322,7 +391,10 @@ mod tests {
         assert!(loaded_now(&slot), "loaded and unlocked reports loaded");
 
         let held = slot.lock().expect("fresh lock");
-        assert!(loaded_now(&slot), "held lock reports busy-as-present, without blocking");
+        assert!(
+            loaded_now(&slot),
+            "held lock reports busy-as-present, without blocking"
+        );
         drop(held);
 
         // The same guarantee for the rung-keyed slots: the cache changed WHICH engine the guard hands
@@ -331,10 +403,16 @@ mod tests {
         assert!(!loaded_now(&cache), "an empty cache reports not loaded");
 
         cache.lock().expect("fresh lock").insert(256, 1);
-        assert!(loaded_now(&cache), "one resident rung is enough to report loaded");
+        assert!(
+            loaded_now(&cache),
+            "one resident rung is enough to report loaded"
+        );
 
         let held_cache = cache.lock().expect("fresh lock");
-        assert!(loaded_now(&cache), "a cache held by a load or a pass reports busy-as-present");
+        assert!(
+            loaded_now(&cache),
+            "a cache held by a load or a pass reports busy-as-present"
+        );
         drop(held_cache);
     }
 
@@ -353,9 +431,16 @@ mod tests {
         assert_eq!(scoped.rerank, Some(true));
 
         let rerank_only = parse_unload_request(br#"{"rerank":true}"#).expect("rerank-only parses");
-        assert!(!rerank_only.is_full_drain(), "naming the reranker alone must not drain the rungs");
+        assert!(
+            !rerank_only.is_full_drain(),
+            "naming the reranker alone must not drain the rungs"
+        );
 
-        assert_eq!(parse_unload_request(b"{not json"), None, "malformed drops NOTHING");
+        assert_eq!(
+            parse_unload_request(b"{not json"),
+            None,
+            "malformed drops NOTHING"
+        );
     }
 
     // ---------- 24/7 reliability: no unbounded wait, no blind probe (2026-08-16) --------------
@@ -380,7 +465,10 @@ mod tests {
         let body = answered
             .expect("/unload must answer while the engine is held, never queue on it")
             .expect("the unload task must not panic");
-        assert!(body.0.loaded.dense, "and it must answer HONESTLY: an engine it could not take is still loaded");
+        assert!(
+            body.0.loaded.dense,
+            "and it must answer HONESTLY: an engine it could not take is still loaded"
+        );
     }
 
     /// A thread STUCK inside the ORT/MIGraphX C++ call never panics, so the poison healing can never
@@ -396,27 +484,51 @@ mod tests {
         // ceilings are chosen around, and the one a naive watchdog would have called a hang.
         write_inflight(
             &state.engines.embed_inflight,
-            Some(stamped(Phase::Building, "embed: building and canary-checking the session", Duration::from_millis(50))),
+            Some(stamped(
+                Phase::Building,
+                "embed: building and canary-checking the session",
+                Duration::from_millis(50),
+            )),
         );
         let building = health(State(state.clone())).await.0;
-        assert_eq!(building.status, "ok", "a build inside its ceiling is slow but alive");
+        assert_eq!(
+            building.status, "ok",
+            "a build inside its ceiling is slow but alive"
+        );
         assert!(!building.wedged && !building.in_flight[0].wedged);
 
         // The same phase, past its ceiling.
         write_inflight(
             &state.engines.embed_inflight,
-            Some(stamped(Phase::Building, "embed: building and canary-checking the session", Duration::from_secs(9))),
+            Some(stamped(
+                Phase::Building,
+                "embed: building and canary-checking the session",
+                Duration::from_secs(9),
+            )),
         );
         let wedged = health(State(state)).await.0;
 
-        assert_ne!(wedged.status, idle.status, "a wedged engine must not answer /health exactly as an idle one");
+        assert_ne!(
+            wedged.status, idle.status,
+            "a wedged engine must not answer /health exactly as an idle one"
+        );
         assert_eq!(wedged.status, "wedged");
         assert!(wedged.wedged, "the one boolean a host can route on");
         assert_eq!(wedged.in_flight[0].engine, "embed");
         assert_eq!(wedged.in_flight[0].phase, "building");
-        assert!(wedged.in_flight[0].activity.contains("canary-checking"), "the operator sees WHAT is stuck");
-        assert!(wedged.in_flight[0].elapsed_seconds >= 9, "and for how long: {:?}", wedged.in_flight[0].elapsed_seconds);
-        assert!(idle.in_flight.is_empty(), "an idle sidecar reports nothing in flight");
+        assert!(
+            wedged.in_flight[0].activity.contains("canary-checking"),
+            "the operator sees WHAT is stuck"
+        );
+        assert!(
+            wedged.in_flight[0].elapsed_seconds >= 9,
+            "and for how long: {:?}",
+            wedged.in_flight[0].elapsed_seconds
+        );
+        assert!(
+            idle.in_flight.is_empty(),
+            "an idle sidecar reports nothing in flight"
+        );
     }
 
     /// /health is a readiness probe: it must do ZERO blocking work inline. The first call used to
@@ -435,8 +547,14 @@ mod tests {
             "the first /health took {elapsed:?} — it hashed the executable and every library beside it on the probe path"
         );
         // Nothing prewarmed it in a test process, so the honest answer is "not yet", never a made-up hash.
-        assert!(!answer.provenance_ready, "an unhashed provenance says so instead of pretending");
-        assert!(answer.exe_sha256.is_empty(), "and leaves the field empty rather than inventing a value");
+        assert!(
+            !answer.provenance_ready,
+            "an unhashed provenance says so instead of pretending"
+        );
+        assert!(
+            answer.exe_sha256.is_empty(),
+            "and leaves the field empty rather than inventing a value"
+        );
     }
 
     /// The cap is on `/health` because a limit a client cannot read is a limit it will guess at. The host
@@ -449,7 +567,10 @@ mod tests {
 
         let reported = health(State(state.clone())).await.limits.max_body_bytes;
 
-        assert_eq!(reported, state.config.max_body_bytes, "what /health says is what the router enforces");
+        assert_eq!(
+            reported, state.config.max_body_bytes,
+            "what /health says is what the router enforces"
+        );
     }
 
     /// `bge` is the embedder's tokenizer AND a registered counting name. It must appear ONCE, on the model
@@ -460,7 +581,14 @@ mod tests {
 
         let models = models_now(&state);
 
-        assert_eq!(models.iter().filter(|entry| entry.id == BGE_TOKENIZER).count(), 0, "not a row of its own");
+        assert_eq!(
+            models
+                .iter()
+                .filter(|entry| entry.id == BGE_TOKENIZER)
+                .count(),
+            0,
+            "not a row of its own"
+        );
         assert_eq!(
             model_row(&models, "bge-m3").tokenizer,
             Some(BGE_TOKENIZER),
@@ -476,13 +604,21 @@ mod tests {
         let state = app_state_with_tokenizers(&[BGE_TOKENIZER]);
 
         let cold = models_now(&state);
-        assert_eq!(model_row(&cold, "bge-m3").dimension, None, "nothing has been embedded on this process");
+        assert_eq!(
+            model_row(&cold, "bge-m3").dimension,
+            None,
+            "nothing has been embedded on this process"
+        );
 
         // A pass reports a real row, and only then does the field carry a number.
         record_embed_dimension(&state, dense_dimension(&[vec![0.0f32; 1024]]));
 
         let warm = models_now(&state);
-        assert_eq!(model_row(&warm, "bge-m3").dimension, Some(1024), "measured from a row, not from a const");
+        assert_eq!(
+            model_row(&warm, "bge-m3").dimension,
+            Some(1024),
+            "measured from a row, not from a const"
+        );
     }
 
     /// "Engine cold, tokenizer ready" is the state a consumer is in while it validates a recipe BEFORE
@@ -502,7 +638,11 @@ mod tests {
         let bge = model_row(&models, "bge-m3");
 
         assert!(!bge.available, "no engine has been built on this state");
-        assert_eq!(bge.tokenizer_available, Some(true), "but the tokenizer counted fine, and that is readable");
+        assert_eq!(
+            bge.tokenizer_available,
+            Some(true),
+            "but the tokenizer counted fine, and that is readable"
+        );
         assert_eq!(
             model_row(&models, "bge-reranker-v2-m3").tokenizer_available,
             None,
@@ -520,7 +660,10 @@ mod tests {
 
         let models = models_now(&state);
 
-        assert!(!model_row(&models, "qwen").available, "the test rows carry no files");
+        assert!(
+            !model_row(&models, "qwen").available,
+            "the test rows carry no files"
+        );
     }
 
     /// model work it describes is the defect `/health` already had fixed (`loaded_now` try_locks).
@@ -532,7 +675,10 @@ mod tests {
         let models = models_now(&state);
 
         assert_eq!(models.len(), 2, "the full answer, not a degraded one");
-        assert!(model_row(&models, "bge-m3").available, "a busy lock reads as resident, exactly as /health does");
+        assert!(
+            model_row(&models, "bge-m3").available,
+            "a busy lock reads as resident, exactly as /health does"
+        );
         drop(held);
     }
 
@@ -547,9 +693,19 @@ mod tests {
         let qwen = model_row(&models, "qwen");
 
         assert_eq!(qwen.kind, "tokenizer-only");
-        assert_eq!(qwen.dimension, None, "there is nothing to embed with, so there is no width");
-        assert_eq!(qwen.max_sequence_length, None, "and a counting tokenizer imposes no cap here");
-        assert_eq!(qwen.tokenizer.expect("it IS a tokenizer"), "qwen", "and /tokenize takes exactly this id");
+        assert_eq!(
+            qwen.dimension, None,
+            "there is nothing to embed with, so there is no width"
+        );
+        assert_eq!(
+            qwen.max_sequence_length, None,
+            "and a counting tokenizer imposes no cap here"
+        );
+        assert_eq!(
+            qwen.tokenizer.expect("it IS a tokenizer"),
+            "qwen",
+            "and /tokenize takes exactly this id"
+        );
     }
 
     /// A cross-encoder returns scores, not vectors — so it never has a width, cold or warm.
@@ -562,7 +718,13 @@ mod tests {
         let rerank = model_row(&models, "bge-reranker-v2-m3");
 
         assert_eq!(rerank.kind, "rerank");
-        assert_eq!(rerank.dimension, None, "an embedder's width must never leak onto the reranker's row");
-        assert_eq!(rerank.tokenizer, None, "and this process registers no counter for it — null, not a guess");
+        assert_eq!(
+            rerank.dimension, None,
+            "an embedder's width must never leak onto the reranker's row"
+        );
+        assert_eq!(
+            rerank.tokenizer, None,
+            "and this process registers no counter for it — null, not a guess"
+        );
     }
 }
