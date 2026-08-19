@@ -75,3 +75,11 @@ jobs:
 
       - name: Plan lifecycle
         run: node .claude/rules/shared/tools/plan-lifecycle.mjs
+
+      # Every submodule pin must equal its remote's tip — "a rule change and the pin bumps are one
+      # task" is a check now, not a habit (see .claude/rules/shared/README.md, Editing discipline).
+      # This repo felt the drift first-hand: it was two commits behind and missing gpu-lease.md,
+      # despite BEING the GPU. Last of the four consumers to gain the step, only because this file
+      # was in another session's hands on the day the other three got it.
+      - name: Pin check
+        run: node .claude/rules/shared/tools/pin-check.mjs
