@@ -267,7 +267,10 @@ mod tests {
     use std::time::Duration;
 
     /// The shape the embed engine actually runs at on this machine, for tests that do not care which.
-    const SHAPE: CacheShape = CacheShape { batch: 64, seq: 256 };
+    const SHAPE: CacheShape = CacheShape {
+        batch: 64,
+        seq: 256,
+    };
 
     /// One engine's slice at [`SHAPE`], as a path — for the tests that put files in it by hand.
     fn slice(base: &Path, engine: &str) -> PathBuf {
@@ -320,7 +323,11 @@ mod tests {
 
         // The two rungs of the ladder, and the 512 that will replace 256.
         assert_ne!(at(64, 128), at(64, 256), "the ladder's two rungs");
-        assert_ne!(at(64, 256), at(64, 512), "and the rung that will replace 256");
+        assert_ne!(
+            at(64, 256),
+            at(64, 512),
+            "and the rung that will replace 256"
+        );
 
         // The batch too: an /embed request may override it (`Limits::resolve`), so it is not constant for
         // the life of the process and a program pinned to 64 rows is not valid for 126.
@@ -334,7 +341,11 @@ mod tests {
 
         // An engine whose batch is not pinned at build time says so instead of inventing one.
         assert_eq!(
-            engine_cache_dir("/cache/device-0", RERANK_CACHE_ENGINE, CacheShape::unpinned_batch(1024)),
+            engine_cache_dir(
+                "/cache/device-0",
+                RERANK_CACHE_ENGINE,
+                CacheShape::unpinned_batch(1024)
+            ),
             "/cache/device-0/rerank-s1024"
         );
     }
@@ -491,7 +502,10 @@ mod tests {
 
         let embed_pass = CompileWatch::start(&base, EMBED_CACHE_ENGINE, SHAPE);
         // The OTHER engine compiles while this pass runs.
-        write_mb(&slice(Path::new(&base), RERANK_CACHE_ENGINE).join("fresh.mxr"), 3);
+        write_mb(
+            &slice(Path::new(&base), RERANK_CACHE_ENGINE).join("fresh.mxr"),
+            3,
+        );
 
         assert_eq!(
             embed_pass.grew_mb(),
@@ -500,7 +514,10 @@ mod tests {
         );
 
         // ...and this engine's own compile still is.
-        write_mb(&slice(Path::new(&base), EMBED_CACHE_ENGINE).join("fresh.mxr"), 2);
+        write_mb(
+            &slice(Path::new(&base), EMBED_CACHE_ENGINE).join("fresh.mxr"),
+            2,
+        );
         assert_eq!(
             embed_pass.grew_mb(),
             2,
