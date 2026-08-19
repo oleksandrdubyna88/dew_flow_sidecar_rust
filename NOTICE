@@ -1,0 +1,80 @@
+DewFlow bge-sidecar
+Copyright (c) 2026 {{COPYRIGHT_HOLDER}}. All rights reserved.
+
+This product includes third-party open-source software. The complete
+per-component inventory, with the exact versions whose licences were resolved,
+is in THIRD-PARTY-NOTICES.md, distributed alongside this file.
+
+This file exists to satisfy the attribution obligations that travel with
+distribution — principally Apache License 2.0 section 4(d), the requirement in
+MIT to retain the copyright notice in all copies, and the source-availability
+duty in MPL-2.0 section 3.2. Do not remove it from a build, an archive, or a
+published artefact.
+
+--------------------------------------------------------------------------------
+Apache License 2.0 components — attribution required
+--------------------------------------------------------------------------------
+
+This product includes software licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0):
+
+  fastembed 5.17.3
+    Copyright Anush008 and the fastembed-rs contributors
+    https://github.com/Anush008/fastembed-rs
+    VENDORED in vendor-fastembed/ as a full copy carrying one marked patch.
+    See THIRD-PARTY-NOTICES.md § "The vendored fork".
+
+  tokenizers 0.22.2
+    Copyright Hugging Face
+    https://github.com/huggingface/tokenizers
+
+  hf-hub 0.5.0
+    Copyright Hugging Face
+    https://github.com/huggingface/hf-hub
+
+  ONNX Runtime
+    Copyright (c) Microsoft Corporation
+    https://github.com/microsoft/onnxruntime
+    Licensed MIT; listed here because it is the native library this product
+    loads, and on the flavours that link a prebuilt one it travels beside the
+    executable. The `ort` crate that binds it is MIT OR Apache-2.0.
+
+--------------------------------------------------------------------------------
+MPL-2.0 component — source availability required
+--------------------------------------------------------------------------------
+
+  option-ext 0.2.0
+    Copyright Simon Ochsenreither
+    https://github.com/soc/option-ext
+    Reached through dirs → dirs-sys → hf-hub → fastembed, and present in the
+    shipped binary. MPL-2.0 is file-level copyleft: its source must remain
+    available under MPL-2.0, which it is at the URL above. This product does
+    not modify any file of it, so no modification has to be released.
+
+--------------------------------------------------------------------------------
+MIT and other permissive components — copyright notice retained
+--------------------------------------------------------------------------------
+
+This product includes software licensed under MIT, or dual-licensed MIT OR
+Apache-2.0, principally the Rust async and web stack:
+
+  tokio, axum, tower, hyper, serde, serde_json, tracing, tracing-subscriber,
+  anyhow, sha2, ndarray, image, and the windows crate
+  Copyright their respective authors — see THIRD-PARTY-NOTICES.md
+
+  libloading 0.9.0 is ISC.
+
+The Unicode data tables carried by several of these are licensed Unicode-3.0.
+
+The full list — 348 crates resolved for the Windows build graph — is in
+THIRD-PARTY-NOTICES.md.
+
+--------------------------------------------------------------------------------
+NOT redistributed, and deliberately so
+--------------------------------------------------------------------------------
+
+Microsoft DirectML, NVIDIA CUDA and NVIDIA cuDNN are vendor-licensed execution
+providers. This product USES them and never ships them: no build, image layer,
+registry cache or offline bundle produced here contains one. That is the reason
+the customer's own machine builds the flavour it needs. See
+THIRD-PARTY-NOTICES.md § "Never redistributed".

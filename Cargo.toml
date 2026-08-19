@@ -3,6 +3,13 @@ name = "bge-sidecar"
 version = "0.1.0"
 edition = "2021"
 description = "ONNX embedding + rerank sidecar: BGE-M3 dense+sparse (FP32) and BGE-Reranker-v2-M3 over fastembed/ONNX Runtime"
+# `license-file` rather than `license`: the terms are proprietary and SPDX has no expression for them.
+# Until 2026-08-19 this field was absent entirely, which `cargo metadata` reported as an empty licence — the
+# one crate in a 348-crate graph that did not say what it was.
+license-file = "LICENSE"
+# Never published. This binary is built on the machine that runs it, and the vendor execution providers it
+# links are licensed such that a copy of it in any registry would make us a redistributor of them.
+publish = false
 
 [dependencies]
 axum = "0.8"

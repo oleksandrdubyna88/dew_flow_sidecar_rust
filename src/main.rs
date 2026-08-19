@@ -227,6 +227,20 @@ pub(crate) async fn main() {
             None => "OFF".to_string(),
         }
     );
+    // Regenerating the canary's oracle is a MODE of this binary rather than a script beside it, so that the
+    // vector comes from the same loader, the same provider selection and the same shape the serving path
+    // uses. It runs instead of the server and leaves. See `canary::write_reference` for the number it prints
+    // and why that number is the whole point.
+    if let Some(path) = canary_reference_target(std::env::args()) {
+        let limits = Limits::resolve(&state.config, 0, 0);
+        if let Err(error) = canary::write_reference(&state, limits, &path) {
+            tracing::error!("{error:#}");
+            eprintln!("[bge-sidecar] fatal: {error:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     prewarm_provenance();
     spawn_wedge_watchdog(state.clone());
 
@@ -243,6 +257,25 @@ pub(crate) async fn main() {
         })
         .await
         .expect("server failed");
+}
+
+/// Where a regenerated canary reference should be written, if this run is a regeneration at all.
+///
+/// `--write-canary-reference [path]`, defaulting to the file the binary embeds — so the ordinary use is
+/// "run it, then look at the diff". Pure over its argument list, because the ONE thing that must never
+/// happen is a normal start being mistaken for a regeneration and overwriting the oracle.
+pub(crate) fn canary_reference_target(
+    args: impl IntoIterator<Item = String>,
+) -> Option<std::path::PathBuf> {
+    const FLAG: &str = "--write-canary-reference";
+    const DEFAULT: &str = "src/canary-reference.f32le";
+
+    let mut args = args.into_iter().skip_while(|a| a != FLAG);
+    args.next()?;
+    Some(std::path::PathBuf::from(match args.next() {
+        Some(path) if !path.starts_with("--") => path,
+        _ => DEFAULT.to_string(),
+    }))
 }
 
 /// The routes and the layers around them, built apart from `main` so a test can drive them without
@@ -291,4 +324,73 @@ pub(crate) async fn log_body_rejections(
         );
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canary_reference_target;
+
+    /// An ordinary start must NEVER be read as a regeneration. This is the whole risk of putting the
+    /// generator in the serving binary: the oracle the canary checks against is one accidental match away
+    /// from being overwritten by a normal boot.
+    #[test]
+    fn a_normal_start_never_regenerates_the_reference() {
+        for args in [
+            vec!["bge-sidecar".to_string()],
+            vec!["bge-sidecar".to_string(), "--serve".to_string()],
+            vec!["bge-sidecar".to_string(), "canary-reference".to_string()],
+            vec![
+                "bge-sidecar".to_string(),
+                "--write".to_string(),
+                "canary".to_string(),
+            ],
+        ] {
+            assert_eq!(
+                canary_reference_target(args.clone()),
+                None,
+                "{args:?} is not a regeneration"
+            );
+        }
+    }
+
+    /// The flag alone writes where the binary embeds it from, so the ordinary use is "run it, read the diff".
+    #[test]
+    fn the_flag_alone_targets_the_file_the_binary_embeds() {
+        let target =
+            canary_reference_target(["bge-sidecar", "--write-canary-reference"].map(String::from));
+
+        assert_eq!(
+            target,
+            Some(std::path::PathBuf::from("src/canary-reference.f32le"))
+        );
+    }
+
+    /// An explicit path wins — writing somewhere else first is how an operator compares before committing.
+    #[test]
+    fn an_explicit_path_is_taken() {
+        let target = canary_reference_target(
+            ["bge-sidecar", "--write-canary-reference", "/tmp/new.f32le"].map(String::from),
+        );
+
+        assert_eq!(target, Some(std::path::PathBuf::from("/tmp/new.f32le")));
+    }
+
+    /// A following FLAG is not a path. Without this, `--write-canary-reference --verbose` would write the
+    /// reference to a file called `--verbose`.
+    #[test]
+    fn a_following_flag_is_not_mistaken_for_a_path() {
+        let target = canary_reference_target(
+            [
+                "bge-sidecar",
+                "--write-canary-reference",
+                "--something-else",
+            ]
+            .map(String::from),
+        );
+
+        assert_eq!(
+            target,
+            Some(std::path::PathBuf::from("src/canary-reference.f32le"))
+        );
+    }
 }

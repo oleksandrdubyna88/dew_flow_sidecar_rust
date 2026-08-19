@@ -1,6 +1,8 @@
 # PLAN — the sidecar: from a binary that runs here to one a customer can build
 
-> Status: **plan; the engine works and is verified on an R9700, the distribution story is not built.**
+> Status: **partly implemented; the engine works and is verified on an R9700. Phase 3 is done bar the
+> release artefact (licence, notices, formatting gate, and the canary generator all landed 2026-08-19);
+> phases 1, 2 and 4 are open, and the build recipe is the large one.**
 > Scope: `src/`, `.github/workflows/ci.yml`, and this repository's public presentation.
 >
 > Related: the RAG repo's `todo/PLAN_rag_product.md` phase 4 (the settings and the compile button that drive
@@ -63,10 +65,17 @@ wrong".
 ### Phase 3 — being a public repository
 
 - **README**: what this is, what it is not, and how to build the CPU flavour in three commands.
-- **LICENSE and notices.** `vendor-fastembed/` is an upstream fork carried under its own Apache-2.0 licence
-  and kept byte-identical to upstream; its patches are marked in place so the provenance survives. The vendor
-  provider terms above belong in the notices too — stating that we never redistribute them is part of the
-  reason we may use them.
+- ~~**LICENSE and notices.**~~ **Done 2026-08-19.** `LICENSE` mirrors the position `dew_flow_mcp` already
+  carries — public and proprietary, with the copyright holder still a placeholder awaiting counsel, exactly as
+  there — plus `NOTICE` and `THIRD-PARTY-NOTICES.md`. `Cargo.toml` gained `license-file` and `publish = false`:
+  the audit found that ours was the ONE crate in a 348-crate graph that did not say what it was.
+
+  Three findings, each resolved from the artefacts rather than from memory. Of the 348 crates in the Windows
+  build graph every one is permissive **except `option-ext` (MPL-2.0)**, which arrives four levels down through
+  `dirs → hf-hub → fastembed` and ships — file-level copyleft, unmodified by us, so the whole obligation is to
+  name it and its source, which the notices do. `r-efi` (MIT OR Apache OR LGPL) is in the metadata but in NO
+  real target's graph, so its LGPL option never arrives. And the vendor providers are recorded as used and
+  never redistributed, which is the sentence the whole distribution story rests on.
 - **Release artefacts** for the flavours we *may* ship: the CPU build ships freely.
 - ~~**The `cargo fmt` gate**, deferred deliberately~~ — **done 2026-08-19.** The deferral's reason had
   expired without anyone noticing: it rested on preserving the diff against the sources this crate was
@@ -75,12 +84,23 @@ wrong".
   monotonically. Applied as its own mechanical commit, exactly as the deferral asked, and the gate is on
   (`cargo fmt --package bge-sidecar --check`, ubuntu only; `--package` so the vendored fork stays
   byte-identical to upstream).
-- **The canary's reference vector cannot be regenerated from this repository** (found 2026-08-19 while
-  auditing the code's own citations). `canary.rs` cited `scripts/generate-canary-reference.mjs`; that
-  script stayed in the monorepo this crate was carried out of, so `src/canary-reference.f32le` has no
-  reproducible provenance here. It works — every fresh engine is checked against it — but a deliberate
-  model change has nothing to regenerate it with, which makes phase 2 partly unimplementable until it is
-  replaced. The docstrings now say this instead of naming a file that is not there.
+- ~~**The canary's reference vector cannot be regenerated from this repository**~~ — **done 2026-08-19.**
+  The generator that made `src/canary-reference.f32le` was a script in the monorepo this crate was carried
+  out of, and it did not travel; the canary — the one guard against a wrong-but-plausible vector — was left
+  with an oracle nobody could reproduce.
+
+  It is now a MODE of the binary rather than a script beside it: `--write-canary-reference [path]`, which
+  goes through `load_dual`, the real provider selection and the production shape, and deliberately NOT
+  through `load_validated_dual` — checking a new engine against the old reference is the circularity this
+  tool has to stand outside of. It reports the cosine against the current file **before** writing, because
+  regenerating to silence a failing canary is the misuse, and a printed distance makes that a decision
+  rather than an accident.
+
+  Verified on the card the day it was written: the regenerated vector scores cosine **1.000000000** against
+  the committed one — this build reproduces the oracle exactly. It is also **not byte-identical**: 1012 of
+  1024 elements differ, max delta 2.868e-07, which is float32 rounding on a GPU that is not bit-reproducible
+  across runs. That measurement is the answer to the question a future regeneration will raise, and it is
+  why the canary's threshold is a cosine.
 
 ### Phase 4 — the ergonomics the host already needs
 
@@ -112,10 +132,12 @@ wrong".
 - [ ] An ABI or provider mismatch fails at startup with a message naming the mismatch — never a hang.
 - [ ] A freshly built sidecar verifies itself against a reference vector at cosine ≥ 0.999 and reports its
       active provider, and the RAG console shows both.
-- [ ] README, LICENSE and notices exist, with the vendored fork's licence and the never-redistributed vendor
-      providers both stated.
+- [x] README, LICENSE and notices exist, with the vendored fork's licence and the never-redistributed vendor
+      providers both stated (2026-08-19). The one thing they say that was not anticipated: a shipped MPL-2.0
+      dependency, `option-ext`.
 - [ ] The CPU flavour has a published release artefact.
 - [x] Formatting is decided on its own merits, in its own commit, and the CI gate is switched back on
       (2026-08-19).
-- [ ] The canary reference has a generator that lives in THIS repository, so a deliberate model change can
-      produce a new one (raised 2026-08-19 — phase 2 cannot be completed without it).
+- [x] The canary reference has a generator that lives in THIS repository, so a deliberate model change can
+      produce a new one (raised and built 2026-08-19: `--write-canary-reference`, verified on the card at
+      cosine 1.000000000 against the committed oracle).

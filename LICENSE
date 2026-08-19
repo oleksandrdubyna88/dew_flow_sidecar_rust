@@ -1,0 +1,118 @@
+DewFlow bge-sidecar — Proprietary Software License
+==================================================
+
+Copyright (c) 2026 {{COPYRIGHT_HOLDER}}. All rights reserved.
+
+    ACTION REQUIRED BEFORE THIS REPOSITORY IS ADVERTISED
+    Replace {{COPYRIGHT_HOLDER}} above with the legal entity that owns this
+    software, and have this file reviewed by counsel. It was drafted as a
+    conservative default so that a PUBLIC repository is not left with no
+    licence at all; it is not legal advice and it has not been reviewed by a
+    lawyer. It mirrors the licence already carried by dew_flow_mcp, so that the
+    family states one position rather than two.
+
+0. This repository is public. That is not a licence.
+----------------------------------------------------
+
+The source is visible so that a prospective or existing customer can read it,
+audit it, and see exactly what a service they run on their own machine does —
+which matters more here than elsewhere, because this binary is BUILT on that
+machine rather than shipped to it. Visibility is deliberate and it grants
+nothing: absent a Commercial Agreement under section 2, you may read this
+repository and you may not use it.
+
+Said plainly here because the opposite is the common assumption. A public
+repository with no licence file is "all rights reserved" by silence, which
+leaves everyone guessing; this file replaces the guess with a statement.
+
+1. Ownership
+------------
+
+This software, including its source code, build scripts, configuration,
+documentation and all other material in this repository (the "Software"), is
+the proprietary property of the copyright holder and is protected by copyright
+and other intellectual property laws.
+
+The Software is licensed, not sold. No title to or ownership of the Software is
+transferred by this licence.
+
+2. No licence granted by default
+--------------------------------
+
+No rights to use, copy, modify, merge, publish, distribute, sublicense or sell
+the Software are granted except under a separate written agreement signed by
+the copyright holder (a "Commercial Agreement"). Absent a Commercial Agreement,
+you may not use the Software for any purpose.
+
+Where a Commercial Agreement exists, that agreement governs, and this file is
+subordinate to it.
+
+3. Restrictions
+---------------
+
+Except to the extent such a restriction is unenforceable under applicable law,
+or is expressly permitted by a Commercial Agreement, you may not:
+
+  (a) distribute, publish, sublicense, rent, lease, lend or host the Software
+      for the benefit of any third party;
+  (b) reverse engineer, decompile or disassemble the Software;
+  (c) remove, obscure or alter any copyright, trademark or attribution notice,
+      including the notices in NOTICE and THIRD-PARTY-NOTICES.md;
+  (d) use the name of the copyright holder or the "DewFlow" name or marks for
+      endorsement or publicity.
+
+4. Third-party components
+-------------------------
+
+The Software incorporates third-party open-source components, each governed by
+its own licence. Those licences apply to those components and are not
+superseded by this file. Attribution and licence terms for every third-party
+component are recorded in:
+
+  - NOTICE                     — attribution carried with any distribution
+  - THIRD-PARTY-NOTICES.md     — the per-component inventory, with versions
+
+Three facts about this repository's position, each resolved from the artefacts
+rather than assumed, and each different from the rest of the family:
+
+  (i)   `vendor-fastembed/` is a FULL VENDORED COPY of the upstream `fastembed`
+        crate (Apache-2.0), carrying one marked patch. Its licence travels with
+        it and is not superseded by this file.
+
+  (ii)  One shipped dependency is MPL-2.0 — `option-ext`, reached through
+        dirs → hf-hub → fastembed. MPL-2.0 is file-level copyleft: it obliges
+        us to make ITS source available and to release any modification of ITS
+        files under MPL. We modify nothing in it. THIRD-PARTY-NOTICES.md
+        records this and where the source is.
+
+  (iii) The GPU execution providers — Microsoft DirectML, NVIDIA CUDA and
+        cuDNN — are USED and NEVER REDISTRIBUTED. They are vendor-licensed,
+        and one cached copy in our registry, an image layer or an offline
+        bundle would make us a redistributor. This is why the customer's own
+        machine builds the flavour it needs, and why no build here bundles a
+        vendor provider. See THIRD-PARTY-NOTICES.md § "Never redistributed".
+
+Nothing in this file limits any right you have under the licence of a
+third-party component.
+
+5. Contributions
+----------------
+
+This repository does not accept outside pull requests, because accepting one
+without a contributor agreement would leave part of a proprietary work owned by
+someone else.
+
+6. No warranty
+--------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+7. Limitation of liability
+--------------------------
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
