@@ -1,4 +1,4 @@
-use crate::compile_cache::{CacheShape, CachePathLease, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
+use crate::compile_cache::{CachePathLease, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
 use crate::config::{Config, DUAL_MODEL, RERANK_MODEL};
 use crate::state::AppState;
 use crate::vram::{self, Attribution, SoloBuildWindow};
@@ -496,6 +496,9 @@ mod tests {
     use super::*;
     use std::path::Path;
     use std::sync::OnceLock;
+
+    // Only the tests build a lease by hand; the production paths receive one already held.
+    use crate::compile_cache::CacheShape;
 
     use crate::testing::*;
 

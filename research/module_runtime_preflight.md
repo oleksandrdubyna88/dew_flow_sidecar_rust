@@ -97,6 +97,17 @@ heal minutes later.
 previous flat `dual/` and `rerank/` directories are then orphaned — they are exactly the programs with mixed
 shapes in them, and deleting them by hand is safe once a run has succeeded.
 
+**Verified on the WSL sidecar, 2026-08-19, and the old cache was worse than no cache:**
+
+| slice state | stall | canary |
+|---|---|---|
+| before, "warm" — a program of the WRONG shape | **213.7 s** (cap 256) + 127.0 s (cap 128) | rejected twice, slice wiped, recompiled |
+| after, EMPTY slice — an honest first compile | 108.3 s + 103.3 s | **accepted on run 1** |
+| after, WARM slice | **25.9 s** + 30.0 s | **accepted on run 1** |
+
+A pass on that arm now pays **55.9 s** of engine stall where it paid **340.9 s**. The tree afterwards is
+`dual-b64s128` (2 280 MB) and `dual-b64s256` (2 396 MB) beside the orphaned flat `dual` (4 675 MB).
+
 ## The DXGI mapping, and why it exists
 
 `src/adapters.rs` (Windows-only, `#[cfg(windows)]`) translates the operator's device index into what the
