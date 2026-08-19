@@ -1,6 +1,7 @@
 # PLAN — the sidecar: from a binary that runs here to one a customer can build
 
-> Status: **IMPLEMENTED, 2026-08-19**, with two items left that this repository cannot close alone — see
+> Status: **IMPLEMENTED, 2026-08-19**. Its console half was closed the same day in `dew_flow_rag_qln`; one
+> item is left, and it is an operator's decision rather than work — see
 > [The open tail](#the-open-tail). Scope as built: `src/` (`canary`, `recipes`, `introspection`, `config`,
 > `state`, `wire`, `handlers`), `build-recipes.json`, `.github/workflows/{ci,release}.yml`, `LICENSE`,
 > `NOTICE`, `THIRD-PARTY-NOTICES.md`, `Cargo.toml` and the README.
@@ -151,10 +152,13 @@ wrong".
       through the stable C ABI and exits naming both versions (ort's own check DEADLOCKS instead of
       erroring), `preflight_migraphx_cache` refuses an unset or unwritable cache path, and
       `preflight_provider` refuses an EP absent from the build with the `--features` line that would add it.
-- [~] A freshly built sidecar verifies itself against a reference vector at cosine ≥ 0.999 and reports its
-      active provider — **done on this side**: `/health.self_check` carries the cosine and BOTH thresholds
-      (0.99 to serve, 0.999 to be called verified), and the provider is answered three ways beside it. The
-      RAG console rendering it is the half this repository cannot close; see the open tail.
+- [x] A freshly built sidecar verifies itself against a reference vector at cosine ≥ 0.999 and reports its
+      active provider. `/health.self_check` carries the cosine and BOTH thresholds (0.99 to serve, 0.999 to
+      be called verified), and the provider is answered three ways beside it. **Closed on both sides the same
+      day** (2026-08-19): `dew_flow_rag_qln` reads it in `RuntimeInspector.SelfCheck` and renders it inside
+      the runtime panel's Provider cell — three badge states, so the build that serves and is not trusted
+      stays visible — pinned by `SidecarSelfCheckTests` and six `RuntimePageTests` cases, each of which was
+      mutation-checked.
 - [x] README, LICENSE and notices exist, with the vendored fork's licence and the never-redistributed vendor
       providers both stated (2026-08-19). The one thing they say that was not anticipated: a shipped MPL-2.0
       dependency, `option-ext`.
@@ -170,13 +174,14 @@ wrong".
 
 ## The open tail
 
-Two items, neither of which this repository can finish on its own:
+One item, and it is a decision rather than work:
 
-1. **The RAG console has to render the self-check.** `dew_flow_rag_qln`'s runtime panel reads `/health`
-   already; `self_check` is a new field there. The pair to show is the cosine AND the active provider,
+1. ~~**The RAG console has to render the self-check.**~~ **Closed 2026-08-19**, the same day it was written
+   down — which is the whole point of having written it down: the `vram_at_load` hand-off took a day to be
+   noticed because nothing recorded that it was owed. `dew_flow_rag_qln` now maps `/health.self_check` onto
+   `SidecarSelfCheckVm` and renders it in the runtime panel's Provider cell, beside the active provider,
    because the failure the gate exists for — a DirectML build that silently ran on CPU — has correct
-   numbers and wrong hardware. This is the same shape as the `vram_at_load` hand-off, which took a day to
-   be noticed the first time, so it is written here rather than assumed.
+   numbers and wrong hardware. Recorded there in `research/module_runtime.md`.
 
 2. **The first release tag.** Cutting `v0.1.0` publishes the CPU archives. Nobody has decided to, and the
    `{{COPYRIGHT_HOLDER}}` placeholder in LICENSE and NOTICE should be resolved by counsel before a binary
