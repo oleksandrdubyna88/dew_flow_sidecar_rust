@@ -236,7 +236,12 @@ signal there is.
 > both happened, and the log line is what the item was actually about — a degradation nobody can see is
 > the defect, not the degradation itself.
 
-*(Original symptoms, for the record, below.)*
+*(Original symptoms, for the record, below — **including two mid-flight notes the landing
+superseded**: "(Still bare at both sites.)" and "REVISED — half of this landed" describe intermediate
+states, not the shipped code. Verified against the source during the 2026-08-19 family audit: all
+three recorders heal (`clear_poison`) AND warn through the one shared `record`, and both `.expect`
+sites carry their invariant inline, exactly as the closure note above records. Kept for the history;
+nothing here is open.)*
 
 - `inference.rs:273` and `inference.rs:394` — `.expect("just loaded")`. Sound today: the same `MutexGuard` that inserted
   the entry is the only handle that can evict it, and `RungCache` capacity is `max(1)`. It is a

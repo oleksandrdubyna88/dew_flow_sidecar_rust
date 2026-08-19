@@ -1,6 +1,8 @@
 # bge-sidecar
 
-ONNX inference sidecar for the v2 code-RAG pipeline (see `research/PLAN_hybrid_search_onnx.md`):
+ONNX inference sidecar of the `dew_flow_*` family — the embedding/rerank engine
+`dew_flow_rag_qln` talks to over HTTP (design records live in this repo's `research/`; the
+retrieval product's side is `dew_flow_rag_qln · research/architecture.md`):
 
 - **BGE-M3 dense + learned-sparse embeddings** — FP32, the official `BAAI/bge-m3` ONNX export,
   two engines over the same model (`TextEmbedding` + `SparseTextEmbedding` from `fastembed`),
@@ -131,9 +133,10 @@ request and for a bare `cargo run`.
 > `loaded_max_batch` now report what actually ran (`null` until one has), the same requested-vs-active
 > split the provider fields already carry. The configured batch default was also raised 4 → 64 to match
 > `SidecarMemory.DefaultMaxBatch`: at the shipped 256 cap a batch of 64 costs 512 MiB of attention, and the
-> old 4 was sized for the 1024-token era. The cost model lives in one place in the host —
-`v2.Web.Contracts/Models/SidecarMemoryModels.cs` (`SidecarMemory`) — with tests in
-`tests/v2.Tests/Rag/SidecarMemoryTests.cs`.
+> old 4 was sized for the 1024-token era. The cost model lived in one place in the host — at the time
+of this note that host was the now-frozen `ClaudeRag` predecessor
+(`v2.Web.Contracts/Models/SidecarMemoryModels.cs`, `SidecarMemory`, with its tests); today's host is
+`dew_flow_rag_qln`, and the citation is kept as the record of where the decision was made.
 
 ## The wedge detector: the one wait this process cannot cancel (2026-08-16)
 
