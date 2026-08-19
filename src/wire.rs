@@ -200,6 +200,9 @@ pub(crate) struct HealthResponse {
     /// Any engine past its ceiling. The single boolean a host can route on.
     pub(crate) wedged: bool,
     pub(crate) loaded: LoadedModels,
+    /// What each engine's BUILD allocated on the adapter — the split `loaded`'s booleans cannot express.
+    /// Additive: `loaded` keeps its shape exactly. See `VramAtLoad`.
+    pub(crate) vram_at_load: VramAtLoad,
     pub(crate) models: ModelNames,
     /// The memory envelope in force — the defaults plus the cap the loaded engines actually carry, so the
     /// host can show what is running rather than what was requested.
@@ -214,6 +217,63 @@ pub(crate) struct LoadedModels {
     pub(crate) dense: bool,
     pub(crate) sparse: bool,
     pub(crate) rerank: bool,
+}
+
+/// How much adapter memory each engine's BUILD allocated — `vram_at_load` on `/health`.
+///
+/// **Not residency, and named so.** The delta is taken around the session build and never re-sampled;
+/// a later pass may allocate more, and under MIGraphX the first kernel launch allocates most of it. A
+/// field called `vram_used` would be read as a live reading and would be wrong within one pass.
+///
+/// A **sibling** of `loaded`, not a replacement for it. The plan this implements proposed turning the
+/// three booleans into three objects and claimed that consumers reading the boolean would keep working;
+/// they would not. `dew_flow_rag_qln`'s `RuntimeInspector.ResidentModels` tests
+/// `loaded.dense.ValueKind == JsonValueKind.True`, so an object there removes every model from the
+/// runtime panel — the one surface this figure exists to fill. The booleans are untouched.
+#[derive(Serialize)]
+pub(crate) struct VramAtLoad {
+    /// Bytes the dual embed session's build allocated, when it could be attributed to that build alone.
+    /// `null` is never a zero — see `unavailable_reason` and the discard counters.
+    pub(crate) embed_bytes: Option<u64>,
+    pub(crate) rerank_bytes: Option<u64>,
+    /// Samples thrown away because another engine's build overlapped this one. On the wire because
+    /// otherwise "unavailable" and "never attributable on this machine" look identical from outside —
+    /// and only the second would justify serializing every build to obtain the number.
+    pub(crate) discarded_overlaps: u64,
+    /// Builds where there was nothing to sample: no DXGI, no resolved adapter, not Windows.
+    pub(crate) discarded_not_sampled: u64,
+    /// Builds sampled alone whose adapter usage did not grow — evidence the allocation was invisible
+    /// here, deliberately not reported as a measurement of zero.
+    pub(crate) discarded_no_growth: u64,
+    /// Why both figures are absent, when both are. `null` once either exists.
+    pub(crate) unavailable_reason: Option<&'static str>,
+}
+
+impl VramAtLoad {
+    /// `None` = the ledger was busy when the probe read it. /health never queues, so a busy ledger is
+    /// reported as a temporary absence with its own reason rather than waited on.
+    pub(crate) fn of(ledger: Option<crate::vram::VramLedger>) -> Self {
+        let Some(ledger) = ledger else {
+            return Self {
+                embed_bytes: None,
+                rerank_bytes: None,
+                discarded_overlaps: 0,
+                discarded_not_sampled: 0,
+                discarded_no_growth: 0,
+                unavailable_reason: Some(
+                    "the ledger was busy when this probe read it — /health never queues",
+                ),
+            };
+        };
+        Self {
+            embed_bytes: ledger.embed,
+            rerank_bytes: ledger.rerank,
+            discarded_overlaps: ledger.discarded_overlaps,
+            discarded_not_sampled: ledger.discarded_not_sampled,
+            discarded_no_growth: ledger.discarded_no_growth,
+            unavailable_reason: ledger.unavailable_reason(),
+        }
+    }
 }
 
 /// One held engine, as /health reports it.
@@ -495,6 +555,56 @@ mod tests {
             .await
             .expect_err("the task panicked");
         assert!(join_error_text(err).contains("the real reason"));
+    }
+
+    /// `loaded` stays three BOOLEANS on the wire, whatever else /health grows.
+    ///
+    /// The plan that asked for per-engine VRAM proposed turning them into three objects and asserted that
+    /// consumers reading the boolean would keep working. They would not:
+    /// `dew_flow_rag_qln`'s `RuntimeInspector.ResidentModels` tests
+    /// `loaded.dense.ValueKind == JsonValueKind.True` and `LoadedRoles` does the same, so an object there
+    /// empties the runtime panel of every model — the exact surface the new figure exists to fill. The
+    /// panel also ships separately from this binary, so the two can never be updated together.
+    #[test]
+    fn the_loaded_flags_stay_booleans_so_a_consumer_that_only_knows_them_keeps_working() {
+        let json = serde_json::to_value(LoadedModels {
+            dense: true,
+            sparse: true,
+            rerank: false,
+        })
+        .expect("LoadedModels is serializable");
+
+        assert_eq!(
+            json["dense"],
+            serde_json::Value::Bool(true),
+            "a BOOLEAN, not an object carrying one"
+        );
+        assert_eq!(json["sparse"], serde_json::Value::Bool(true));
+        assert_eq!(json["rerank"], serde_json::Value::Bool(false));
+    }
+
+    /// An absent figure is absent WITH A REASON, and never a zero — a `0` on this field would read as
+    /// "this engine costs no VRAM", which is the one thing it can never mean.
+    #[test]
+    fn vram_at_load_reports_absence_with_a_reason_rather_than_a_zero() {
+        let fresh = VramAtLoad::of(Some(crate::vram::VramLedger::default()));
+        assert_eq!(fresh.embed_bytes, None);
+        assert_eq!(fresh.rerank_bytes, None);
+        assert_eq!(
+            fresh.unavailable_reason,
+            Some("no session has been built yet")
+        );
+
+        let json = serde_json::to_value(&fresh).expect("VramAtLoad is serializable");
+        assert!(json["embed_bytes"].is_null(), "null, never 0: {json}");
+
+        // A ledger nobody could read is its own state, distinguishable from an empty one.
+        let busy = VramAtLoad::of(None);
+        assert!(
+            busy.unavailable_reason
+                .is_some_and(|reason| reason.contains("busy")),
+            "a probe that found the ledger locked says so instead of reporting an empty ledger"
+        );
     }
 
     #[test]

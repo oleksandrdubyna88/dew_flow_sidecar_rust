@@ -1,3 +1,4 @@
+use crate::bookkeeping::{committed_cap, settle_cap};
 use crate::config::{DENSE_MODEL, DUAL_MODEL, RERANK_MODEL, SPARSE_MODEL};
 use crate::engine_cache::EngineSlot;
 use crate::inference::lock_or_refuse;
@@ -7,7 +8,8 @@ use crate::tokens::BGE_TOKENIZER;
 use crate::wedge::Patience;
 use crate::wire::{
     in_flight_now, join_error_text, tokenizer_available, HealthResponse, LimitsWire, LoadedModels,
-    ModelEntry, ModelNames, ModelsResponse, KIND_DENSE_SPARSE, KIND_RERANK, KIND_TOKENIZER_ONLY,
+    ModelEntry, ModelNames, ModelsResponse, VramAtLoad, KIND_DENSE_SPARSE, KIND_RERANK,
+    KIND_TOKENIZER_ONLY,
 };
 use axum::body::Bytes;
 use axum::extract::State;
@@ -69,6 +71,7 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
             sparse: loaded_now(&state.engines.embed),
             rerank: loaded_now(&state.engines.rerank),
         },
+        vram_at_load: VramAtLoad::of(crate::vram::snapshot(&state)),
         models: ModelNames {
             dense: DENSE_MODEL,
             sparse: SPARSE_MODEL,
@@ -79,11 +82,7 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
             max_batch: state.config.max_batch,
             embed_batch_texts: embed_batch,
             rerank_max_length: state.config.rerank_max_length,
-            loaded_embed_max_length: state
-                .loaded_embed_max_length
-                .try_lock()
-                .ok()
-                .and_then(|g| *g),
+            loaded_embed_max_length: committed_cap(&state),
             loaded_max_batch: state.loaded_max_batch.try_lock().ok().and_then(|g| *g),
             resident_embed_max_lengths: state
                 .engines
@@ -125,12 +124,7 @@ pub(crate) fn models_now(state: &AppState) -> Vec<ModelEntry> {
             // default. The same resolution the host already performs over /health, moved to the side
             // that owns the fact.
             max_sequence_length: Some(
-                state
-                    .loaded_embed_max_length
-                    .try_lock()
-                    .ok()
-                    .and_then(|c| *c)
-                    .unwrap_or(state.config.embed_max_length),
+                committed_cap(state).unwrap_or(state.config.embed_max_length),
             ),
             tokenizer: Some(BGE_TOKENIZER),
             available: loaded_now(&state.engines.embed),
@@ -187,7 +181,7 @@ pub(crate) fn loaded_now<S: EngineSlot>(engine: &Mutex<S>) -> bool {
     }
 }
 
-/// A scoped `/unload` body (research/PLAN_gpu_search_arbitration.md): the host's budget-aware eviction
+/// A scoped `/unload` body (`dew_flow_rag_qln · research/PLAN_gpu_arbitration.md`): the host's budget-aware eviction
 /// names exactly what must go — individual embed rungs and/or the reranker — so the rest stays warm.
 /// An EMPTY body keeps the original contract: drop everything (the exclusive-LLM handover).
 #[derive(Deserialize, Default, Debug, PartialEq)]
@@ -276,6 +270,36 @@ pub(crate) async fn unload(
     health(State(state)).await
 }
 
+/// Says, in the LOG, how much the teardown actually gave back — beside what the build was recorded as
+/// costing.
+///
+/// A log line rather than a wire field on purpose: this is evidence ABOUT the measurement, not a fact
+/// about the engine. A freed delta that disagrees with the recorded load figure is the signal that the
+/// attribution rule is not measuring what it claims, and it is the only check available short of a
+/// second process watching the card.
+///
+/// Silent when there is nothing to compare — a build nobody could attribute has no figure to disagree
+/// with, and a machine that cannot sample cannot produce either half.
+fn log_freed_vram(state: &AppState, engine: &str, before: Option<u64>, recorded_load: Option<u64>) {
+    let (Some(before), Some(after)) = (before, crate::vram::sample(state)) else {
+        return;
+    };
+    let freed = before.saturating_sub(after);
+    match recorded_load {
+        Some(load) => tracing::info!(
+            "{engine}: teardown freed {} MB; its build was recorded at {} MB — the cross-check on the \
+             load figure (they agree only when nothing else moved on the card meanwhile)",
+            freed / (1024 * 1024),
+            load / (1024 * 1024)
+        ),
+        None => tracing::info!(
+            "{engine}: teardown freed {} MB; no load figure was attributable for this engine, so there is \
+             nothing to check it against",
+            freed / (1024 * 1024)
+        ),
+    }
+}
+
 /// What one `/unload` actually moved.
 #[derive(Default)]
 pub(crate) struct Drained {
@@ -316,9 +340,20 @@ pub(crate) fn drain_engines(state: &AppState, req: &UnloadRequest) -> Drained {
                         .filter_map(|&cap| guard.remove(cap).map(|e| (cap, e)))
                         .collect()
                 };
+                // Before the guard goes: a rung that has just left must stop being what the next query
+                // inherits. Reported `loaded_embed_max_length` used to survive its own engine, so
+                // /health named a cap while `loaded.dense` said false.
+                settle_cap(state, &guard);
                 drop(guard);
                 drained.embed_rungs = taken.iter().map(|(cap, _)| *cap).collect();
+                let before = crate::vram::sample(state);
                 drop(taken);
+                log_freed_vram(
+                    state,
+                    "embed",
+                    before,
+                    crate::vram::snapshot(state).and_then(|l| l.embed),
+                );
             }
             Err(e) => {
                 tracing::warn!("/unload: {e:#}");
@@ -339,7 +374,14 @@ pub(crate) fn drain_engines(state: &AppState, req: &UnloadRequest) -> Drained {
                 let taken = guard.take();
                 drop(guard);
                 drained.rerank = taken.is_some();
+                let before = crate::vram::sample(state);
                 drop(taken);
+                log_freed_vram(
+                    state,
+                    "rerank",
+                    before,
+                    crate::vram::snapshot(state).and_then(|l| l.rerank),
+                );
             }
             Err(e) => {
                 tracing::warn!("/unload: {e:#}");
@@ -416,7 +458,7 @@ mod tests {
         drop(held_cache);
     }
 
-    /// The /unload body contract (research/PLAN_gpu_search_arbitration.md): an empty body is the
+    /// The /unload body contract (`dew_flow_rag_qln · research/PLAN_gpu_arbitration.md`): an empty body is the
     /// original full drain; a scoped body names rungs and/or the reranker; a MALFORMED body drops
     /// nothing — a typo'd partial request must never silently become a full drain.
     #[test]
@@ -573,6 +615,38 @@ mod tests {
         );
     }
 
+    /// The reported cap must not outlive the engine that carries it.
+    ///
+    /// `loaded_embed_max_length` was written by every request before any build and never cleared, so an
+    /// `/unload` that handed the whole card to an exclusive LLM left /health naming a rung while
+    /// `loaded.dense` in the very same body said false — and the host reads exactly this field to decide
+    /// what a pass would run at.
+    #[tokio::test]
+    async fn the_reported_cap_does_not_outlive_the_engine_that_carried_it() {
+        let state = app_state();
+        settle_cap(&state, &cache_of(1, &[(256, 7u8)]));
+
+        let loaded = health(State(state.clone())).await.0;
+        assert_eq!(
+            loaded.limits.loaded_embed_max_length,
+            Some(256),
+            "a resident rung is what it reports"
+        );
+
+        // /unload takes the card.
+        settle_cap(&state, &RungCache::<u8>::new(1));
+
+        let unloaded = health(State(state)).await.0;
+        assert_eq!(
+            unloaded.limits.loaded_embed_max_length, None,
+            "nothing is resident, so there is no loaded cap — null, never the last one asked for"
+        );
+        assert!(
+            !unloaded.loaded.dense,
+            "and the two fields of one body agree about it"
+        );
+    }
+
     /// `bge` is the embedder's tokenizer AND a registered counting name. It must appear ONCE, on the model
     /// it belongs to — a duplicate row would offer a caller two ways to name one thing.
     #[test]
@@ -666,7 +740,8 @@ mod tests {
         );
     }
 
-    /// model work it describes is the defect `/health` already had fixed (`loaded_now` try_locks).
+    /// `/models` is a read, and a read that queues behind the model work it describes is the defect
+    /// `/health` already had fixed (`loaded_now` try_locks).
     #[test]
     fn models_answers_while_an_engine_is_held() {
         let state = app_state_with_tokenizers(&[BGE_TOKENIZER]);

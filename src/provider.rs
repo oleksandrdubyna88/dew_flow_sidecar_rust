@@ -1,6 +1,7 @@
 use crate::compile_cache::{CachePathLease, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
 use crate::config::{Config, DUAL_MODEL, RERANK_MODEL};
 use crate::state::AppState;
+use crate::vram::{self, Attribution, SoloBuildWindow};
 use crate::wire::join_error_text;
 use fastembed::{
     Bgem3DualEmbedding, Bgem3DualInitOptions, RerankInitOptions, RerankerModel, TextRerank,
@@ -13,9 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// Builds the ONE session both heads share. Its compiled-model cache slice is `dual/` — its own,
-/// never `dense/` or `sparse/`: a cache hit must always mean "MY program" (the 2026-07-27 stale-cache
-/// incident), and the per-head slices belong to the retired two-session binaries.
 /// Everything a session load does around the one line that differs — building the options.
 ///
 /// The two loaders below were the same seven steps twice: pin the provider, preflight it, log the
@@ -54,16 +52,42 @@ fn load_session<T>(
         return record_session_outcome::<T>(state, &provider, Err(error));
     }
 
+    // Two samples around the ONE place a session is ever built, so both engines are covered by
+    // construction and a third added later is covered for free. What the delta measures is the LOAD, not
+    // residency: a later pass may allocate more — under MIGraphX the first kernel launch allocates most
+    // of it — and nothing here re-samples. See `vram::attribute` for why a delta is published only when
+    // this build was alone.
     let started = std::time::Instant::now();
+    let window = SoloBuildWindow::open(vram::sample(state));
     let built = build(&provider);
+    let attribution = window.close(vram::sample(state));
     if built.is_ok() {
+        // Only a build that produced a session: a failed one allocates and frees an unknown amount, and
+        // charging that to the engine would describe the failure rather than the engine.
+        vram::record(state, engine, attribution);
         tracing::info!(
-            "{model}: session ready in {:.1}s (the EP compiles or loads its cache lazily, on the first \
+            "{model}: session ready in {:.1}s, {} (the EP compiles or loads its cache lazily, on the first \
              pass — the cache path stays claimed until it has)",
-            started.elapsed().as_secs_f32()
+            started.elapsed().as_secs_f32(),
+            load_size_text(attribution)
         );
     }
     record_session_outcome(state, &provider, built)
+}
+
+/// How the build's allocation reads in the startup log — the same four states `/health` publishes, in a
+/// sentence, because the log is where an operator meets this first.
+fn load_size_text(attribution: Attribution) -> String {
+    match attribution {
+        Attribution::Measured(bytes) => format!("{} MB of adapter memory", bytes / (1024 * 1024)),
+        Attribution::Overlapped => {
+            "adapter memory not attributed (another build overlapped this one)".to_string()
+        }
+        Attribution::NotSampled => "adapter memory not sampled on this build".to_string(),
+        Attribution::NoGrowth => {
+            "adapter memory unchanged across the build (allocation not visible here)".to_string()
+        }
+    }
 }
 
 /// Applies the knobs every model shares. `intra_threads` stays conditional: 0 means "let ONNX Runtime
@@ -118,6 +142,9 @@ impl WithCommonOptions for RerankInitOptions {
     }
 }
 
+/// Builds the ONE session both heads share. Its compiled-model cache slice is `dual/` — its own,
+/// never `dense/` or `sparse/`: a cache hit must always mean "MY program" (the 2026-07-27 stale-cache
+/// incident), and the per-head slices belong to the retired two-session binaries.
 pub(crate) fn load_dual(
     state: &AppState,
     provider_hint: &str,
@@ -239,7 +266,8 @@ pub(crate) fn preflight_provider(provider: &str, exe_dir: &Path) -> anyhow::Resu
         anyhow::bail!(
             "execution provider `{provider}` is compiled in, but its runtime libraries are missing \
              from `{}`: {}. ONNX Runtime resolves these from the EXECUTABLE'S directory, not PATH — \
-             deploy the full package (tools/bge-sidecar/scripts/build-cuda-windows.ps1), not just the exe.",
+             copy them next to the exe (README, \"Build\"): a package that ships only the binary fails \
+             here every time.",
             exe_dir.display(),
             missing.join(", ")
         );

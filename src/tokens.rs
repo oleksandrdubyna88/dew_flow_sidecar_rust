@@ -96,8 +96,8 @@ impl TokenizerRegistry {
     ///
     /// Naming the SOURCE is the point rather than decoration: a count is reproducible only if the file
     /// behind it can be named afterwards, and a silently updated `tokenizer.json` changes every count
-    /// without changing anything a consumer can see. `GET /models`
-    /// (`todo/PLAN_tokenizer_registry.md` §3.2) will report these same facts on the wire.
+    /// without changing anything a consumer can see. `GET /models` reports these same facts on the
+    /// wire (`research/PLAN_tokenizer_registry.md` §3.2).
     pub(crate) fn describe(&self) -> String {
         self.entries
             .iter()

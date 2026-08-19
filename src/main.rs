@@ -1,7 +1,7 @@
 //! BGE sidecar: BGE-M3 dense + learned-sparse embeddings (FP32, official BAAI ONNX) and
 //! BGE-Reranker-v2-M3 cross-encoder scores, served over HTTP for the v2 code-RAG pipeline.
 //!
-//! Contract (mirrors research/PLAN_hybrid_search_onnx.md §A):
+//! Contract (the full wire shape lives in research/module_http_surface.md):
 //!   POST /embed  { texts: [string], kind: "doc"|"query", provider?: string,
 //!                  max_length?: usize, max_batch?: usize }
 //!                -> { dense: [[f32]], sparse: [{ indices: [u32], values: [f32] }] }
@@ -53,6 +53,7 @@ mod provider;
 mod state;
 mod testing;
 mod tokens;
+mod vram;
 mod wedge;
 mod wire;
 
@@ -78,7 +79,7 @@ use crate::wedge::*;
 pub(crate) async fn main() {
     // Stdout (the Aspire dashboard) PLUS an append-only file: the dashboard's scrollback is transient
     // and unreachable from scripts, which made every incident this week depend on a human pasting log
-    // fragments. The file survives restarts and is greppable — analyze-pass-log.mjs reads it directly.
+    // fragments. The file survives restarts and is greppable, so a tool can read a pass back afterwards.
     // Best-effort: an unwritable directory must never keep the sidecar from starting.
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -207,11 +208,12 @@ pub(crate) async fn main() {
         pinned_provider: OnceLock::new(),
         active_provider: Mutex::new(None),
         last_provider_error: Mutex::new(None),
-        loaded_embed_max_length: Mutex::new(None),
+        committed_embed_cap: std::sync::atomic::AtomicUsize::new(0),
         loaded_max_batch: Mutex::new(None),
         loaded_embed_dimension: Mutex::new(None),
         adapter,
         tokenizers,
+        vram: Mutex::new(vram::VramLedger::default()),
     });
 
     tracing::info!(

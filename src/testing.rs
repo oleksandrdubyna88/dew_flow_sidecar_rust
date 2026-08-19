@@ -78,11 +78,12 @@ pub(crate) fn app_state_full(config: Config, tokenizers: TokenizerRegistry) -> A
         pinned_provider: OnceLock::new(),
         active_provider: Mutex::new(None),
         last_provider_error: Mutex::new(None),
-        loaded_embed_max_length: Mutex::new(None),
+        committed_embed_cap: std::sync::atomic::AtomicUsize::new(0),
         loaded_max_batch: Mutex::new(None),
         loaded_embed_dimension: Mutex::new(None),
         adapter: None,
         tokenizers,
+        vram: Mutex::new(crate::vram::VramLedger::default()),
     })
 }
 

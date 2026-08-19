@@ -1,5 +1,6 @@
 use crate::engine_cache::RungCache;
 use crate::state::AppState;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -30,19 +31,33 @@ fn record(cell: &Mutex<Option<usize>>, what: &str, value: usize) {
     }
 }
 
-/// Records the sequence cap this request runs at, so `cap_for` can keep a query on the rung a pass is
-/// using and /health can report it.
+/// The cap this process is committed to, or `None` when no embedding engine is resident or being built.
+/// Lock-free by construction — see `AppState::committed_embed_cap` for why the read must not queue.
+pub(crate) fn committed_cap(state: &AppState) -> Option<usize> {
+    match state.committed_embed_cap.load(Ordering::Relaxed) {
+        0 => None,
+        cap => Some(cap),
+    }
+}
+
+/// Declares the cap a build is about to materialise, so a `query` arriving mid-build inherits the cap
+/// that build is aiming at instead of asking for one of its own and queueing to evict it.
 ///
-/// It used to EVICT both embedding engines whenever the cap changed, because `max_length` is baked into
-/// an ort session at build time. That was the right shape for one engine slot and the wrong price for a
-/// two-rung ladder: a pass crosses the boundary twice and each crossing cost 156-173 s of rebuild (see
-/// `RungCache`). The engines are now kept per rung, so a change is a lookup and this records, nothing more.
-pub(crate) fn record_embed_max_length(state: &AppState, requested: usize) {
-    record(
-        &state.loaded_embed_max_length,
-        "embed max_length",
-        requested,
-    );
+/// Called under the engine lock, and every path that leaves the build MUST follow it with `settle_cap`
+/// — a commitment a failed build left behind is exactly the stale intent this mirror replaced.
+pub(crate) fn commit_cap(state: &AppState, cap: usize) {
+    state.committed_embed_cap.store(cap, Ordering::Relaxed);
+}
+
+/// Re-derives the commitment from what the cache actually holds — the most recently used rung, or none.
+///
+/// The only writer that can ever LOWER the claim, and therefore the one every failure path owes:
+/// a build that threw, an eviction, an `/unload`. Takes the cache by reference so the caller must be
+/// holding it, which is what makes "mirror" true rather than hopeful.
+pub(crate) fn settle_cap<T>(state: &AppState, cache: &RungCache<T>) {
+    state
+        .committed_embed_cap
+        .store(cache.caps().last().copied().unwrap_or(0), Ordering::Relaxed);
 }
 
 /// Same bookkeeping for the BATCH, so /health can report what ran rather than what was configured.

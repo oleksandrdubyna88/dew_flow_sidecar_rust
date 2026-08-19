@@ -18,6 +18,7 @@ flavour, what the endpoints are, the VRAM arithmetic, the WSL/MIGraphX recipe. T
 | [module_inference.md](module_inference.md) | Engines, the rung cache, shape pinning, the settling retry, the timing spans — and the measurement behind each |
 | [module_http_surface.md](module_http_surface.md) | The five routes, their wire shapes, and the fields that exist to prevent a specific wrong reading |
 | [module_runtime_preflight.md](module_runtime_preflight.md) | Config, provider resolution, the DXGI device mapping, startup checks |
+| [PLAN_vram_per_engine.md](PLAN_vram_per_engine.md) | Design record, IMPLEMENTED 2026-08-19 — how much of the card each engine's BUILD took, published only when it was attributable to that build alone (2 175 MB for the dual embed session, measured on an R9700; teardown returned 2 183 MB). Also the record of a plan whose own wire-compatibility claim was refuted by reading the consumer before writing a line |
 | [PLAN_reliability_tail.md](PLAN_reliability_tail.md) | Design record, IMPLEMENTED 2026-08-16 — the whole tail of the 24/7 audit, eight items, each with the observation that made it a defect. Also the record of a plan whose own line references decayed against its own work twice, and what that cost |
 | [PLAN_tokenizer_registry.md](PLAN_tokenizer_registry.md) | Design record, IMPLEMENTED 2026-08-16 — tokenizers as a startup-built registry, and `GET /models` |
 | [PLAN_response_timings.md](PLAN_response_timings.md) | Design record, IMPLEMENTED 2026-08-15 — `timings` and `request_id` on `/embed` and `/rerank` |

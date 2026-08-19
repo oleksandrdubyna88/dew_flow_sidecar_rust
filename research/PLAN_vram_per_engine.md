@@ -1,12 +1,19 @@
 # PLAN — VRAM per engine, or an honest refusal to guess it
 
-> Status: **plan only, nothing implemented yet, 2026-08-17.** Scope: `src/adapters.rs`,
-> `src/provider.rs`, `src/wire.rs`, `src/introspection.rs`.
+> Status: **IMPLEMENTED, 2026-08-19.** Scope as built: `src/vram.rs` (new), `src/adapters.rs`,
+> `src/provider.rs`, `src/wire.rs`, `src/state.rs`, `src/introspection.rs`.
 >
 > Raised from `dew_flow_rag_qln`, whose runtime panel has labelled the split unavailable since it shipped
 > and whose promoted plan (`dew_flow_rag_qln · research/PLAN_runtime_panel.md`) records that this item
 > **was owned by no repository at all** — its status line said it had been raised here, and it had not.
-> This plan closes that.
+> This plan closed that.
+>
+> **What it delivered, measured on the R9700 the day it shipped:** the dual bge-m3 embed session's build
+> allocates **2 175 MB**, and tearing it down returned **2 183 MB** — a 0.37 % disagreement, which is the
+> pass's own transient buffers going with the session. `/health` carries it as `vram_at_load`, alongside
+> the count of samples thrown away for overlap. See [What shipped differently](#what-shipped-differently)
+> before reading the design below: three of its decisions changed under measurement, and one of its
+> premises about the wire was simply wrong.
 
 ## The symptom
 
@@ -130,14 +137,85 @@ has exactly this shape: a `#[cfg(windows)]` DXGI module and an `None` for everyt
   stated tolerance of the recorded one. This is the only step that proves the number means anything, and
   it cannot run in CI.
 
+## What shipped differently
+
+Four deviations, and the first is the one worth reading.
+
+### 1. The wire change this plan asked for would have broken the only consumer
+
+Build order step 3 said: *"Three booleans become three entries each carrying `loaded: bool` and
+`load_bytes: Option<u64>`; `/health` consumers that only read the boolean keep working, which matters
+because the RAG panel ships separately from this binary."*
+
+The reasoning is right and the conclusion is false. Checked against the consumer before writing anything:
+`dew_flow_rag_qln · src/Rag.Infrastructure/Runtime/RuntimeInspector.cs` reads
+`loaded.TryGetProperty(role, out var isLoaded) && isLoaded.ValueKind == JsonValueKind.True` in
+`ResidentModels`, and `LoadedRoles` does the same. A JSON object is `ValueKind.Object`, not `.True` — so
+turning the booleans into entries would have emptied the runtime panel of every model, on the very
+surface this figure exists to fill, in a repository that ships separately and would not have been
+updated in the same change.
+
+**Shipped instead:** `loaded` is untouched, and `vram_at_load` is a SIBLING object on `/health`. A test
+(`wire.rs`, `the_loaded_flags_stay_booleans_so_a_consumer_that_only_knows_them_keeps_working`) asserts the
+three fields serialize as booleans, so the next person to have this idea meets a red test rather than a
+blank panel.
+
+### 2. Absent needed four states, not two
+
+The DoD asked for "`None` with a reason it can be told apart from zero", and two states could not carry
+it. `Attribution` is `Measured | Overlapped | NotSampled | NoGrowth`, each counted separately on the wire.
+`NoGrowth` is the one that had to be invented: a build sampled alone whose adapter usage did not grow is
+not a measurement of zero — it is evidence the allocation was invisible to this sampler — and publishing
+it as `0` would have read as "this engine is free", which is the single most misleading thing this field
+could say.
+
+### 3. A build counter alone cannot detect overlap
+
+The design said: keep the delta only if the build counter was 1 for the whole window. A counter tells a
+build whether it STARTED alone; it cannot tell a build that started alone that somebody joined it
+half-way. So there are two statics: `BUILDS_IN_FLIGHT`, and `OVERLAP_MARKS` which any build bumps when it
+finds another already in flight. A window compares the mark it opened with against the mark at close. The
+read order matters and is argued at `SoloBuildWindow::open`: the mark is read BEFORE counting in, so a
+joiner's bump can never land in the gap unobserved.
+
+### 4. What the delta covers, precisely
+
+It covers **session construction**, because that is what `load_session` brackets. On MIGraphX most of the
+allocation happens later, at the first kernel launch — the same lazy behaviour `CachePathLease` exists
+for — and that memory is not in this number. On DirectML, where it was measured, construction is where
+the weights land, which is why 2 175 MB is a credible figure for a 2.27 GB FP32 model. Not a defect;
+a stated boundary, repeated at the sampler and in `module_http_surface.md`.
+
+Also minor: `adapters::process_vram_bytes` is gated on a RESOLVED adapter rather than on the configured
+device id. With no resolution the sidecar passes the raw id to the EP, and an id DXGI could not map is
+one this sampler must not pretend to understand either.
+
 ## Definition of Done
 
-- [ ] `/health` reports per-engine load bytes, or `None` with a reason it can be told apart from zero.
-- [ ] A figure is published only when no other build overlapped it; the discard count is on the wire.
-- [ ] The overlap case has a test that fails against the naive delta.
-- [ ] Non-Windows and DXGI-failure paths report absent, never zero.
-- [ ] The unload cross-check is logged, and its agreement with the load figure is recorded here.
-- [ ] `research/architecture.md`'s *What does not exist yet* entry is updated — it currently says "No live
-      GPU telemetry", and this is not live telemetry either. Say precisely what now exists.
-- [ ] `dew_flow_rag_qln · research/module_runtime.md` is told: its "Nobody owns this" note is why this plan
-      exists, and its panel can stop labelling the split permanently unavailable.
+- [x] `/health` reports per-engine load bytes, or `None` with a reason it can be told apart from zero —
+      `vram_at_load`, with `unavailable_reason` and three discard counters.
+- [x] A figure is published only when no other build overlapped it; the discard count is on the wire.
+- [x] The overlap case has a test that fails against the naive delta —
+      `vram.rs · two_overlapping_builds_both_refuse_to_publish_and_are_counted_as_discards`, two real
+      threads held open on a barrier.
+- [x] Non-Windows and DXGI-failure paths report absent, never zero.
+- [x] The unload cross-check is logged, and its agreement with the load figure is recorded here:
+      **2 175 MB recorded at build, 2 183 MB freed at teardown** (R9700, DirectML, 2026-08-19). The 8 MB
+      excess is the inference pass's own buffers, freed with the session; a tolerance of ±5 % is what this
+      cross-check should be read against, and nothing tighter, because the sample is process-wide and any
+      other consumer of the card moves it.
+- [x] `research/architecture.md`'s *What does not exist yet* entry is updated — it said "No live GPU
+      telemetry", and this is not live telemetry either. It now says what exists and what still does not.
+- [x] `dew_flow_rag_qln · research/module_runtime.md` is told.
+
+## The open tail
+
+The **panel still shows 0**. This repository now publishes the figure; nothing reads it yet.
+`RuntimeInspector.ResidentModels` hardcodes `new LoadedModelVm(Text(models, role), 0, cap)` with the
+comment *"The sidecar does not report per-model VRAM; 0 says 'unknown', never 'none'"* — a comment that
+became false on 2026-08-19. Reading `vram_at_load.embed_bytes` / `rerank_bytes` (bytes here, MB there)
+is owned by `dew_flow_rag_qln` and is not tracked by this plan.
+
+Two smaller ones, both deliberate: MIGraphX/WSL and CUDA-on-Linux report `discarded_not_sampled` forever
+(DXGI is Windows), and the number is a LOAD, never residency — a second pass that allocates more is
+invisible to it.

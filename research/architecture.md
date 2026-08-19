@@ -20,15 +20,17 @@ everywhere. The customer's machine builds the flavour it needs.
   `tokenizers`, `tracing`.
 - **Execution providers** — DirectML (default feature), CUDA, MIGraphX, CPU. Selected at **build** time;
   `ORT_PROVIDER` only chooses among the ones compiled in.
-- **Layout** — **17 modules under `src/`**, none over 800 lines (2026-08-16; it was one 4 744-line
+- **Layout** — **18 modules under `src/`**, none over 800 lines (2026-08-16; it was one 4 744-line
   `main.rs` until then). `main.rs` keeps only the crate docs, the module list, `main`, `build_router`
   and the body-limit middleware. The rest, by job: `config`, `state`, `wedge` (the wedge detector),
   `engine_cache` (`RungCache`), `tokens` (the tokenizer registry), `preflight`, `wire` (request/response
   records), `introspection` (`/health`, `/models`, `/unload` — the routes that only READ),
   `handlers` (`/embed`, `/tokenize`, `/rerank` — the routes that COMPUTE), `inference`,
   `compile_cache` (the MIGraphX cache paths, `CompileWatch` and `CachePathLease`), `bookkeeping`, `canary`,
-  `provider`, `logging`, and `testing` (shared test fixtures). Plus `src/adapters.rs` (DXGI device
-  resolution, Windows-only) and `vendor-fastembed/` (a full vendored copy carrying one marked patch).
+  `provider`, `vram` (what a build cost on the card, and when that may be attributed to one engine),
+  `logging`, and `testing` (shared test fixtures). Plus `src/adapters.rs` (DXGI device
+  resolution and the per-process memory sample, Windows-only) and `vendor-fastembed/` (a full vendored
+  copy carrying one marked patch).
   Visibility is `pub(crate)` throughout: a binary crate has no external API to narrow.
 
 ## Containers
@@ -72,7 +74,7 @@ graph TD
 
 | Route | Body | Answer |
 |---|---|---|
-| `GET /health` | — | `status` (`ok` \| `wedged`), activity, `in_flight[]`, `wedged`, requested/compiled/active provider, `provider_ready`, last provider error, exe and runtime-manifest hashes + `provenance_ready`, loaded models, limits, DXGI adapter |
+| `GET /health` | — | `status` (`ok` \| `wedged`), activity, `in_flight[]`, `wedged`, requested/compiled/active provider, `provider_ready`, last provider error, exe and runtime-manifest hashes + `provenance_ready`, loaded models, `vram_at_load` (bytes each engine's BUILD allocated, or absent with a reason), limits, DXGI adapter |
 | `GET /models` | — | one row per model or registered tokenizer: `id`, `name`, `kind` (`dense+sparse` \| `rerank` \| `tokenizer-only`), `dimension` (measured, `null` = unknown), `max_sequence_length`, `tokenizer`, `available` (the engine), `tokenizer_available` (the file) |
 | `POST /embed` | `texts[]`, `kind`, `provider?`, `max_length?`, `max_batch?`, `request_id?` | `dense[][]`, `sparse[]`, `dimension`, token accounting, `request_id`, `timings` |
 | `POST /rerank` | `query`, `documents[]`, `provider?`, `max_batch?`, `request_id?` | `scores[]` in input order, `request_id`, `timings` |
@@ -177,6 +179,14 @@ it. Measured 2026-07-28 at `(64, 1024)`: dense returned 80 rows for a 128-row in
 boundary twice per pass; before the cache each crossing evicted both engines — ~5.5 minutes per pass,
 forever.
 
+**Which cap a request runs at** is decided from `AppState::committed_embed_cap` — an atomic mirror of
+that cache's occupancy, written only under the engine lock and read without it. A `query` inherits the
+cap this process is COMMITTED to (a resident rung, or the one a build is materialising right now) and
+never moves it; a `doc` states its own. Until 2026-08-19 the cap was read from a cell every request
+stamped with what it ASKED for, before the lock and before any build — so a request that was then refused
+or failed its canary left a cap no engine had been built at, and the next query built it, evicting the
+rung the pass was using. The same requested-vs-active conflation the provider fields exist to prevent.
+
 ### Logging
 
 `tracing` with two layers: stdout **with** ANSI, and a file **without**, at
@@ -212,9 +222,17 @@ holder's activity and elapsed time, because nothing is wrong with the request an
 
 ### CI
 
-`.github/workflows/` builds the crate. There is **no `cargo fmt` gate**: the checkout carries ~109
-pre-existing rustfmt diffs, and the gate is open work in
-[../todo/PLAN_sidecar_product.md](../todo/PLAN_sidecar_product.md).
+`.github/workflows/` builds the crate on ubuntu (CPU flavour) and windows (DirectML), runs the tests, and
+since 2026-08-19 **checks formatting**: `cargo fmt --package bge-sidecar --check`, ubuntu only. `--package`
+so the vendored fastembed fork stays byte-identical to upstream.
+
+The gate was deferred for a year-long-sounding reason that had quietly expired. It was argued that
+reformatting would destroy the diff against the sources this crate was carried from — true while the code
+was one 4 744-line `main.rs`, and no longer true after the 2026-08-16 split rewrote every file anyway. By
+then the drift had also spread from "790 lines of main.rs" to 233 hunks across 19 files. It was applied as
+its own mechanical commit, exactly as the deferral asked.
+
+A third job checks the plan lifecycle from the shared rules submodule.
 
 ## Modules
 
@@ -228,12 +246,19 @@ pre-existing rustfmt diffs, and the gate is open work in
 
 - **No metrics endpoint** (no Prometheus, no OpenTelemetry) and no `#[instrument]` spans. Every timing
   is a manual `Instant`.
-- **No live GPU telemetry.** `adapter.vram_mb` is DXGI's static capacity sampled once at startup;
-  `mxr_cache_mb` is disk usage of the compiled-program cache, not memory.
+- **No live GPU telemetry — and `vram_at_load` is not it.** Since 2026-08-19 `/health` reports how many
+  bytes each engine's BUILD allocated on the adapter (`vram_at_load`, see
+  [PLAN_vram_per_engine.md](PLAN_vram_per_engine.md)); measured on an R9700, the dual embed session costs
+  2 175 MB. That is a figure taken ONCE, around session construction, and never re-sampled: a later pass
+  that allocates more is invisible to it, and under MIGraphX most of the allocation happens at the first
+  kernel launch and is therefore not in the number at all. It is also Windows-only, because DXGI is. What
+  still does not exist is a reading of what the card holds RIGHT NOW. `adapter.vram_mb` remains DXGI's
+  static capacity sampled once at startup; `mxr_cache_mb` remains disk usage of the compiled-program
+  cache, not memory.
 - **No queue-depth signal.** Concurrency is implicit in mutex contention, and `/health` deliberately
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
   `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
 - **No integration test suite** — testing is inline `#[cfg(test)]` beside what each module tests
-  (82 tests), with shared fixtures in `src/testing.rs`.
+  (108 tests), with shared fixtures in `src/testing.rs`.
 - **Distribution is not built**: no build-recipe-as-data, no self-verification gate, no LICENSE or
   third-party notices.

@@ -1,6 +1,6 @@
 use crate::bookkeeping::{
-    dense_dimension, record_embed_dimension, record_embed_max_length, record_max_batch,
-    remember_engine,
+    commit_cap, committed_cap, dense_dimension, record_embed_dimension, record_max_batch,
+    remember_engine, settle_cap,
 };
 use crate::canary::load_validated_dual;
 use crate::compile_cache::{
@@ -201,17 +201,14 @@ pub(crate) fn embed_blocking(
     limits: Limits,
     request_id: &str,
 ) -> anyhow::Result<EmbedResponse> {
-    // Read the current cap under its own lock and drop it before record_embed_max_length takes it again.
-    let resident = state
-        .loaded_embed_max_length
-        .lock()
-        .ok()
-        .and_then(|loaded| *loaded);
+    // What this process is COMMITTED to — a rung that is resident, or one a build is materialising right
+    // now. Read lock-free, because this decision happens before the engine lock is taken; and never from
+    // what an earlier request merely ASKED for, which is what let a refused request capture the next
+    // query's cap. See `AppState::committed_embed_cap`.
     let limits = Limits {
-        max_length: cap_for(kind, limits.max_length, resident),
+        max_length: cap_for(kind, limits.max_length, committed_cap(state)),
         ..limits
     };
-    record_embed_max_length(state, limits.max_length);
     record_max_batch(state, limits.max_batch);
 
     // Counted here and nowhere else: AFTER cap_for has settled the effective cap (a `query` may not move
@@ -295,7 +292,7 @@ pub(crate) fn embed_natural(
     // ONE forward pass over the official FP32 model: the export returns both heads per run
     // (`sentence_embedding` + `token_embeddings`), so the dense/sparse split lives in the
     // post-processing, not in separate sessions — see Bgem3DualEmbedding and
-    // research/PLAN_bge_sidecar_unified_session.md. Still deliberately NOT the INT8-quantized
+    // research/module_inference.md. Still deliberately NOT the INT8-quantized
     // all-in-one Bgem3Embedding — retrieval quality over speed (locked decision).
     set_activity(state, "embed: waiting for the engine");
     // Queue wait is measured around the MUTEX only — another request holding the engine is the
@@ -322,13 +319,21 @@ pub(crate) fn embed_natural(
         stamp.enter(Phase::Building, "embed: building and canary-checking the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
         let building = Instant::now();
         let cache = CachePathLease::hold(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE);
-        let built = load_validated_dual(state, provider_hint, limits, retry_short, &cache)?;
+        // Claimed BEFORE the build so a query arriving during these minutes inherits the cap this build
+        // is aiming at; rolled back to real residency the moment the build fails, because a commitment a
+        // failed build left behind is the stale intent this mirror exists to replace.
+        commit_cap(state, limits.max_length);
+        let built = load_validated_dual(state, provider_hint, limits, retry_short, &cache)
+            .inspect_err(|_| settle_cap(state, &guard))?;
         remember_engine(&mut guard, "embed", limits.max_length, built);
         session_build_ms = building.elapsed().as_millis() as u64;
         Some(cache)
     } else {
         None
     };
+    // Resident either way now, and `get_mut` above has promoted this rung to most-recently-used — so the
+    // mirror follows the cache rather than the request. Under the guard, which is what keeps it a mirror.
+    settle_cap(state, &guard);
     stamp.enter(
         Phase::Running,
         format!("embed: embedding {} row(s)", texts.len()),
@@ -629,6 +634,7 @@ pub(crate) fn sigmoid(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_cache::RungCache;
     use crate::testing::*;
 
     /// A search query runs at whatever cap is already resident and never moves it. Before this rule, a Fast
@@ -661,6 +667,56 @@ mod tests {
             cap_for("", 512, Some(256)),
             512,
             "an unset kind is treated as a doc, not as a query"
+        );
+    }
+
+    /// A cap that no engine was ever built at must not capture the next query.
+    ///
+    /// The defect: every /embed stamped `loaded_embed_max_length` with what it ASKED for, before the lock
+    /// and before any build. A `doc` request that was then refused (503 behind a wedged engine) or that
+    /// failed its canary still left its cap in that cell — so the next `query` inherited a cap nothing had
+    /// been built at, missed in the cache, BUILT it, and at the shipped `EMBED_ENGINE_CACHE_RUNGS=1`
+    /// evicted the rung the pass was using. Exactly the thrash `cap_for` exists to prevent, arriving
+    /// through the value handed to it.
+    #[test]
+    fn a_cap_no_engine_was_ever_built_at_cannot_capture_the_next_query() {
+        let state = app_state();
+        let resident = cache_of(1, &[(256, 7u8)]);
+        settle_cap(&state, &resident);
+        assert_eq!(
+            cap_for("query", 1024, committed_cap(&state)),
+            256,
+            "precondition: 256 is the resident rung"
+        );
+
+        // A doc request commits to 1024 — and its build fails. Every path out of a build settles the
+        // commitment back to what the cache actually holds.
+        commit_cap(&state, 1024);
+        settle_cap(&state, &resident);
+
+        assert_eq!(
+            cap_for("query", 1024, committed_cap(&state)),
+            256,
+            "a build that never produced an engine must leave nothing behind for a query to inherit"
+        );
+    }
+
+    /// The counter-guarantee, and the reason this is a commitment rather than a residency reading: a
+    /// query arriving DURING a cold build must inherit the cap that build is aiming at. Reading pure
+    /// residency would answer "nothing is resident", the query would state its own cap, and the process
+    /// would build a second engine beside the one it is already paying minutes for.
+    #[test]
+    fn a_query_arriving_during_a_build_inherits_the_cap_that_build_is_aiming_at() {
+        let state = app_state();
+        settle_cap(&state, &RungCache::<u8>::new(1));
+        assert_eq!(committed_cap(&state), None, "nothing built yet");
+
+        commit_cap(&state, 1024);
+
+        assert_eq!(
+            cap_for("query", 256, committed_cap(&state)),
+            1024,
+            "the query waits for the engine being built instead of asking for a second one beside it"
         );
     }
 
@@ -769,10 +825,6 @@ mod tests {
         assert!(unpin_rows(vec!["only-one".to_string()], &positions).is_err());
     }
 
-    /// The common case — a settled session — must cost exactly ONE run. This is the regression that
-    /// retired the throwaway warm-up: it charged an extra full-cap pass on EVERY engine build, which
-    /// pushed a pass's first request to ~608s, past the host's 600s HTTP budget, and the pass
-    /// "completed" with 0 methods embedded.
     /// The number a host must send to get ONE batch, and the reason this is reported rather than derived
     /// by the caller: sending `max_batch` costs a second, near-empty batch. Measured over a whole
     /// aspnetcore pass 2026-08-18 — 1260 of 1263 calls arrived one text too large and each computed 128
@@ -807,6 +859,10 @@ mod tests {
         assert_eq!(embed_batch_texts(&cfg(1, "auto"), "migraphx"), 1);
     }
 
+    /// The common case — a settled session — must cost exactly ONE run. This is the regression that
+    /// retired the throwaway warm-up: it charged an extra full-cap pass on EVERY engine build, which
+    /// pushed a pass's first request to ~608s, past the host's 600s HTTP budget, and the pass
+    /// "completed" with 0 methods embedded.
     #[test]
     fn a_settled_session_costs_exactly_one_run() {
         let mut calls = 0;
@@ -890,23 +946,9 @@ mod tests {
         assert!(err.to_string().contains("genuine failure"));
     }
 
-    // The default is the "we do not know" state, and it must not read as "nothing was truncated":
-    // token_accounting stays false and both vectors stay empty, so a host that checks the flag cannot
-    // mistake an absent measurement for a clean one.
-    // The configured batch is a FALLBACK, not a report. Every /embed carries the operator's own batch, so
-    // a health field that echoed the config read as the running value — which is how "batch 126" and
-    // "max_batch 4" and an actual 64 coexisted in one answer, none of them describing the same thing.
-    #[test]
-    fn a_requests_batch_overrides_the_configured_default() {
-        assert_eq!(rerank_batch(&config("dml"), 64), 64, "the request wins");
-        assert_eq!(
-            rerank_batch(&config("dml"), 0),
-            config("dml").max_batch,
-            "0 falls back to the config"
-        );
-    }
-
-    /// ~110 KB of constant text, cloned once per chunk of every pinned request. One allocation, shared.
+    /// The ~110 KB constant is BUILT once and handed out by reference. Each ruler ROW a layout needs is
+    /// still a clone into the batch — that is what `pin_shape` hands the engine — but the `repeat(4096)`
+    /// behind it happens exactly once per process rather than once per request.
     #[test]
     fn the_ruler_is_allocated_once_and_shared() {
         assert!(
@@ -919,7 +961,8 @@ mod tests {
         );
     }
 
-    /// is what lets the pinned path re-measure from the returned rows rather than carrying a number over.
+    /// Unpinning must not change the WIDTH of a row, which is what lets the pinned path re-measure the
+    /// dimension from the rows that actually leave rather than carrying a number over from the padded batch.
     #[test]
     fn unpinning_leaves_the_width_untouched() {
         let padded = vec![vec![0.0f32; 1024], vec![1.0f32; 1024], vec![2.0f32; 1024]];

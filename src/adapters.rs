@@ -78,12 +78,36 @@ pub fn resolve(_device_id: i32) -> Option<ResolvedAdapter> {
     None // DirectML is Windows-only; other builds (CUDA/CPU) keep the raw id semantics.
 }
 
+/// How many bytes THIS PROCESS currently holds in the adapter's local memory segment, or `None` when
+/// there is no way to ask.
+///
+/// `plain_index` is the DirectML EP's own numbering — the index `ResolvedAdapter::dml_device_id`
+/// carries — so the sample is taken against the card the engines actually run on rather than against
+/// whichever adapter enumerates first. Pass the resolved index; a caller that has no resolved adapter
+/// has no business guessing one, and `None` is the honest answer there.
+///
+/// `None` is never a zero. A process that holds no VRAM and a process that could not be asked are
+/// different facts, and the field this feeds exists precisely to keep them apart.
+#[cfg(windows)]
+pub(crate) fn process_vram_bytes(plain_index: i32) -> Option<u64> {
+    dxgi::process_local_usage(u32::try_from(plain_index).ok()?)
+}
+
+/// DXGI is Windows. The MIGraphX (WSL/ROCm) and CUDA-on-Linux flavours have no equivalent here, and
+/// that is a stated limit rather than a gap to fill later with a second, differently-scaled mechanism.
+#[cfg(not(windows))]
+pub(crate) fn process_vram_bytes(_plain_index: i32) -> Option<u64> {
+    None
+}
+
 #[cfg(windows)]
 mod dxgi {
     use super::AdapterDesc;
+    use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory6, DXGI_ADAPTER_FLAG_SOFTWARE,
-        DXGI_ERROR_NOT_FOUND, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        CreateDXGIFactory1, IDXGIAdapter1, IDXGIAdapter3, IDXGIFactory6,
+        DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
     };
 
     /// Hardware-and-software adapters in "fastest first" order (the picker's numbering source).
@@ -121,6 +145,19 @@ mod dxgi {
             adapters.push(describe(&adapter)?);
         }
         Some(adapters)
+    }
+
+    /// `IDXGIAdapter3::QueryVideoMemoryInfo` for the LOCAL segment — the one figure DXGI reports about
+    /// THIS process rather than about the machine, which is what makes a before/after delta around a
+    /// build attributable at all. `IDXGIAdapter3` is a cast of the adapter we already enumerate; a
+    /// driver too old to serve it yields `None` like every other failure here.
+    pub fn process_local_usage(index: u32) -> Option<u64> {
+        let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory1() }.ok()?;
+        let adapter: IDXGIAdapter3 = unsafe { factory.EnumAdapters1(index) }.ok()?.cast().ok()?;
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }
+            .ok()?;
+        Some(info.CurrentUsage)
     }
 
     fn describe(adapter: &IDXGIAdapter1) -> Option<AdapterDesc> {

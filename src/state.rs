@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 /// Lazily-loaded model engines. Each is guarded by its own mutex: the GPU serializes inference
 /// anyway, and the lock makes the first-use load race-free. Loads happen inside spawn_blocking.
 /// BOTH embedding heads live in ONE `Bgem3DualEmbedding` per rung (see `RungCache` and
-/// research/PLAN_bge_sidecar_unified_session.md — the official export returns both heads from one
+/// research/module_inference.md — the official export returns both heads from one
 /// forward pass, so two sessions doubled every cost for nothing); rerank runs at one fixed cap, so
 /// it has nothing to key on.
 pub(crate) struct Engines {
@@ -54,10 +54,22 @@ pub(crate) struct AppState {
     /// Why the last EP registration failed, verbatim from ort. Kept so /health can explain a
     /// `provider_ready: false` instead of merely asserting it.
     pub(crate) last_provider_error: Mutex<Option<String>>,
-    /// The cap the MOST RECENTLY USED embedding pair was built with. Engines are kept per rung, so this
-    /// no longer decides what gets evicted — it is what a `query` runs at (`cap_for`) and what /health
-    /// reports as current. See `record_embed_max_length`.
-    pub(crate) loaded_embed_max_length: Mutex<Option<usize>>,
+    /// The sequence cap this process is COMMITTED to: the most recently used resident rung, or the one
+    /// a build is materialising right now. `0` = none. What a `query` inherits (`cap_for`) and what
+    /// /health reports as `loaded_embed_max_length`.
+    ///
+    /// It is a mirror of `Engines.embed`'s occupancy, maintained under that engine's lock by
+    /// `commit_cap` / `settle_cap`, and read WITHOUT it. Both halves are the design:
+    ///
+    /// - **Read without the lock**, because a query arriving during somebody else's pass is the ordinary
+    ///   case, and blocking a cap decision on the engine mutex is the rule /health follows everywhere
+    ///   else (`loaded_now`'s try_lock) applied to the one decision that has to happen before the lock.
+    /// - **Written only where residency changes**, because this used to be a cell every request stamped
+    ///   with what it ASKED for, before any build. A request that was then refused (503) or failed its
+    ///   canary still left its cap here, and the next `query` inherited a cap no engine had ever been
+    ///   built at — building it, and at the shipped one-rung capacity evicting the rung the pass was
+    ///   using. The same conflation the requested/active provider split exists to prevent, one field over.
+    pub(crate) committed_embed_cap: std::sync::atomic::AtomicUsize,
     /// The batch the most recent embed actually ran at — the request's override, not the config default.
     /// Reported by /health as `loaded_max_batch`, which is what makes the configured value readable as a
     /// default rather than as a fact: every request carries the operator's own batch, so the configured
@@ -73,6 +85,9 @@ pub(crate) struct AppState {
     pub(crate) loaded_embed_dimension: Mutex<Option<usize>>,
     /// The DXGI adapter ORT_DEVICE_ID resolves to (None = mapping unavailable — raw id fallback).
     pub(crate) adapter: Option<adapters::ResolvedAdapter>,
+    /// What building each engine cost on that adapter, where it could be attributed to ONE engine —
+    /// see `vram::VramLedger`. Never a residency reading: nothing here re-samples after the build.
+    pub(crate) vram: Mutex<crate::vram::VramLedger>,
     /// Every tokenizer this build can COUNT with, resolved at startup — see `TokenizerRegistry`.
     ///
     /// Deliberately a wider set than the models this process embeds: the semantic channel runs on Ollama,

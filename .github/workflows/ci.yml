@@ -46,18 +46,20 @@ jobs:
       - name: Test
         run: cargo test --release --locked ${{ matrix.features }}
 
-      # No `cargo fmt --check` here yet, deliberately. It was added, it failed on the first run, and the
-      # reason is worth writing down rather than papering over: the crate carries pre-existing formatting
-      # drift — `cargo fmt --package bge-sidecar` rewrites 790 lines of main.rs and 52 of adapters.rs. That
-      # is a decision about this codebase's style, not a side effect a CI file should make on its way past;
-      # a reformat that size also destroys the diff against the sources this crate was carried from, which
-      # is the one thing making the port reviewable right now.
+      # ON since 2026-08-19. It was deferred for a reason that had quietly expired: the argument was that
+      # reformatting destroys the diff against the sources this crate was carried from — true while the
+      # code was one 4 744-line main.rs, and no longer true after the 2026-08-16 split rewrote every file
+      # anyway. By then the drift had spread from "790 lines of main.rs" to 233 hunks across 19 files, so
+      # waiting only made the eventual commit larger. Applied as its own mechanical commit, as the
+      # deferral asked.
       #
-      # To turn it on: run `cargo fmt --package bge-sidecar` as its own commit, then add
-      #   - name: Format check
-      #     if: matrix.os == 'ubuntu-latest'
-      #     run: cargo fmt --package bge-sidecar --check
-      # (--package, so the vendored fastembed fork stays byte-identical to upstream.)
+      # --package, so the vendored fastembed fork stays byte-identical to upstream — its formatting is
+      # upstream's business and a diff against it is what makes the one marked patch reviewable.
+      # ubuntu only: formatting does not vary by platform, and running it twice only doubles the ways a
+      # green build can go red.
+      - name: Format check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --package bge-sidecar --check
 
   # The plan lifecycle, enforced from the shared rules repository rather than four times over — the check
   # reads markdown, not code, so one implementation serves every consumer (see .claude/rules/shared/README.md).

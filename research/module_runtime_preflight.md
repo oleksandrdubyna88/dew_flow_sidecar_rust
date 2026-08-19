@@ -83,13 +83,23 @@ an unresolved mapping is reported, not guessed.
 `ResolvedAdapter` carries the name, `vram_mb` (**total capacity**, sampled once — not a live reading),
 the LUID, the requested device and the resolved DML id.
 
+The same module also owns the one memory question DXGI can answer about US rather than about the machine:
+`process_vram_bytes(plain_index)` is `IDXGIAdapter3::QueryVideoMemoryInfo` for the LOCAL segment, i.e. how
+many bytes **this process** currently holds on that adapter. It takes the resolved plain index, so the
+sample is taken against the card the engines actually run on, and it is gated on a resolved adapter: with
+no resolution the sidecar passes the raw id to the EP, and an id DXGI could not map is one this sampler
+must not pretend to understand either. `None` on every failure and on every non-Windows build — never a
+zero, because a process holding no VRAM and a process that could not be asked are different facts. What
+consumes it is `src/vram.rs` (see [PLAN_vram_per_engine.md](PLAN_vram_per_engine.md)).
+
 ## AppState
 
 | Field | Purpose |
 |---|---|
 | `activity` | One free-text line — `"idle"`, `"embed: waiting for the engine"`, `"embed: building and canary-checking the session…"` — polled through `/health` so a host UI can show "compiling models" instead of a dead card during a multi-minute first build. One slot, last writer wins |
 | `pinned_provider` | The provider of the first successful session, fixed until restart |
-| `loaded_embed_max_length` / `loaded_max_batch` | What actually ran, as opposed to what was configured |
+| `committed_embed_cap` / `loaded_max_batch` | What actually ran, as opposed to what was configured. The cap is an atomic mirror of the engine cache's occupancy — written under that lock, read without it; see *A cap is a commitment* in [module_inference.md](module_inference.md) |
+| `vram` | What each engine's BUILD cost on the adapter, and how many samples were discarded as unattributable |
 | `active_provider` / `last_provider_error` | Filled by session creation; read by `/health` with `try_lock` |
 | `exe_sha256` / `runtime_manifest_sha256` | Identity of the binary and of the provider libraries beside it |
 

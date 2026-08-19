@@ -158,6 +158,25 @@ Plus `exe_sha256` and `runtime_manifest_sha256` — so a benchmark can prove it 
 and the same provider libraries; `limits` (configured **and** `loaded_*`, the requested-versus-active
 split again); `resident_embed_max_lengths`; and the resolved DXGI `adapter`.
 
+And `vram_at_load` (2026-08-19, [PLAN_vram_per_engine.md](PLAN_vram_per_engine.md)) — how much adapter
+memory each engine's BUILD allocated:
+
+| Field | Answers |
+|---|---|
+| `embed_bytes` / `rerank_bytes` | Bytes that engine's build allocated, when it could be attributed to that build ALONE. Measured on an R9700: the dual embed session costs 2 175 MB. `null` is never a zero |
+| `discarded_overlaps` | Samples thrown away because another engine's build overlapped this one. On the wire because otherwise "unavailable" and "never attributable on this machine" look identical — and only the second would justify serializing every build to obtain the number |
+| `discarded_not_sampled` / `discarded_no_growth` | The other two ways of being absent: nothing to sample (no DXGI, no resolved adapter, not Windows), and sampled-alone-but-flat, which is evidence the allocation was invisible here rather than a measurement of zero |
+| `unavailable_reason` | Why both figures are absent, in a sentence. `null` once either exists |
+
+**It is a LOAD, not residency**, and the name says so: the delta is taken around session construction and
+never re-sampled. A later pass that allocates more is invisible to it, and under MIGraphX most of the
+allocation happens at the first kernel launch and is not in the number at all.
+
+`loaded`'s three booleans are **untouched** by this addition, deliberately: the plan proposed replacing
+them with objects carrying the bytes, and `dew_flow_rag_qln`'s `RuntimeInspector` tests them for
+`JsonValueKind.True` — an object there empties the runtime panel of every model. A test in `wire.rs`
+pins the boolean shape so the idea meets a red test rather than a blank panel.
+
 ### `POST /unload`
 
 `{}` drains every resident rung; `{ "embed_max_lengths": [256], "rerank": true }` drops named ones. A
@@ -179,7 +198,8 @@ LLM ends up sharing the card.
 |---|---|
 | `token_accounting: false` | A caller reads "no truncation reported" as "nothing was truncated". Truncation here is silent: an over-long input is embedded as a prefix, with no error and no warning |
 | `truncated[]` | Same, per text |
-| `loaded_max_batch` / `loaded_embed_max_length` | The configured default reads as a fact. It described an intention — "why 15 methods/s when the batch is 126?" produced three different numbers, none of them the one that ran |
+| `loaded_max_batch` / `loaded_embed_max_length` | The configured default reads as a fact. It described an intention — "why 15 methods/s when the batch is 126?" produced three different numbers, none of them the one that ran. `loaded_embed_max_length` was itself guilty of this until 2026-08-19: every request stamped it with the cap it ASKED for, before any build, so it named a rung after `/unload` had dropped it and `loaded.dense` in the same body said `false`. It now mirrors what the engine cache actually holds |
+| `vram_at_load.unavailable_reason` + the discard counters | A `0` reads as "this engine is free", and one bare `null` cannot say whether the figure is missing because nothing was built, because DXGI is absent, or because every build so far overlapped another — and only the last is an argument for changing how the number is obtained |
 | `timings.queue_wait_ms` | A request that waited behind another caller looks like a slow model |
 | `activity` | A multi-minute first-build renders as a dead card in the host UI |
 | `in_flight[].wedged` + `ceiling_seconds` | A stuck inference and a healthy cold compile look identical. The elapsed time alone cannot separate them — the ceiling has to travel with it |

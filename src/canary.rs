@@ -22,8 +22,10 @@ use std::sync::OnceLock;
 // serve. Retries absorb defect 2; a cache wipe + one clean recompile heals defect 1; anything past
 // that fails the request rather than silently indexing garbage.
 
-/// Must match `CANARY_TEXT` in scripts/generate-canary-reference.mjs — the reference vector was
-/// computed from exactly this string.
+/// The exact string the stored reference vector was computed from. Change it and every engine fails
+/// its canary, because the reference cannot be recomputed here: the generator that produced
+/// `canary-reference.f32le` stayed in the monorepo this crate was carried out of, and replacing it is
+/// open work (`todo/PLAN_sidecar_product.md`, phase 2).
 pub(crate) const CANARY_TEXT: &str =
     "A canary sentence for the bge-m3 engine self-check: the quick brown fox jumps over the lazy dog 0123456789.";
 
@@ -32,8 +34,9 @@ pub(crate) const CANARY_TEXT: &str =
 pub(crate) const CANARY_MIN_COSINE: f32 = 0.99;
 
 /// The dense embedding of `CANARY_TEXT`, captured 2026-07-31 from the unified build that passed the
-/// parity gate bit-exact at both caps (scripts/generate-canary-reference.mjs). Regenerate only when
-/// the MODEL deliberately changes — never to green a failing canary.
+/// parity gate bit-exact at both caps. Regenerate only when the MODEL deliberately changes — never to
+/// green a failing canary; and see `CANARY_TEXT` for why regenerating is not currently possible from
+/// this repository alone.
 pub(crate) fn canary_reference() -> &'static [f32] {
     static REFERENCE: OnceLock<Vec<f32>> = OnceLock::new();
     REFERENCE.get_or_init(|| {

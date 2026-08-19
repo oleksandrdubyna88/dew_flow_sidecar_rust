@@ -68,11 +68,19 @@ wrong".
   provider terms above belong in the notices too — stating that we never redistribute them is part of the
   reason we may use them.
 - **Release artefacts** for the flavours we *may* ship: the CPU build ships freely.
-- **The `cargo fmt` gate**, deferred deliberately: the crate carries pre-existing drift, and running the
-  formatter rewrites 790 lines of `main.rs` and 52 of `adapters.rs`. That is a style decision on its own
-  merits, not something to smuggle in behind a CI commit — and a reformat that size destroys the diff against
-  the sources this crate was carried from, which is what makes the port reviewable. The command and the
-  two-step recipe are left in `ci.yml`.
+- ~~**The `cargo fmt` gate**, deferred deliberately~~ — **done 2026-08-19.** The deferral's reason had
+  expired without anyone noticing: it rested on preserving the diff against the sources this crate was
+  carried from, and the 2026-08-16 split into 17 modules had already destroyed that diff. Meanwhile the
+  drift spread from "790 lines of `main.rs`" to **233 hunks across 19 files** — waiting made it worse
+  monotonically. Applied as its own mechanical commit, exactly as the deferral asked, and the gate is on
+  (`cargo fmt --package bge-sidecar --check`, ubuntu only; `--package` so the vendored fork stays
+  byte-identical to upstream).
+- **The canary's reference vector cannot be regenerated from this repository** (found 2026-08-19 while
+  auditing the code's own citations). `canary.rs` cited `scripts/generate-canary-reference.mjs`; that
+  script stayed in the monorepo this crate was carried out of, so `src/canary-reference.f32le` has no
+  reproducible provenance here. It works — every fresh engine is checked against it — but a deliberate
+  model change has nothing to regenerate it with, which makes phase 2 partly unimplementable until it is
+  replaced. The docstrings now say this instead of naming a file that is not there.
 
 ### Phase 4 — the ergonomics the host already needs
 
@@ -107,4 +115,7 @@ wrong".
 - [ ] README, LICENSE and notices exist, with the vendored fork's licence and the never-redistributed vendor
       providers both stated.
 - [ ] The CPU flavour has a published release artefact.
-- [ ] Formatting is decided on its own merits, in its own commit, and the CI gate is switched back on.
+- [x] Formatting is decided on its own merits, in its own commit, and the CI gate is switched back on
+      (2026-08-19).
+- [ ] The canary reference has a generator that lives in THIS repository, so a deliberate model change can
+      produce a new one (raised 2026-08-19 — phase 2 cannot be completed without it).
