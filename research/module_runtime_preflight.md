@@ -65,6 +65,38 @@ a real deployment runs on until a request overrides it. The old default of 4 sil
 | `seed_model_cache_from_env` / `copy_missing_files` | Weights are missing from the cache. Copies what is absent, repairs a truncated earlier copy, and skips what is already there |
 | `adapters::resolve` / `map_device` | The device id means a different card than the operator picked |
 
+## The compiled-model cache slice — one per engine AND one per shape (2026-08-19)
+
+Under MIGraphX the compiled-model cache is mandatory, and its layout is a correctness matter rather than a
+tidiness one. **The EP's own cache key distinguishes neither the engine nor the input shape**, so a session
+can load a program that was compiled for something else, load it cleanly, and return a mis-shaped tensor
+minutes later. Two incidents establish this:
+
+| date | what collided | what it looked like |
+|---|---|---|
+| 2026-07-27 | the ENGINE (dense / sparse / rerank run the same graph at the same pinned shape) | a sparse session died on `assertion failed: index < dim` |
+| 2026-08-19 | the SEQUENCE LENGTH | a session built for `max_length` 256 was served programs compiled for 128 and then 224 — both already in `dual/`, one from the previous day — returning `token_embeddings` shaped `[64, 128, 1024]` and `[64, 224, 1024]` against an input of 64x256 |
+
+The 2026-08-19 cost, measured on a full aspnetcore index pass: the canary rejected two runs, gave up, wiped
+the slice and recompiled — **213.7 s**, against **5.1 s** for the same step on DirectML. The sequence ladder's
+step down to cap 128 then paid another **127 s** the same way. Together **341 s against 9 s**, all of it inside
+the embed wall, which is why it had been read as a slow vector-store write path
+(`dew_flow_rag_qln` research/GPU_BACKEND_WSL_VS_WINDOWS.md §10).
+
+So the slice carries the engine **and** the shape: `dual-b64s256`, `dual-b64s128`, `rerank-s1024`. The rule is
+one sentence — **a cache hit must mean "my program, at my shape", or it must miss** — and a miss forces a
+compile, which is the only correct answer. Never a program that is close.
+
+Both dimensions, because an `/embed` request may override either (`Limits::resolve`); an engine whose batch is
+not pinned at build time (the reranker takes whatever the request brings) is spelled without one rather than
+with an invented `b0`. `CachePathLease` remembers the shape it was taken for and `load_session` refuses a
+build at any other, so a mismatched claim is one sentence at the call site instead of a canary failure and a
+heal minutes later.
+
+**Migration.** The first run after this change finds empty slices and recompiles each resident rung once. The
+previous flat `dual/` and `rerank/` directories are then orphaned — they are exactly the programs with mixed
+shapes in them, and deleting them by hand is safe once a run has succeeded.
+
 ## The DXGI mapping, and why it exists
 
 `src/adapters.rs` (Windows-only, `#[cfg(windows)]`) translates the operator's device index into what the

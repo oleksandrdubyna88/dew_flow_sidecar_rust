@@ -1,4 +1,4 @@
-use crate::compile_cache::{CachePathLease, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
+use crate::compile_cache::{CacheShape, CachePathLease, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE};
 use crate::config::{Config, DUAL_MODEL, RERANK_MODEL};
 use crate::state::AppState;
 use crate::vram::{self, Attribution, SoloBuildWindow};
@@ -34,6 +34,7 @@ fn load_session<T>(
     provider_hint: &str,
     model: &str,
     engine: &str,
+    seq: usize,
     cache: &CachePathLease,
     build: impl FnOnce(&str) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
@@ -45,6 +46,18 @@ fn load_session<T>(
         "internal: building a `{engine}` session while the compiled-model cache path is claimed for \
          `{}` — hold the lease for the engine you are about to build",
         cache.engine()
+    );
+
+    // And the SHAPE, which is the same hazard one axis further out. 2026-08-19: a session asked for
+    // `max_length` 256 was served programs compiled for 128 and then 224 — both already in `dual/`, one of
+    // them from the previous day — and returned `token_embeddings` shaped `[64, 128, 1024]` against an input
+    // of 64x256. The slice name now keeps the PROGRAMS apart; this keeps the INTENT apart, so a mismatched
+    // lease is one sentence here instead of a canary failure and a 213 s heal minutes later.
+    anyhow::ensure!(
+        cache.shape().seq == seq,
+        "internal: building a `{engine}` session at sequence length {seq} while the compiled-model cache \
+         path is claimed for sequence length {} — hold the lease for the shape you are about to build",
+        cache.shape().seq
     );
 
     let provider = pin_provider(state, provider_hint);
@@ -156,6 +169,7 @@ pub(crate) fn load_dual(
         provider_hint,
         DUAL_MODEL,
         EMBED_CACHE_ENGINE,
+        max_length,
         cache,
         |provider| {
             tracing::info!("loading {DUAL_MODEL} (provider {provider}, max_length {max_length})");
@@ -178,6 +192,7 @@ pub(crate) fn load_rerank(
         provider_hint,
         RERANK_MODEL,
         RERANK_CACHE_ENGINE,
+        state.config.rerank_max_length,
         cache,
         |provider| {
             tracing::info!(
@@ -592,7 +607,11 @@ mod tests {
     #[test]
     fn a_session_built_under_another_engines_lease_is_refused() {
         let state = app_state();
-        let wrong = CachePathLease::hold(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE);
+        let wrong = CachePathLease::hold(
+            &state.config.mxr_cache_base,
+            RERANK_CACHE_ENGINE,
+            CacheShape::unpinned_batch(128),
+        );
 
         // let-else rather than `expect_err`: an ort session is not `Debug`, and a test that could only
         // report this failure by formatting a GPU handle would be a test nobody could run here.

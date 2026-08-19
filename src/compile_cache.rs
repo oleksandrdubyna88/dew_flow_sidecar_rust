@@ -30,11 +30,11 @@ pub(crate) struct CompileWatch {
 }
 
 impl CompileWatch {
-    pub(crate) fn start(base: &str, engine: &str) -> Self {
+    pub(crate) fn start(base: &str, engine: &str, shape: CacheShape) -> Self {
         let dir = if base.trim().is_empty() {
             String::new()
         } else {
-            engine_cache_dir(base, engine)
+            engine_cache_dir(base, engine, shape)
         };
         Self {
             before: mxr_cache_mb(&dir),
@@ -101,13 +101,60 @@ pub(crate) fn pass_log_message(
     }
 }
 
-/// The per-engine slice of the compiled-model cache. The dense, sparse, and rerank engines of
-/// bge-m3 run the SAME graph at the SAME pinned shape, so the EP's cache key collides across
-/// them — a sparse session that loaded a program cached by another engine returned mis-shaped
-/// outputs and died on `assertion failed: index < dim` (the stale-cache incident, 2026-07-27).
-/// One subdirectory per engine makes a cache hit always mean "MY program".
-pub(crate) fn engine_cache_dir(base: &str, engine: &str) -> String {
-    format!("{}/{engine}", base.trim_end_matches('/'))
+/// The pinned input shape a compiled program is valid for, and ONLY for.
+///
+/// Part of the cache slice's identity because the EP's own key does not distinguish it — see
+/// [`engine_cache_dir`]. Both dimensions, because an `/embed` request may override either one
+/// (`Limits::resolve`), so neither is constant for the life of the process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CacheShape {
+    pub(crate) batch: usize,
+    pub(crate) seq: usize,
+}
+
+impl CacheShape {
+    pub(crate) fn new(batch: usize, seq: usize) -> Self {
+        Self { batch, seq }
+    }
+
+    /// For an engine whose batch is NOT pinned at build time — the reranker takes whatever the request
+    /// brings. Spelled without a batch rather than with a made-up one, because `b0` would read as a shape.
+    pub(crate) fn unpinned_batch(seq: usize) -> Self {
+        Self { batch: 0, seq }
+    }
+
+    /// The directory-safe spelling. Deliberately readable: an operator looking at the cache tree should be
+    /// able to see which shapes this machine has ever compiled, and delete one by hand — which is exactly
+    /// what a retired rung becomes when 512 replaces 256.
+    pub(crate) fn slug(self) -> String {
+        match self.batch {
+            0 => format!("s{}", self.seq),
+            batch => format!("b{batch}s{}", self.seq),
+        }
+    }
+}
+
+/// The per-engine, PER-SHAPE slice of the compiled-model cache.
+///
+/// **Two incidents, one rule: a cache hit must mean "my program, at my shape", or it must miss.**
+///
+/// - *2026-07-27.* The dense, sparse and rerank engines of bge-m3 run the SAME graph at the SAME pinned
+///   shape, so the EP's key collided across ENGINES — a sparse session that loaded a program cached by
+///   another engine returned mis-shaped outputs and died on `assertion failed: index < dim`. Fixed by one
+///   subdirectory per engine.
+/// - *2026-08-19.* The same key also ignores the SEQUENCE LENGTH. A session built for `max_length` 256
+///   loaded a program compiled for 128, and then for 224 — the two rungs already in `dual/`, one of them
+///   from the previous day's run — and returned `token_embeddings` shaped `[64, 128, 1024]` and
+///   `[64, 224, 1024]` against an input of 64x256. The canary caught it, re-ran twice, gave up, wiped the
+///   slice and recompiled: **213.7 s of one index pass**, against 5.1 s for the same step on DirectML. The
+///   ladder's step down to cap 128 then cost another 127 s the same way. Measured on the full aspnetcore
+///   corpus; see `dew_flow_rag_qln` research/GPU_BACKEND_WSL_VS_WINDOWS.md.
+///
+/// So the shape joins the slice. A program compiled for a shape this session did not ask for is now
+/// unreachable rather than merely unlikely: the miss forces a compile, which is the only correct answer —
+/// **never a program that is close.**
+pub(crate) fn engine_cache_dir(base: &str, engine: &str, shape: CacheShape) -> String {
+    format!("{}/{engine}-{}", base.trim_end_matches('/'), shape.slug())
 }
 
 /// Serializes the process-global cache-path variables. Static because what it guards is static: there
@@ -143,6 +190,9 @@ static CACHE_PATH_LOCK: Mutex<()> = Mutex::new(());
 /// claim: no lock is taken and no environment is touched, so holding one across a pass costs nothing.
 pub(crate) struct CachePathLease {
     engine: &'static str,
+    /// The shape this claim was taken for. A build at any OTHER shape is refused by `load_session`: the
+    /// directory name alone would keep the programs apart, and the check keeps the INTENT apart too.
+    shape: CacheShape,
     /// This engine's slice; empty when no cache is configured.
     dir: String,
     /// `None` when no cache is configured — there is no process-global state to serialize on.
@@ -150,10 +200,11 @@ pub(crate) struct CachePathLease {
 }
 
 impl CachePathLease {
-    pub(crate) fn hold(base: &str, engine: &'static str) -> Self {
+    pub(crate) fn hold(base: &str, engine: &'static str, shape: CacheShape) -> Self {
         if base.trim().is_empty() {
             return Self {
                 engine,
+                shape,
                 dir: String::new(),
                 _held: None,
             };
@@ -162,12 +213,13 @@ impl CachePathLease {
         let held = CACHE_PATH_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = engine_cache_dir(base, engine);
+        let dir = engine_cache_dir(base, engine, shape);
         std::fs::create_dir_all(&dir).ok();
         std::env::set_var("ORT_MIGRAPHX_MODEL_CACHE_PATH", &dir);
         std::env::set_var("ORT_MIGRAPHX_CACHE_PATH", &dir);
         Self {
             engine,
+            shape,
             dir,
             _held: Some(held),
         }
@@ -175,6 +227,11 @@ impl CachePathLease {
 
     pub(crate) fn engine(&self) -> &'static str {
         self.engine
+    }
+
+    /// The shape this claim covers. Read by `load_session` to refuse a build at a different one.
+    pub(crate) fn shape(&self) -> CacheShape {
+        self.shape
     }
 
     /// This engine's cache slice — empty when none is configured, which is the same test the callers
@@ -204,9 +261,18 @@ impl CachePathLease {
 mod tests {
     use super::*;
     use crate::testing::*;
-    use std::path::Path;
+
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
+
+    /// The shape the embed engine actually runs at on this machine, for tests that do not care which.
+    const SHAPE: CacheShape = CacheShape { batch: 64, seq: 256 };
+
+    /// One engine's slice at [`SHAPE`], as a path — for the tests that put files in it by hand.
+    fn slice(base: &Path, engine: &str) -> PathBuf {
+        PathBuf::from(engine_cache_dir(&base.to_string_lossy(), engine, SHAPE))
+    }
 
     /// Dense, sparse, and rerank run the SAME graph at the SAME pinned shape, so the EP's cache
     /// key collides across engines — a sparse session once loaded a program cached by another
@@ -215,15 +281,15 @@ mod tests {
     #[test]
     fn each_engine_gets_its_own_cache_slice() {
         assert_eq!(
-            engine_cache_dir("/cache/device-0", "sparse"),
-            "/cache/device-0/sparse"
+            engine_cache_dir("/cache/device-0", "sparse", SHAPE),
+            "/cache/device-0/sparse-b64s256"
         );
         assert_eq!(
-            engine_cache_dir("/cache/device-0/", "dense"),
-            "/cache/device-0/dense"
+            engine_cache_dir("/cache/device-0/", "dense", SHAPE),
+            "/cache/device-0/dense-b64s256"
         );
 
-        let unconfigured = CachePathLease::hold("", EMBED_CACHE_ENGINE);
+        let unconfigured = CachePathLease::hold("", EMBED_CACHE_ENGINE, SHAPE);
         assert!(
             unconfigured.dir().is_empty(),
             "no cache configured -> nothing to claim, no lock taken"
@@ -231,6 +297,57 @@ mod tests {
         assert!(
             unconfigured.covers(EMBED_CACHE_ENGINE),
             "and it still knows which engine it stands for"
+        );
+    }
+
+    /// Two sequence lengths must never share a compiled program, and the reason is measured rather than
+    /// theoretical: on 2026-08-19 a session built for `max_length` 256 loaded a program compiled for 128,
+    /// then one compiled for 224 — the two rungs already sitting in `dual/`, one of them from the previous
+    /// day's run — and returned `token_embeddings` shaped `[64, 128, 1024]` and `[64, 224, 1024]` against an
+    /// input of 64x256. The canary caught it, re-ran twice, gave up, wiped the slice and recompiled: 213.7 s
+    /// of one index pass, against 5.1 s for the same step on DirectML.
+    ///
+    /// A miss must force a compile. It must never be answered with a program that is CLOSE.
+    #[test]
+    fn no_two_shapes_can_share_a_compiled_program() {
+        let at = |batch, seq| {
+            engine_cache_dir(
+                "/cache/device-0",
+                EMBED_CACHE_ENGINE,
+                CacheShape::new(batch, seq),
+            )
+        };
+
+        // The two rungs of the ladder, and the 512 that will replace 256.
+        assert_ne!(at(64, 128), at(64, 256), "the ladder's two rungs");
+        assert_ne!(at(64, 256), at(64, 512), "and the rung that will replace 256");
+
+        // The batch too: an /embed request may override it (`Limits::resolve`), so it is not constant for
+        // the life of the process and a program pinned to 64 rows is not valid for 126.
+        assert_ne!(at(64, 256), at(126, 256), "the batch is part of the shape");
+
+        // Same shape, same slice — otherwise every request would recompile, which is the opposite defect.
+        assert_eq!(at(64, 256), at(64, 256));
+
+        // Readable on disk, because a retired rung is something an operator deletes by hand.
+        assert_eq!(at(64, 256), "/cache/device-0/dual-b64s256");
+
+        // An engine whose batch is not pinned at build time says so instead of inventing one.
+        assert_eq!(
+            engine_cache_dir("/cache/device-0", RERANK_CACHE_ENGINE, CacheShape::unpinned_batch(1024)),
+            "/cache/device-0/rerank-s1024"
+        );
+    }
+
+    /// The claim carries the shape it was taken for, so `load_session` can refuse a build at another one.
+    #[test]
+    fn a_claim_remembers_which_shape_it_was_taken_for() {
+        let unconfigured = CachePathLease::hold("", EMBED_CACHE_ENGINE, CacheShape::new(64, 128));
+
+        assert_eq!(
+            unconfigured.shape(),
+            CacheShape::new(64, 128),
+            "even with no cache configured: the check that reads it is not about the filesystem"
         );
     }
 
@@ -248,7 +365,7 @@ mod tests {
         let embed = {
             let (base, building) = (base.clone(), Arc::clone(&building));
             std::thread::spawn(move || {
-                let cache = CachePathLease::hold(&base, EMBED_CACHE_ENGINE);
+                let cache = CachePathLease::hold(&base, EMBED_CACHE_ENGINE, SHAPE);
                 building.wait(); // the rerank engine may now start building
                                  // The window the old scope left open: the session is built, the first kernel launch —
                                  // which is what actually reads the variable — has not happened yet.
@@ -263,7 +380,7 @@ mod tests {
             let (base, building) = (base.clone(), Arc::clone(&building));
             std::thread::spawn(move || {
                 building.wait();
-                let _cache = CachePathLease::hold(&base, RERANK_CACHE_ENGINE);
+                let _cache = CachePathLease::hold(&base, RERANK_CACHE_ENGINE, SHAPE);
                 std::thread::sleep(Duration::from_millis(50));
             })
         };
@@ -273,7 +390,7 @@ mod tests {
 
         assert_eq!(
             seen,
-            engine_cache_dir(&base, EMBED_CACHE_ENGINE),
+            engine_cache_dir(&base, EMBED_CACHE_ENGINE, SHAPE),
             "the first kernel launch must still read the slice its own session was built under"
         );
 
@@ -281,12 +398,12 @@ mod tests {
         // ends with the BUILD, the other engine's build flips the variable before the first launch reads
         // it — and the launch then compiles into, or loads from, a directory that is not its own.
         {
-            let _built_under = CachePathLease::hold(&base, EMBED_CACHE_ENGINE);
+            let _built_under = CachePathLease::hold(&base, EMBED_CACHE_ENGINE, SHAPE);
         } // <- where `with_engine_cache` returned
-        let _other_engine_builds = CachePathLease::hold(&base, RERANK_CACHE_ENGINE);
+        let _other_engine_builds = CachePathLease::hold(&base, RERANK_CACHE_ENGINE, SHAPE);
         assert_eq!(
             std::env::var("ORT_MIGRAPHX_MODEL_CACHE_PATH").unwrap_or_default(),
-            engine_cache_dir(&base, RERANK_CACHE_ENGINE),
+            engine_cache_dir(&base, RERANK_CACHE_ENGINE, SHAPE),
             "which is what an embed engine used to read at its first launch"
         );
 
@@ -299,11 +416,11 @@ mod tests {
     #[test]
     fn wiping_a_slice_leaves_it_present_and_empty_and_never_touches_the_other_engine() {
         let base = std::env::temp_dir().join(format!("mxr-wipe-{}", std::process::id()));
-        write_mb(&base.join(EMBED_CACHE_ENGINE).join("corrupt.mxr"), 1);
-        write_mb(&base.join(RERANK_CACHE_ENGINE).join("healthy.mxr"), 1);
+        write_mb(&slice(&base, EMBED_CACHE_ENGINE).join("corrupt.mxr"), 1);
+        write_mb(&slice(&base, RERANK_CACHE_ENGINE).join("healthy.mxr"), 1);
         let base = base.to_string_lossy().to_string();
 
-        let cache = CachePathLease::hold(&base, EMBED_CACHE_ENGINE);
+        let cache = CachePathLease::hold(&base, EMBED_CACHE_ENGINE, SHAPE);
         cache.wipe();
 
         assert!(
@@ -316,7 +433,7 @@ mod tests {
             "and the corrupt program is gone"
         );
         assert_eq!(
-            mxr_cache_mb(&engine_cache_dir(&base, RERANK_CACHE_ENGINE)),
+            mxr_cache_mb(&engine_cache_dir(&base, RERANK_CACHE_ENGINE, SHAPE)),
             1,
             "the other engine is untouched"
         );
@@ -368,19 +485,13 @@ mod tests {
     #[test]
     fn a_compile_by_one_engine_is_not_reported_as_growth_by_the_other() {
         let base = std::env::temp_dir().join(format!("mxr-scope-{}", std::process::id()));
-        write_mb(&base.join(EMBED_CACHE_ENGINE).join("warm.mxr"), 1);
-        write_mb(&base.join(RERANK_CACHE_ENGINE).join("warm.mxr"), 1);
+        write_mb(&slice(&base, EMBED_CACHE_ENGINE).join("warm.mxr"), 1);
+        write_mb(&slice(&base, RERANK_CACHE_ENGINE).join("warm.mxr"), 1);
         let base = base.to_string_lossy().to_string();
 
-        let embed_pass = CompileWatch::start(&base, EMBED_CACHE_ENGINE);
+        let embed_pass = CompileWatch::start(&base, EMBED_CACHE_ENGINE, SHAPE);
         // The OTHER engine compiles while this pass runs.
-        write_mb(
-            Path::new(&base)
-                .join(RERANK_CACHE_ENGINE)
-                .join("fresh.mxr")
-                .as_path(),
-            3,
-        );
+        write_mb(&slice(Path::new(&base), RERANK_CACHE_ENGINE).join("fresh.mxr"), 3);
 
         assert_eq!(
             embed_pass.grew_mb(),
@@ -389,13 +500,7 @@ mod tests {
         );
 
         // ...and this engine's own compile still is.
-        write_mb(
-            Path::new(&base)
-                .join(EMBED_CACHE_ENGINE)
-                .join("fresh.mxr")
-                .as_path(),
-            2,
-        );
+        write_mb(&slice(Path::new(&base), EMBED_CACHE_ENGINE).join("fresh.mxr"), 2);
         assert_eq!(
             embed_pass.grew_mb(),
             2,
@@ -417,7 +522,7 @@ mod tests {
     /// An empty base must stay empty rather than becoming `/dual`, which is a real directory to stat.
     #[test]
     fn a_flavour_with_no_cache_never_walks_anything() {
-        let watch = CompileWatch::start("", EMBED_CACHE_ENGINE);
+        let watch = CompileWatch::start("", EMBED_CACHE_ENGINE, SHAPE);
 
         assert!(
             watch.dir.is_empty(),

@@ -4,7 +4,8 @@ use crate::bookkeeping::{
 };
 use crate::canary::load_validated_dual;
 use crate::compile_cache::{
-    pass_log_message, CachePathLease, CompileWatch, EMBED_CACHE_ENGINE, RERANK_CACHE_ENGINE,
+    pass_log_message, CachePathLease, CacheShape, CompileWatch, EMBED_CACHE_ENGINE,
+    RERANK_CACHE_ENGINE,
 };
 use crate::config::Config;
 use crate::engine_cache::EngineSlot;
@@ -318,7 +319,11 @@ pub(crate) fn embed_natural(
     let cache_claim = if guard.get_mut(limits.max_length).is_none() {
         stamp.enter(Phase::Building, "embed: building and canary-checking the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
         let building = Instant::now();
-        let cache = CachePathLease::hold(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE);
+        let cache = CachePathLease::hold(
+            &state.config.mxr_cache_base,
+            EMBED_CACHE_ENGINE,
+            CacheShape::new(limits.max_batch, limits.max_length),
+        );
         // Claimed BEFORE the build so a query arriving during these minutes inherits the cap this build
         // is aiming at; rolled back to real residency the moment the build fails, because a commitment a
         // failed build left behind is the stale intent this mirror exists to replace.
@@ -340,7 +345,11 @@ pub(crate) fn embed_natural(
     );
     // The duration below includes any settling re-runs — that is honest: it is what the caller waited.
     let (compiles, pass) = (
-        CompileWatch::start(&state.config.mxr_cache_base, EMBED_CACHE_ENGINE),
+        CompileWatch::start(
+            &state.config.mxr_cache_base,
+            EMBED_CACHE_ENGINE,
+            CacheShape::new(limits.max_batch, limits.max_length),
+        ),
         Instant::now(),
     );
     // INVARIANT: this rung is resident. Either it already was, or the block above built it and
@@ -427,7 +436,11 @@ pub(crate) fn rerank_blocking(
     let _cache_claim = if guard.is_none() {
         stamp.enter(Phase::Building, "rerank: building the session (a first-ever shape compiles for minutes; cached shapes load in seconds)");
         let building = Instant::now();
-        let cache = CachePathLease::hold(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE);
+        let cache = CachePathLease::hold(
+            &state.config.mxr_cache_base,
+            RERANK_CACHE_ENGINE,
+            CacheShape::unpinned_batch(state.config.rerank_max_length),
+        );
         *guard = Some(load_rerank(state, provider_hint, &cache)?);
         session_build_ms = building.elapsed().as_millis() as u64;
         Some(cache)
@@ -497,7 +510,11 @@ pub(crate) fn score_documents(
 ) -> anyhow::Result<(Vec<f32>, PassTimings)> {
     let count = documents.len();
     let (compiles, pass) = (
-        CompileWatch::start(&state.config.mxr_cache_base, RERANK_CACHE_ENGINE),
+        CompileWatch::start(
+            &state.config.mxr_cache_base,
+            RERANK_CACHE_ENGINE,
+            CacheShape::unpinned_batch(state.config.rerank_max_length),
+        ),
         std::time::Instant::now(),
     );
     // query.to_string(): fastembed's `rerank` shares one generic across the query and the document slice,
