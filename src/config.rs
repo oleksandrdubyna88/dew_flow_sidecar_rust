@@ -53,6 +53,15 @@ pub(crate) struct Config {
     pub(crate) engine_cache_rungs: usize,
     /// When a wait stops being "slow but alive" — see `WedgePolicy`.
     pub(crate) wedge: WedgePolicy,
+    /// Drop every engine after this long with no request. `None` = never, and that is the DEFAULT.
+    ///
+    /// Opt-in because the failure it prevents and the failure it causes are both real. It prevents the one
+    /// on record: three sidecars were found running on this machine, two of them holding models nobody was
+    /// using, which on a 32 GB card is the difference between a pass that fits and a pass that crawls. It
+    /// causes a rebuild — 60 s and up, minutes on a first-ever MIGraphX shape — if the gap between two
+    /// batches of a live pass ever exceeds it. So the operator chooses the number, knowing their own gaps,
+    /// and a machine that has never had the problem pays nothing.
+    pub(crate) idle_unload: Option<std::time::Duration>,
 }
 
 impl Config {
@@ -97,6 +106,13 @@ impl Config {
             // this with the same setting that raises the rung count.
             engine_cache_rungs: env_parse("EMBED_ENGINE_CACHE_RUNGS", 1),
             wedge: WedgePolicy::from_env(),
+            // 0 is the off switch and the default, spelled as a number rather than a second boolean:
+            // "unload after N seconds" and "unload at all" are one decision, and two knobs for one
+            // decision is how a machine ends up configured to unload after a value nobody enabled.
+            idle_unload: match env_parse::<u64>("SIDECAR_IDLE_UNLOAD_SECONDS", 0) {
+                0 => None,
+                seconds => Some(std::time::Duration::from_secs(seconds)),
+            },
         }
     }
 }

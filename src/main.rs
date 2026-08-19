@@ -50,6 +50,7 @@ mod log_segments;
 mod logging;
 mod preflight;
 mod provider;
+mod recipes;
 mod state;
 mod testing;
 mod tokens;
@@ -214,6 +215,8 @@ pub(crate) async fn main() {
         adapter,
         tokenizers,
         vram: Mutex::new(vram::VramLedger::default()),
+        self_check: Mutex::new(None),
+        last_request: Mutex::new(std::time::Instant::now()),
     });
 
     tracing::info!(
@@ -243,6 +246,7 @@ pub(crate) async fn main() {
 
     prewarm_provenance();
     spawn_wedge_watchdog(state.clone());
+    spawn_idle_unloader(state.clone());
 
     let app = build_router(state);
 

@@ -84,6 +84,8 @@ pub(crate) fn app_state_full(config: Config, tokenizers: TokenizerRegistry) -> A
         adapter: None,
         tokenizers,
         vram: Mutex::new(crate::vram::VramLedger::default()),
+        self_check: Mutex::new(None),
+        last_request: Mutex::new(std::time::Instant::now()),
     })
 }
 
@@ -144,6 +146,9 @@ pub(crate) fn config(provider: &str) -> Config {
         tokenize_max_texts: 4096,
         max_body_bytes: 2 * 1024 * 1024,
         wedge: test_wedge_policy(),
+        // Off, as it ships. A fixture that quietly enabled it would give every test a background task
+        // racing to unload the engines the test is about.
+        idle_unload: None,
     }
 }
 

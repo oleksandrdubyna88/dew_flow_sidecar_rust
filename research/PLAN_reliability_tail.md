@@ -341,7 +341,7 @@ afternoon that would not have been spent.
 
 **Fix:** set it explicitly, report it in `/health` beside `max_batch` (a limit a client cannot read is
 a limit it will guess at), document it beside the other env vars, and log rejections. Shares its `/health`
-half with [PLAN_sidecar_product.md](../todo/PLAN_sidecar_product.md) phase 4, which records the same finding.
+half with [PLAN_sidecar_product.md](PLAN_sidecar_product.md) phase 4, which records the same finding.
 
 ### 8. `src/main.rs` was 4 744 lines — LOW severity, high friction · **DONE 2026-08-16**
 

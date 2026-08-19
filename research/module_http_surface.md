@@ -177,6 +177,25 @@ them with objects carrying the bytes, and `dew_flow_rag_qln`'s `RuntimeInspector
 `JsonValueKind.True` — an object there empties the runtime panel of every model. A test in `wire.rs`
 pins the boolean shape so the idea meets a red test rather than a blank panel.
 
+And `self_check` (2026-08-19) — what the canary scored the last time this build loaded an engine:
+
+| Field | Answers |
+|---|---|
+| `cosine` | The similarity to the committed reference vector. `null` when the engine threw instead of scoring: unknown, which is neither -1 nor 0 |
+| `serving` / `serving_threshold` | Cleared 0.99 — this engine may run. Loose on purpose: it must tolerate the arithmetic difference between execution providers, and refusing a real CUDA build over the fourth decimal would cost a customer their install |
+| `verified` / `verified_threshold` | Cleared 0.999 — this BUILD is worth trusting, which is the question the compile button asks. `serving: true, verified: false` is a real state: it works, and somebody should look at it |
+| `attempts` | Runs the canary needed. `>1` is normal on a freshly built MIGraphX session and worth seeing anywhere else |
+| `checked_seconds_ago` | When, without a wall clock — the same shape `in_flight[]` uses |
+
+`null` before the first engine build: a check that never ran is neither a pass nor a failure, and a console
+rendering "unverified" for a cold sidecar would describe a check that did not happen.
+
+**The provider is deliberately not repeated here.** `/health` already answers it three ways
+(`requested_provider`, `active_provider`, `provider_ready`), and a fact kept in two places is one that will
+eventually disagree with itself. The gate is read as a PAIR: `self_check` says the numbers are right,
+`active_provider` says which hardware produced them — and a DirectML build that silently ran on CPU is
+exactly the case where the first is fine and the second is not.
+
 ### `POST /unload`
 
 `{}` drains every resident rung; `{ "embed_max_lengths": [256], "rerank": true }` drops named ones. A

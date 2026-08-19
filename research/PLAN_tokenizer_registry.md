@@ -34,7 +34,7 @@
 > `dew_flow_benchmark · todo/PLAN_corpus_axis_integrity.md`. Both still name this plan under its old
 > `todo/` path; they are separate repositories and were left as found.
 >
-> Related: [../todo/PLAN_sidecar_product.md](../todo/PLAN_sidecar_product.md) (the distribution story this
+> Related: [PLAN_sidecar_product.md](PLAN_sidecar_product.md) (the distribution story this
 > does not touch), [../README.md](../README.md) (the shipped contract),
 > [module_http_surface.md](module_http_surface.md) (the wire shapes as they now are).
 
@@ -141,7 +141,7 @@ What this plan needs from nobody: it is standalone and can ship before or after 
   slots keyed by id, its own reference-vector canary, and a VRAM budget across two loaded engines — a
   larger piece of work that deserves its own plan rather than a field on a request.
 - **SPLADE is not wired.** It is named in §1 only to justify `kind` existing from the start.
-- **No authentication, no versioning, no metrics.** Those remain [PLAN_sidecar_product.md](../todo/PLAN_sidecar_product.md)'s.
+- **No authentication, no versioning, no metrics.** Those remain [PLAN_sidecar_product.md](PLAN_sidecar_product.md)'s.
 
 ## 6. Build order
 

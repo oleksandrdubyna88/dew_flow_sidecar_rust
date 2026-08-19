@@ -1,0 +1,122 @@
+{
+  "$comment": [
+    "The build recipe as DATA — what to install and what to run, per platform and per accelerator.",
+    "",
+    "Why a file and not an endpoint: this is needed BEFORE any sidecar exists. The whole distribution story",
+    "is that the customer's machine builds the flavour it needs (the execution provider is a compile-time",
+    "feature and the vendor providers may never be redistributed), so the thing that drives that build cannot",
+    "be served by the thing being built. It is checked into the repository and read from a checkout.",
+    "",
+    "Why JSON and not TOML: it parses with serde_json, already a dependency here, and natively on the .NET",
+    "side that consumes it. No new package on either end.",
+    "",
+    "The RAG side detects the card and picks a row; a human reading the same rows gets the same answer. That",
+    "is the requirement, and it is why every field is spelled for both readers rather than encoded.",
+    "",
+    "`build_minutes` is MEASURED where it is present and ABSENT where nobody has measured it — the CUDA and",
+    "MIGraphX rows carry no number because building them needs a vendor toolchain this machine does not",
+    "have, and a guess would be worse than nothing: it is the field an operator uses to decide whether to",
+    "start a build now or after lunch. `build_minutes_measured` says on what, and when.",
+    "",
+    "The tests in src/recipes.rs keep the feature flags and the flavour names honest against Cargo.toml, so",
+    "this file cannot quietly stop describing the crate — including the reverse direction, a feature added",
+    "with no recipe, which is the half that rots without anyone noticing."
+  ],
+  "schema": "dewflow.sidecar.build-recipes/v1",
+  "crate": "bge-sidecar",
+  "resolved": "2026-08-19",
+  "recipes": [
+    {
+      "id": "windows-directml",
+      "title": "Windows · DirectML",
+      "platform": "windows",
+      "accelerator": "any DirectX 12 GPU — AMD, Intel or NVIDIA",
+      "is_default": true,
+      "cargo_features": [],
+      "command": "cargo build --release",
+      "toolchain": [
+        "Rust (stable, MSVC toolchain)",
+        "Visual Studio Build Tools with the C++ workload"
+      ],
+      "onnxruntime": {
+        "how": "downloaded by the ort crate as a prebuilt Windows package",
+        "operator_action": "none"
+      },
+      "build_minutes": null,
+      "ships_freely": false,
+      "why_not_shipped": "DirectML is a vendor-licensed Microsoft redistributable. One cached copy in a registry, an image layer or an offline bundle would make us a redistributor.",
+      "verify": "GET /health → active_provider = \"dml\", provider_ready = true, self_check.verified = true"
+    },
+    {
+      "id": "windows-cuda",
+      "title": "Windows · NVIDIA CUDA",
+      "platform": "windows",
+      "accelerator": "NVIDIA GPU",
+      "is_default": false,
+      "cargo_features": ["cuda"],
+      "command": "cargo build --release --no-default-features --features cuda",
+      "toolchain": [
+        "Rust (stable, MSVC toolchain)",
+        "Visual Studio Build Tools with the C++ workload",
+        "NVIDIA CUDA runtime libraries and cuDNN, installed by the operator"
+      ],
+      "onnxruntime": {
+        "how": "the same prebuilt Windows package as DirectML — both EPs come from it",
+        "operator_action": "the CUDA provider DLLs must sit BESIDE THE EXECUTABLE: onnxruntime_providers_shared.dll and onnxruntime_providers_cuda.dll. ONNX Runtime resolves them from the exe's directory, not from PATH."
+      },
+      "build_minutes": null,
+      "ships_freely": false,
+      "why_not_shipped": "The CUDA runtime and cuDNN are vendor-licensed under NVIDIA's EULA and SLA. cuDNN is the most commonly mis-shipped of the three because it arrives as a plain folder of DLLs.",
+      "verify": "GET /health → active_provider = \"cuda\". A binary built without the ort/cuda feature registers no CUDA EP and answers 500 in ~4 ms while still reporting the REQUESTED provider — which is why requested, compiled and active are three separate fields.",
+      "known_trap": "`--features cuda` still links DirectML, because both EPs come from one package. Seeing `-l DirectML` in the build log is therefore no evidence about CUDA either way. Read the feature tree, not the link line."
+    },
+    {
+      "id": "linux-migraphx",
+      "title": "Linux / WSL · AMD ROCm via MIGraphX",
+      "platform": "linux",
+      "accelerator": "AMD GPU under ROCm",
+      "is_default": false,
+      "cargo_features": ["migraphx"],
+      "command": "cargo build --release --no-default-features --features migraphx --target-dir target-wsl",
+      "toolchain": [
+        "Rust (stable) INSIDE the distro",
+        "ROCm",
+        "pkg-config and libssl-dev — on Linux fastembed's downloader links system OpenSSL; Windows uses Schannel and needs neither",
+        "an ONNX Runtime BUILT FROM SOURCE with --use_migraphx: no prebuilt package ships this EP"
+      ],
+      "onnxruntime": {
+        "how": "built from source by the operator, from a tag satisfying ort's required API version",
+        "operator_action": "point ORT_DYLIB_PATH at the resulting libonnxruntime.so. It must be at least ONNX Runtime 1.x where x is ort::MINOR_VERSION; the sidecar preflights this at startup and exits naming both versions, because ort's own version check DEADLOCKS instead of erroring on a mismatch.",
+        "also_required": "ORT_MIGRAPHX_MODEL_CACHE_PATH must be set and writable. ROCm's MIGraphX EP always saves the compiled model, and with no path it writes to \"\" — the write fails and takes the kernel call with it, so every /embed answers 500 after a ~2-minute compile with the GPU idle."
+      },
+      "build_minutes": null,
+      "ships_freely": false,
+      "why_not_shipped": "The ONNX Runtime build is the operator's own, and nothing here bundles ROCm.",
+      "verify": "GET /health → active_provider = \"migraphx\", adapter = null (DXGI is Windows-only, so the raw ORT_DEVICE_ID semantics apply)",
+      "known_trap": "A separate --target-dir is not optional: the Windows and Linux flavours must never share target/, or each clobbers the other's artefacts."
+    },
+    {
+      "id": "cpu",
+      "title": "CPU only",
+      "platform": "any",
+      "accelerator": "none — the CPU",
+      "is_default": false,
+      "cargo_features": [],
+      "command": "cargo build --release --no-default-features",
+      "toolchain": [
+        "Rust (stable)",
+        "a C++ toolchain for the platform (MSVC Build Tools on Windows, cc/pkg-config on Linux)"
+      ],
+      "onnxruntime": {
+        "how": "downloaded by the ort crate as a prebuilt package",
+        "operator_action": "none"
+      },
+      "build_minutes": 4.5,
+      "build_minutes_measured": "2026-08-19, cold release build with a warm cargo registry, Windows 11, x86_64: 4m29s. A cold registry adds the download of ~348 crates.",
+      "ships_freely": true,
+      "why_not_shipped": null,
+      "verify": "GET /health → compiled_providers = [\"cpu\"], and every embed runs — slowly. This is the flavour that may be published as a release artefact, because it carries no vendor component at all.",
+      "known_trap": "Roughly forty times slower than a GPU flavour on the same work. A silent CPU fallback is exactly the failure the verification gate exists to catch — self_check.verified answers the numbers, active_provider answers the hardware."
+    }
+  ]
+}

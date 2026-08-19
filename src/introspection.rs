@@ -8,8 +8,8 @@ use crate::tokens::BGE_TOKENIZER;
 use crate::wedge::Patience;
 use crate::wire::{
     in_flight_now, join_error_text, tokenizer_available, HealthResponse, LimitsWire, LoadedModels,
-    ModelEntry, ModelNames, ModelsResponse, VramAtLoad, KIND_DENSE_SPARSE, KIND_RERANK,
-    KIND_TOKENIZER_ONLY,
+    ModelEntry, ModelNames, ModelsResponse, SelfCheckWire, VramAtLoad, KIND_DENSE_SPARSE,
+    KIND_RERANK, KIND_TOKENIZER_ONLY,
 };
 use axum::body::Bytes;
 use axum::extract::State;
@@ -72,6 +72,13 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
             rerank: loaded_now(&state.engines.rerank),
         },
         vram_at_load: VramAtLoad::of(crate::vram::snapshot(&state)),
+        // try_lock like every other field here: a probe must never queue behind model work, and a busy
+        // record reads as "not yet" rather than blocking the endpoint that explains the busyness.
+        self_check: state
+            .self_check
+            .try_lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(SelfCheckWire::of)),
         models: ModelNames {
             dense: DENSE_MODEL,
             sparse: SPARSE_MODEL,
@@ -268,6 +275,78 @@ pub(crate) async fn unload(
         );
     }
     health(State(state)).await
+}
+
+/// Drops every engine after a stretch with no request, when an operator has asked for that.
+///
+/// **The incident it answers.** Three sidecars were found running on this machine during development, two
+/// of them holding models nobody was using. On a 32 GB card that is the difference between a pass that
+/// fits and a pass that crawls over PCIe, and nothing surfaced it until the RAG runtime panel did. `/unload`
+/// gives an operator the manual fix; this gives them a standing one.
+///
+/// **Off by default, and it has to be**, because the cost it can cause is as real as the one it prevents:
+/// a pass whose gap between two batches exceeds the threshold pays a rebuild — 60 s and up, minutes on a
+/// first-ever MIGraphX shape. Only the operator knows their own gaps, so only they can choose the number.
+///
+/// **Two guards past the clock**, because a timer alone would unload work in progress:
+/// - nothing may be in flight (the same stamps `/health` reads, and never the engine locks — a probe that
+///   queued behind a build would be the defect this whole file avoids);
+/// - the drain runs on the blocking pool through the SAME `drain_engines` an `/unload` uses, so it takes
+///   the engine locks with a ceiling and refuses rather than waiting forever.
+pub(crate) fn spawn_idle_unloader(state: Arc<AppState>) {
+    let Some(after) = state.config.idle_unload else {
+        return;
+    };
+
+    tracing::info!(
+        "idle unload: engines are dropped after {}s with no request (SIDECAR_IDLE_UNLOAD_SECONDS). Set it \
+         longer than the longest gap between two batches of a pass, or a live pass pays a rebuild.",
+        after.as_secs()
+    );
+
+    tokio::spawn(async move {
+        // A third of the threshold, so the check is never the thing that decides the timing, and never
+        // more often than once a second on an aggressive setting.
+        let tick = (after / 3).max(std::time::Duration::from_secs(1));
+        loop {
+            tokio::time::sleep(tick).await;
+
+            let idle_for = state
+                .last_request
+                .try_lock()
+                .map(|at| at.elapsed())
+                .unwrap_or_default();
+            let busy = !in_flight_now(&state).is_empty();
+            let loaded = loaded_now(&state.engines.embed) || loaded_now(&state.engines.rerank);
+
+            if busy || idle_for < after || !loaded {
+                continue;
+            }
+
+            tracing::info!(
+                "idle unload: {}s with no request and nothing in flight — dropping every engine to give the \
+                 card back. The next /embed or /rerank rebuilds lazily.",
+                idle_for.as_secs()
+            );
+            let worker = state.clone();
+            let drained = tokio::task::spawn_blocking(move || {
+                drain_engines(&worker, &UnloadRequest::default())
+            })
+            .await;
+
+            match drained {
+                Ok(drained) if !drained.refused.is_empty() => tracing::warn!(
+                    "idle unload: {:?} would not come free — still loaded, and this will be retried",
+                    drained.refused
+                ),
+                Ok(drained) => tracing::info!(
+                    "idle unload: dropped embed rung(s) {:?}, rerank: {}",
+                    drained.embed_rungs, drained.rerank
+                ),
+                Err(e) => tracing::warn!("idle unload task failed: {}", join_error_text(e)),
+            }
+        }
+    });
 }
 
 /// Says, in the LOG, how much the teardown actually gave back — beside what the build was recorded as
@@ -645,6 +724,93 @@ mod tests {
             !unloaded.loaded.dense,
             "and the two fields of one body agree about it"
         );
+    }
+
+    /// A sidecar that has never built an engine has NOT failed its self-check — it has not run one. The
+    /// third state is the point: a console rendering "unverified" for a cold sidecar would be describing a
+    /// check that never happened, which is the same category error as reporting an unmeasured VRAM figure
+    /// as zero.
+    #[tokio::test]
+    async fn a_sidecar_that_has_built_nothing_reports_no_self_check_at_all() {
+        let state = app_state();
+
+        let health = health(State(state)).await.0;
+
+        assert!(health.self_check.is_none());
+    }
+
+    /// Once a check has run, the wire carries the NUMBER and both bars — so a reader judges it without
+    /// access to this source, exactly as `in_flight[]` carries its own ceiling.
+    #[tokio::test]
+    async fn a_completed_self_check_reaches_the_wire_with_both_thresholds() {
+        let state = app_state();
+        *state.self_check.lock().expect("fresh lock") =
+            Some(crate::canary::SelfCheck::for_test(0.9995, 2));
+
+        let health = health(State(state)).await.0;
+
+        let check = health.self_check.expect("a check has run");
+        assert_eq!(check.cosine, Some(0.9995));
+        assert_eq!(check.attempts, 2);
+        assert!(check.serving && check.verified);
+        assert_eq!(check.serving_threshold, crate::canary::CANARY_MIN_COSINE);
+        assert_eq!(check.verified_threshold, crate::canary::VERIFIED_MIN_COSINE);
+    }
+
+    /// Off unless asked for, and the default is off — so a machine that never had the three-sidecars
+    /// problem pays nothing, and no test gains a background task racing to unload what it is about.
+    #[test]
+    fn idle_unloading_is_off_unless_an_operator_sets_a_number() {
+        assert_eq!(
+            crate::config::Config::from_env().idle_unload,
+            None,
+            "the shipped default"
+        );
+        assert_eq!(
+            config("").idle_unload,
+            None,
+            "and the fixture agrees, or every test here gets a racer"
+        );
+    }
+
+    /// THE guard. A timer alone would drop the engines out from under a pass that is merely between
+    /// batches; the unloader must see the in-flight stamp and leave. Asserted through the same
+    /// `in_flight_now` the loop reads, because a test that checked a different signal would pass while
+    /// the loop looked at the wrong one.
+    #[test]
+    fn work_in_flight_is_visible_to_the_idle_check_without_touching_an_engine_lock() {
+        let state = app_state();
+        let _held = HeldEngine::hold(state.clone(), |s| &s.engines.embed);
+        write_inflight(
+            &state.engines.embed_inflight,
+            Some(stamped(
+                Phase::Running,
+                "embed: embedding 64 row(s)",
+                Duration::from_secs(1),
+            )),
+        );
+
+        let asked = Instant::now();
+        let busy = !in_flight_now(&state).is_empty();
+
+        assert!(
+            busy,
+            "a running pass must be visible, or the unloader drops the engine under it"
+        );
+        assert!(
+            asked.elapsed() < Duration::from_millis(200),
+            "and visible WITHOUT queueing on the engine lock the pass is holding"
+        );
+    }
+
+    /// The other half: an idle sidecar with nothing loaded has nothing to give back, and the loop must
+    /// not spend a drain — with its lock acquisition and its ceiling — discovering that.
+    #[test]
+    fn a_sidecar_holding_nothing_has_nothing_to_unload() {
+        let state = app_state();
+
+        assert!(!loaded_now(&state.engines.embed));
+        assert!(!loaded_now(&state.engines.rerank));
     }
 
     /// `bge` is the embedder's tokenizer AND a registered counting name. It must appear ONCE, on the model

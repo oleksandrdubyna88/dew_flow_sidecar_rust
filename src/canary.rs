@@ -28,9 +28,42 @@ use std::sync::OnceLock;
 pub(crate) const CANARY_TEXT: &str =
     "A canary sentence for the bge-m3 engine self-check: the quick brown fox jumps over the lazy dog 0123456789.";
 
-/// Deliberately loose: EP-to-EP arithmetic differences sit near 0.9999, the observed garbage at
-/// 0.13. This is a corruption detector, not a numerics test — the parity harness owns exactness.
+/// The bar an engine must clear to SERVE. Deliberately loose: EP-to-EP arithmetic differences sit near
+/// 0.9999, the observed garbage at 0.13. This is a corruption detector, not a numerics test — the parity
+/// harness owns exactness.
 pub(crate) const CANARY_MIN_COSINE: f32 = 0.99;
+
+/// The bar a freshly BUILT BINARY must clear to be called verified, reported on `/health` and rendered by
+/// the RAG console.
+///
+/// **Two thresholds because there are two questions**, and collapsing them would answer neither well:
+///
+/// - `CANARY_MIN_COSINE` (0.99) decides whether this engine may serve at all. It has to tolerate the
+///   arithmetic difference between execution providers, because refusing a legitimate CUDA build for
+///   disagreeing with a DirectML-captured reference in the fourth decimal would be a false alarm that
+///   costs a customer their install.
+/// - `VERIFIED_MIN_COSINE` (0.999) decides whether the build is worth TRUSTING — the question the
+///   compile button asks after a customer's machine has just built one. A binary between the two bars
+///   serves and is reported as unverified, which is a state somebody should look at rather than one that
+///   should stop the service.
+///
+/// Measured on the reference build 2026-08-19: 1.000000000. The gap between the bars is where a genuine
+/// EP difference lives, and it is small on purpose.
+pub(crate) const VERIFIED_MIN_COSINE: f32 = 0.999;
+
+/// What the canary observed — the number itself, not just whether it passed.
+///
+/// Returned rather than only logged because a cosine that reached nothing but this process's own log file
+/// cannot answer the question the verification gate exists for: a customer's DirectML build that silently
+/// ran on CPU looks identical to a working one, except forty times slower, and the complaint arrives as
+/// "your product is slow".
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CanaryOutcome {
+    pub(crate) cosine: f32,
+    /// How many runs it took. `>1` means the engine needed settling, which is normal on a fresh MIGraphX
+    /// session and worth seeing anywhere else.
+    pub(crate) attempts: usize,
+}
 
 /// The dense embedding of `CANARY_TEXT`, captured 2026-07-31 from the unified build that passed the
 /// parity gate bit-exact at both caps, and reproduced at cosine 1.000000000 by this repository's own
@@ -90,7 +123,7 @@ pub(crate) fn canary_check(
     engine: &mut Bgem3DualEmbedding,
     limits: Limits,
     pin: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CanaryOutcome> {
     let (texts, position) = if pin && limits.max_batch >= 2 {
         let (expanded, positions) =
             pin_shape(&[CANARY_TEXT.to_string()], limits.max_batch, ruler_text());
@@ -106,8 +139,12 @@ pub(crate) fn canary_check(
                 Some((dense, _)) => {
                     let cos = cosine(dense, canary_reference());
                     if cos >= CANARY_MIN_COSINE {
-                        tracing::info!("canary: engine verified against the reference (cosine {cos:.6}, run {attempt})");
-                        return Ok(());
+                        tracing::info!(
+                            "canary: engine verified against the reference (cosine {cos:.6}, run {attempt}); \
+                             the build is {} the {VERIFIED_MIN_COSINE} verification bar",
+                            if cos >= VERIFIED_MIN_COSINE { "above" } else { "BELOW" }
+                        );
+                        return Ok(CanaryOutcome { cosine: cos, attempts: attempt });
                     }
                     last_cosine = cos;
                     tracing::info!(
@@ -125,10 +162,37 @@ pub(crate) fn canary_check(
             Err(e) => return Err(e).context("canary run failed outright"),
         }
     }
-    anyhow::bail!(
-        "canary cosine {last_cosine:.4} after {SETTLE_ATTEMPTS} run(s) (threshold {CANARY_MIN_COSINE}) — the engine's output does not match the reference"
-    )
+    anyhow::bail!(CanaryFailed {
+        outcome: CanaryOutcome {
+            cosine: last_cosine,
+            attempts: SETTLE_ATTEMPTS
+        },
+    })
 }
+
+/// A canary that never settled, carrying the number it reached.
+///
+/// A typed error rather than a formatted string, for the same reason `EngineWedged` is one: the caller has
+/// to RECORD the cosine, not merely print it. A failure that reaches `/health` as a boolean tells an
+/// operator that something is wrong; one that arrives as 0.13 tells them it is the corrupt-cache defect,
+/// and one that arrives as 0.97 tells them it is probably the execution provider.
+#[derive(Debug)]
+pub(crate) struct CanaryFailed {
+    pub(crate) outcome: CanaryOutcome,
+}
+
+impl std::fmt::Display for CanaryFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "canary cosine {:.4} after {} run(s) (threshold {CANARY_MIN_COSINE}) — the engine's output does \
+             not match the reference",
+            self.outcome.cosine, self.outcome.attempts
+        )
+    }
+}
+
+impl std::error::Error for CanaryFailed {}
 
 /// `load_dual` + the canary, healing a corrupt compiled-model cache: a persistent canary failure on
 /// a cached program means the .mxr on disk is bad (defect 1 above), so the engine's cache slice is
@@ -147,12 +211,17 @@ pub(crate) fn load_validated_dual(
     cache: &CachePathLease,
 ) -> anyhow::Result<Bgem3DualEmbedding> {
     let mut engine = load_dual(state, provider_hint, limits.max_length, cache)?;
-    let Err(first_failure) = canary_check(&mut engine, limits, pin) else {
-        return Ok(engine);
+    let first_failure = match canary_check(&mut engine, limits, pin) {
+        Ok(outcome) => {
+            record_self_check(state, Ok(outcome));
+            return Ok(engine);
+        }
+        Err(failure) => failure,
     };
 
     if cache.dir().is_empty() {
         // No compiled-model cache -> nothing to heal by wiping; the failure is the answer.
+        record_self_check(state, Err(&first_failure));
         return Err(first_failure.context("canary failed with no compiled-model cache configured"));
     }
 
@@ -163,10 +232,93 @@ pub(crate) fn load_validated_dual(
     drop(engine);
     cache.wipe();
     let mut rebuilt = load_dual(state, provider_hint, limits.max_length, cache)?;
-    canary_check(&mut rebuilt, limits, pin).context(
-        "canary still failing after a clean recompile — refusing to serve garbage embeddings",
-    )?;
-    Ok(rebuilt)
+    match canary_check(&mut rebuilt, limits, pin) {
+        Ok(outcome) => {
+            record_self_check(state, Ok(outcome));
+            Ok(rebuilt)
+        }
+        Err(failure) => {
+            // Recorded before the context is stacked on, so /health carries the NUMBER rather than the
+            // sentence: 0.13 and 0.97 are the same failure to a boolean and different diagnoses to a human.
+            record_self_check(state, Err(&failure));
+            Err(failure.context(
+                "canary still failing after a clean recompile — refusing to serve garbage embeddings",
+            ))
+        }
+    }
+}
+
+/// The build's verdict on itself, as `/health` reports it and the RAG console renders it.
+///
+/// Both thresholds travel with the number, so a reader needs no access to this source to judge it — the
+/// same reason `in_flight[]` carries `ceiling_seconds` beside `elapsed_seconds`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelfCheck {
+    /// `None` when the engine threw instead of scoring: the cosine is unknown, which is not -1 and not 0.
+    pub(crate) cosine: Option<f32>,
+    pub(crate) attempts: usize,
+    /// Cleared `CANARY_MIN_COSINE` — this engine is allowed to serve.
+    pub(crate) serving: bool,
+    /// Cleared `VERIFIED_MIN_COSINE` — this BUILD is worth trusting. A binary that serves without being
+    /// verified is the state the compile button has to be able to see.
+    pub(crate) verified: bool,
+    pub(crate) since: std::time::Instant,
+}
+
+impl SelfCheck {
+    fn passed(outcome: CanaryOutcome) -> Self {
+        Self {
+            cosine: Some(outcome.cosine),
+            attempts: outcome.attempts,
+            serving: true,
+            verified: outcome.cosine >= VERIFIED_MIN_COSINE,
+            since: std::time::Instant::now(),
+        }
+    }
+
+    /// A completed check, for tests that need one without a GPU. Goes through `passed` so a test can
+    /// never assert a combination the real path cannot produce.
+    #[cfg(test)]
+    pub(crate) fn for_test(cosine: f32, attempts: usize) -> Self {
+        Self::passed(CanaryOutcome { cosine, attempts })
+    }
+
+    fn failed(outcome: Option<CanaryOutcome>) -> Self {
+        Self {
+            cosine: outcome.map(|o| o.cosine),
+            attempts: outcome.map_or(0, |o| o.attempts),
+            serving: false,
+            verified: false,
+            since: std::time::Instant::now(),
+        }
+    }
+}
+
+/// Files what the canary observed, so `/health` can report the build's own verdict on itself.
+///
+/// Healing a poisoned cell the way the rest of the bookkeeping does — one panic must cost one record, not
+/// this field for the life of the process.
+/// The PROVIDER is deliberately not copied in here: `/health` already answers it three ways
+/// (`requested_provider`, `active_provider`, `provider_ready`), and a fact kept in two places is a fact
+/// that will eventually disagree with itself. The console reads the pair.
+fn record_self_check(state: &AppState, outcome: Result<CanaryOutcome, &anyhow::Error>) {
+    let check = match outcome {
+        Ok(outcome) => SelfCheck::passed(outcome),
+        // A failure that carries no `CanaryFailed` never produced a vector at all — the engine threw
+        // instead of scoring — and its cosine is honestly unknown rather than -1.
+        Err(error) => SelfCheck::failed(error.downcast_ref::<CanaryFailed>().map(|f| f.outcome)),
+    };
+
+    match state.self_check.lock() {
+        Ok(mut slot) => *slot = Some(check),
+        Err(poisoned) => {
+            tracing::warn!(
+                "self-check record was poisoned by an earlier panic — healing it and recording"
+            );
+            *poisoned.into_inner() = Some(check);
+            state.self_check.clear_poison();
+        }
+    }
 }
 
 /// Produces a NEW reference vector from the model this build actually loads, and writes it to `path`.
@@ -279,6 +431,66 @@ mod tests {
             super::cosine(&[0.0, 0.0], &[1.0, 0.0]),
             -1.0,
             "a zero vector fails, not NaNs"
+        );
+    }
+
+    /// The two bars answer two questions, and the gap between them is where a legitimate execution
+    /// provider lives. A build at 0.995 SERVES — refusing a real CUDA build for disagreeing with a
+    /// DirectML-captured reference in the third decimal would cost a customer their install — and is
+    /// reported as NOT verified, which is a thing to look at rather than a thing to stop.
+    #[test]
+    fn a_build_between_the_two_bars_serves_and_is_reported_unverified() {
+        let borderline = super::SelfCheck::passed(super::CanaryOutcome {
+            cosine: 0.995,
+            attempts: 1,
+        });
+
+        assert!(borderline.serving, "0.995 is far above the corruption bar");
+        assert!(
+            !borderline.verified,
+            "and below the bar for calling a freshly built binary trustworthy"
+        );
+
+        let clean = super::SelfCheck::passed(super::CanaryOutcome {
+            cosine: 1.0,
+            attempts: 1,
+        });
+        assert!(clean.serving && clean.verified);
+    }
+
+    /// An engine that threw instead of scoring has an UNKNOWN cosine. Reporting -1 or 0 there would put a
+    /// measurement on the wire where there was none — the same rule the VRAM figures and the token
+    /// accounting already follow.
+    #[test]
+    fn a_canary_that_never_scored_reports_no_cosine_rather_than_a_sentinel() {
+        let threw = super::SelfCheck::failed(None);
+
+        assert_eq!(threw.cosine, None);
+        assert_eq!(threw.attempts, 0);
+        assert!(!threw.serving && !threw.verified);
+
+        // A canary that DID score and still failed keeps its number: 0.13 and 0.97 are the same failure
+        // to a boolean and different diagnoses to a human.
+        let scored = super::SelfCheck::failed(Some(super::CanaryOutcome {
+            cosine: 0.13,
+            attempts: 3,
+        }));
+        assert_eq!(scored.cosine, Some(0.13));
+        assert_eq!(scored.attempts, 3);
+    }
+
+    /// The thresholds are ordered, and the order is the whole design. If the verification bar ever fell
+    /// below the serving bar, "verified" would become a weaker claim than "allowed to run".
+    // Constant by construction, and asserted anyway: the ordering is an invariant an edit to either
+    // constant could break, and clippy's complaint is about redundancy rather than correctness. A test that
+    // fails the moment someone "simplifies" the two bars into one is exactly what should exist here.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn the_verification_bar_is_stricter_than_the_serving_bar() {
+        assert!(super::VERIFIED_MIN_COSINE > super::CANARY_MIN_COSINE);
+        assert!(
+            super::VERIFIED_MIN_COSINE < 1.0,
+            "1.0 would refuse every GPU that rounds differently"
         );
     }
 

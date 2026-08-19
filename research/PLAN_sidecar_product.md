@@ -1,9 +1,22 @@
 # PLAN — the sidecar: from a binary that runs here to one a customer can build
 
-> Status: **partly implemented; the engine works and is verified on an R9700. Phase 3 is done bar the
-> release artefact (licence, notices, formatting gate, and the canary generator all landed 2026-08-19);
-> phases 1, 2 and 4 are open, and the build recipe is the large one.**
-> Scope: `src/`, `.github/workflows/ci.yml`, and this repository's public presentation.
+> Status: **IMPLEMENTED, 2026-08-19**, with two items left that this repository cannot close alone — see
+> [The open tail](#the-open-tail). Scope as built: `src/` (`canary`, `recipes`, `introspection`, `config`,
+> `state`, `wire`, `handlers`), `build-recipes.json`, `.github/workflows/{ci,release}.yml`, `LICENSE`,
+> `NOTICE`, `THIRD-PARTY-NOTICES.md`, `Cargo.toml` and the README.
+>
+> **What it delivered:** the build recipe as data with a test that keeps it honest against the manifest in
+> both directions; the verification gate on the wire (`/health.self_check`, two thresholds, measured at
+> 1.0000004 on the reference build); the licence position, resolved from the artefacts rather than from
+> memory and turning up a shipped MPL-2.0 dependency nobody had noticed; a generator for the canary's own
+> oracle; a tag-driven release workflow for the one flavour that may ship; and an opt-in idle unload for the
+> incident where three sidecars sat holding models nobody was using.
+>
+> **The phase-4 audit's own finding** is worth stating up front, because it is the kind of thing a plan
+> hides from itself: three of its four ergonomics items were ALREADY DONE when the audit ran, and the plan
+> text had simply gone stale. `/health.adapter.luid` tells two sidecars on two cards apart; `session_build_ms`
+> on every pass is the sidecar saying it rebuilt; `max_body_bytes` was stated in an earlier task. Only the
+> idle unload was real work.
 >
 > Related: the RAG repo's `todo/PLAN_rag_product.md` phase 4 (the settings and the compile button that drive
 > this) and the MCP repo's `todo/PLAN_mcp_product.md` (the surface eventually served by these vectors).
@@ -127,17 +140,46 @@ wrong".
 
 ## Definition of Done
 
-- [ ] A build recipe exists as data, covering DirectML, CUDA, MIGraphX and CPU, with toolchain requirements
-      and expected build times.
-- [ ] An ABI or provider mismatch fails at startup with a message naming the mismatch — never a hang.
-- [ ] A freshly built sidecar verifies itself against a reference vector at cosine ≥ 0.999 and reports its
-      active provider, and the RAG console shows both.
+- [x] A build recipe exists as data, covering DirectML, CUDA, MIGraphX and CPU, with toolchain requirements
+      and expected build times — `build-recipes.json`, kept honest by `src/recipes.rs` (test-only) in both
+      directions: a recipe naming a feature the crate lacks, and a feature the crate gained that no recipe
+      builds with. Build times are MEASURED (CPU: 4m29s cold, this machine) or ABSENT (CUDA, MIGraphX —
+      no vendor toolchain here, and a guessed number is worse than none on the field an operator uses to
+      decide whether to start a build now or after lunch).
+- [x] An ABI or provider mismatch fails at startup with a message naming the mismatch — never a hang.
+      Already true before this task and verified rather than assumed: `preflight_ort_dylib` probes the dylib
+      through the stable C ABI and exits naming both versions (ort's own check DEADLOCKS instead of
+      erroring), `preflight_migraphx_cache` refuses an unset or unwritable cache path, and
+      `preflight_provider` refuses an EP absent from the build with the `--features` line that would add it.
+- [~] A freshly built sidecar verifies itself against a reference vector at cosine ≥ 0.999 and reports its
+      active provider — **done on this side**: `/health.self_check` carries the cosine and BOTH thresholds
+      (0.99 to serve, 0.999 to be called verified), and the provider is answered three ways beside it. The
+      RAG console rendering it is the half this repository cannot close; see the open tail.
 - [x] README, LICENSE and notices exist, with the vendored fork's licence and the never-redistributed vendor
       providers both stated (2026-08-19). The one thing they say that was not anticipated: a shipped MPL-2.0
       dependency, `option-ext`.
-- [ ] The CPU flavour has a published release artefact.
+- [~] The CPU flavour has a published release artefact — the workflow exists and packages it for Windows
+      and Linux on a `v*` tag, with LICENSE, NOTICE, THIRD-PARTY-NOTICES.md and build-recipes.json inside
+      every archive, and a `workflow_dispatch` rehearsal path that publishes nothing. **No tag has been
+      cut**, so nothing is published yet: that is an operator's decision, not code.
 - [x] Formatting is decided on its own merits, in its own commit, and the CI gate is switched back on
       (2026-08-19).
 - [x] The canary reference has a generator that lives in THIS repository, so a deliberate model change can
       produce a new one (raised and built 2026-08-19: `--write-canary-reference`, verified on the card at
       cosine 1.000000000 against the committed oracle).
+
+## The open tail
+
+Two items, neither of which this repository can finish on its own:
+
+1. **The RAG console has to render the self-check.** `dew_flow_rag_qln`'s runtime panel reads `/health`
+   already; `self_check` is a new field there. The pair to show is the cosine AND the active provider,
+   because the failure the gate exists for — a DirectML build that silently ran on CPU — has correct
+   numbers and wrong hardware. This is the same shape as the `vram_at_load` hand-off, which took a day to
+   be noticed the first time, so it is written here rather than assumed.
+
+2. **The first release tag.** Cutting `v0.1.0` publishes the CPU archives. Nobody has decided to, and the
+   `{{COPYRIGHT_HOLDER}}` placeholder in LICENSE and NOTICE should be resolved by counsel before a binary
+   carries them to a third party.
+
+Everything else this plan asked for is in the repository and tested.

@@ -5,6 +5,7 @@ use crate::tokens::{TokenizerRegistry, BGE_TOKENIZER};
 use crate::wedge::InFlight;
 use fastembed::{Bgem3DualEmbedding, TextRerank};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 /// Lazily-loaded model engines. Each is guarded by its own mutex: the GPU serializes inference
 /// anyway, and the lock makes the first-use load race-free. Loads happen inside spawn_blocking.
@@ -88,6 +89,16 @@ pub(crate) struct AppState {
     /// What building each engine cost on that adapter, where it could be attributed to ONE engine —
     /// see `vram::VramLedger`. Never a residency reading: nothing here re-samples after the build.
     pub(crate) vram: Mutex<crate::vram::VramLedger>,
+    /// What the canary observed the last time an embedding engine was built — the build's verdict on
+    /// ITSELF, which is the thing a freshly compiled sidecar has to be able to state.
+    ///
+    /// `None` until an engine has been built. That is a third state rather than a failure: a sidecar that
+    /// has never loaded a model has neither passed nor failed, and a console rendering "unverified" for it
+    /// would be describing a check that never ran.
+    pub(crate) self_check: Mutex<Option<crate::canary::SelfCheck>>,
+    /// When this process last did work for somebody. Read only by the idle unloader, which is off unless
+    /// an operator turned it on — see `Config::idle_unload`.
+    pub(crate) last_request: Mutex<Instant>,
     /// Every tokenizer this build can COUNT with, resolved at startup — see `TokenizerRegistry`.
     ///
     /// Deliberately a wider set than the models this process embeds: the semantic channel runs on Ollama,

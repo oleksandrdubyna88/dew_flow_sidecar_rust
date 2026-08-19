@@ -13,6 +13,17 @@ use std::sync::Arc;
 
 // ---------- handlers ----------
 
+/// Records that somebody asked this process to do something.
+///
+/// Read by exactly one thing — the idle unloader, which is off unless an operator turned it on. Written
+/// here rather than in the inference path so a REFUSED request counts too: a caller hammering a wedged
+/// engine is not an idle sidecar, and unloading underneath them would turn one problem into two.
+fn touch(state: &AppState) {
+    if let Ok(mut at) = state.last_request.try_lock() {
+        *at = std::time::Instant::now();
+    }
+}
+
 /// Runs one blocking pass and turns its TWO failure modes into the two different HTTP answers they
 /// deserve.
 ///
@@ -30,6 +41,7 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
+    touch(state);
     let idle = state.clone();
     let outcome = tokio::task::spawn_blocking(pass).await;
     set_activity(&idle, "idle");
@@ -126,6 +138,7 @@ pub(crate) async fn tokenize(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<TokenizeResponse>, ApiError> {
+    touch(&state);
     let TokenizeRequest { texts, model } = req;
     let model = requested_tokenizer(&model);
     known_tokenizer(&state, &model)?;

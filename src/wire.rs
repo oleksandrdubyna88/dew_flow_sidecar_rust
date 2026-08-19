@@ -203,6 +203,9 @@ pub(crate) struct HealthResponse {
     /// What each engine's BUILD allocated on the adapter — the split `loaded`'s booleans cannot express.
     /// Additive: `loaded` keeps its shape exactly. See `VramAtLoad`.
     pub(crate) vram_at_load: VramAtLoad,
+    /// What this build proved about ITSELF the last time it loaded an engine. `null` before the first
+    /// build — a check that has not run is neither a pass nor a failure. See `SelfCheckWire`.
+    pub(crate) self_check: Option<SelfCheckWire>,
     pub(crate) models: ModelNames,
     /// The memory envelope in force — the defaults plus the cap the loaded engines actually carry, so the
     /// host can show what is running rather than what was requested.
@@ -217,6 +220,47 @@ pub(crate) struct LoadedModels {
     pub(crate) dense: bool,
     pub(crate) sparse: bool,
     pub(crate) rerank: bool,
+}
+
+/// The verification gate, on the wire: what the canary scored when this build last loaded an engine.
+///
+/// **The failure it exists to prevent** (`todo/PLAN_sidecar_product.md`, phase 2): a customer's DirectML
+/// build that silently ran on CPU looks identical to a working one, except forty times slower, and the
+/// complaint arrives as "your product is slow" rather than "my build is wrong". Reading this beside the
+/// provider fields answers both halves — did this binary produce the right numbers, and did it produce
+/// them on the accelerator it was asked to use.
+///
+/// **Two thresholds, both carried**, so a reader needs no access to the source to judge the number:
+/// `serving_threshold` is the bar to run at all (loose enough to tolerate real execution-provider
+/// arithmetic), `verified_threshold` the bar to be trusted as a freshly built binary. A sidecar can be
+/// `serving: true, verified: false` — it works and somebody should look at it.
+#[derive(Serialize)]
+pub(crate) struct SelfCheckWire {
+    /// The cosine against the committed reference vector. `null` when the engine threw instead of
+    /// scoring: unknown, which is neither -1 nor 0.
+    pub(crate) cosine: Option<f32>,
+    pub(crate) serving: bool,
+    pub(crate) verified: bool,
+    pub(crate) serving_threshold: f32,
+    pub(crate) verified_threshold: f32,
+    /// Runs the canary needed. `>1` is normal on a freshly built MIGraphX session and worth seeing
+    /// anywhere else.
+    pub(crate) attempts: usize,
+    pub(crate) checked_seconds_ago: u64,
+}
+
+impl SelfCheckWire {
+    pub(crate) fn of(check: &crate::canary::SelfCheck) -> Self {
+        Self {
+            cosine: check.cosine,
+            serving: check.serving,
+            verified: check.verified,
+            serving_threshold: crate::canary::CANARY_MIN_COSINE,
+            verified_threshold: crate::canary::VERIFIED_MIN_COSINE,
+            attempts: check.attempts,
+            checked_seconds_ago: check.since.elapsed().as_secs(),
+        }
+    }
 }
 
 /// How much adapter memory each engine's BUILD allocated — `vram_at_load` on `/health`.

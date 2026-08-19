@@ -1,0 +1,114 @@
+name: release
+
+# Tag-driven, never on a push to main: a release is a decision somebody makes, and a workflow that cut
+# one on every merge would publish binaries nobody chose to publish.
+on:
+  push:
+    tags: ["v*"]
+  # So the whole thing can be rehearsed without inventing a tag. A manual run uploads its artefacts to the
+  # RUN rather than to a release — the packaging is exercised, nothing is published.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# ONLY the CPU flavour is built here, and that is a licence decision rather than a scope decision.
+#
+# DirectML, CUDA and cuDNN are vendor-licensed: one cached copy of any of them in a release asset, an
+# image layer or an offline bundle would make us a redistributor (LICENSE §4(iii), THIRD-PARTY-NOTICES.md
+# § "Never redistributed"). The CPU build carries no vendor component at all, which is precisely why it is
+# the one that may ship — and why every other flavour is built on the customer's own machine from
+# build-recipes.json instead.
+#
+# The dependency licences allow this: of the 348 crates in the build graph, all are permissive bar
+# `option-ext` (MPL-2.0), whose only obligation is that its source stays available — which it does, at
+# upstream. NOTICE carries the attribution and travels inside every archive below, because an artefact
+# that leaves the attribution behind is the one way this position breaks.
+jobs:
+  cpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: bge-sidecar
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: bge-sidecar.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    name: cpu · ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # On Linux fastembed's model downloader links system OpenSSL; Windows uses Schannel and needs none.
+      # Named here for the same reason build-recipes.json names it: it is the dependency whose absence
+      # fails a build for a reason that says nothing about this code.
+      - name: Install build dependencies (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      # --locked: a release built from a drifted lockfile is a release nobody can reproduce.
+      - name: Build
+        run: cargo build --release --locked --no-default-features
+
+      # The gate the plan asks for, at the one moment it is cheap: a binary that cannot pass its own tests
+      # must not become an artefact. It also proves the CPU flavour on the platform being packaged, which
+      # the ci workflow only does for ubuntu.
+      - name: Test
+        run: cargo test --release --locked --no-default-features
+
+      # LICENSE, NOTICE and THIRD-PARTY-NOTICES.md travel INSIDE the archive. NOTICE says in as many words
+      # that it must not be removed from a build, an archive or a published artefact — and an attribution
+      # obligation that depends on somebody also visiting the repository is not satisfied.
+      - name: Stage the archive (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p stage
+          cp target/release/${{ matrix.binary }} stage/
+          cp LICENSE NOTICE THIRD-PARTY-NOTICES.md README.md build-recipes.json stage/
+          tar -czf bge-sidecar-cpu-${{ matrix.target }}.tar.gz -C stage .
+
+      - name: Stage the archive (windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item target/release/${{ matrix.binary }} stage/
+          Copy-Item LICENSE, NOTICE, THIRD-PARTY-NOTICES.md, README.md, build-recipes.json stage/
+          Compress-Archive -Path stage/* -DestinationPath bge-sidecar-cpu-${{ matrix.target }}.zip
+
+      # A manual rehearsal stops here: the archive is attached to the run and nothing is published.
+      - name: Upload to the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: bge-sidecar-cpu-${{ matrix.target }}
+          path: bge-sidecar-cpu-${{ matrix.target }}.*
+
+      - name: Publish to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bge-sidecar-cpu-${{ matrix.target }}.*
+          fail_on_unmatched_files: true
+          body: |
+            **CPU flavour only.** This is the one build that carries no vendor execution provider and may
+            therefore be distributed. For DirectML, CUDA or MIGraphX, build on the machine that will run it
+            — `build-recipes.json` in this archive says exactly what to install and what to run, per
+            platform and per accelerator.
+
+            Verify the result with `GET /health`: `active_provider` says which accelerator actually served
+            (never trust the one that was requested), and `self_check` carries the cosine against the
+            committed reference vector plus the two thresholds it is judged against.
+
+            LICENSE, NOTICE and THIRD-PARTY-NOTICES.md are inside the archive and must stay with it.

@@ -1,6 +1,6 @@
 # Architecture — dew_flow_sidecar_rust (bge-sidecar)
 
-> The system **as it is**, 2026-08-16. Everything below is in the repository today; what is planned but
+> The system **as it is**, 2026-08-19. Everything below is in the repository today; what is planned but
 > absent is listed in [What does not exist yet](#what-does-not-exist-yet). Open work lives in
 > [../todo/](../todo/).
 
@@ -27,6 +27,7 @@ everywhere. The customer's machine builds the flavour it needs.
   records), `introspection` (`/health`, `/models`, `/unload` — the routes that only READ),
   `handlers` (`/embed`, `/tokenize`, `/rerank` — the routes that COMPUTE), `inference`,
   `compile_cache` (the MIGraphX cache paths, `CompileWatch` and `CachePathLease`), `bookkeeping`, `canary`,
+  `recipes` (test-only: it keeps `build-recipes.json` honest against the manifest),
   `provider`, `vram` (what a build cost on the card, and when that may be attributed to one engine),
   `logging`, and `testing` (shared test fixtures). Plus `src/adapters.rs` (DXGI device
   resolution and the per-process memory sample, Windows-only) and `vendor-fastembed/` (a full vendored
@@ -74,7 +75,7 @@ graph TD
 
 | Route | Body | Answer |
 |---|---|---|
-| `GET /health` | — | `status` (`ok` \| `wedged`), activity, `in_flight[]`, `wedged`, requested/compiled/active provider, `provider_ready`, last provider error, exe and runtime-manifest hashes + `provenance_ready`, loaded models, `vram_at_load` (bytes each engine's BUILD allocated, or absent with a reason), limits, DXGI adapter |
+| `GET /health` | — | `status` (`ok` \| `wedged`), activity, `in_flight[]`, `wedged`, requested/compiled/active provider, `provider_ready`, last provider error, exe and runtime-manifest hashes + `provenance_ready`, loaded models, `vram_at_load` (bytes each engine's BUILD allocated, or absent with a reason), `self_check` (the canary's cosine and both thresholds, or `null` before the first build), limits, DXGI adapter |
 | `GET /models` | — | one row per model or registered tokenizer: `id`, `name`, `kind` (`dense+sparse` \| `rerank` \| `tokenizer-only`), `dimension` (measured, `null` = unknown), `max_sequence_length`, `tokenizer`, `available` (the engine), `tokenizer_available` (the file) |
 | `POST /embed` | `texts[]`, `kind`, `provider?`, `max_length?`, `max_batch?`, `request_id?` | `dense[][]`, `sparse[]`, `dimension`, token accounting, `request_id`, `timings` |
 | `POST /rerank` | `query`, `documents[]`, `provider?`, `max_batch?`, `request_id?` | `scores[]` in input order, `request_id`, `timings` |
@@ -220,6 +221,37 @@ A **wedged** engine — held past its ceiling by an uncancellable ORT call — i
 holder's activity and elapsed time, because nothing is wrong with the request and a host that degrades on
 `503` while treating `500` as a hard failure can only act on the difference if it is made.
 
+### The verification gate, and the two thresholds
+
+A build that compiles proves nothing about the vectors. `/health.self_check` carries what the canary scored
+the last time an engine was built, against **two** bars, because there are two questions:
+
+- `CANARY_MIN_COSINE` = 0.99 decides whether an engine may SERVE. Loose on purpose: it has to tolerate the
+  arithmetic difference between execution providers, and refusing a real CUDA build for disagreeing with a
+  DirectML-captured reference in the fourth decimal would cost a customer their install.
+- `VERIFIED_MIN_COSINE` = 0.999 decides whether a freshly built BINARY is worth trusting — the question the
+  compile button asks after a customer's machine has just produced one. A sidecar can be `serving: true,
+  verified: false`: it works, and somebody should look at it.
+
+Both bars travel on the wire beside the number, so a reader judges it without this source — the same reason
+`in_flight[]` carries `ceiling_seconds` beside `elapsed_seconds`. Measured on the reference build: 1.0000004.
+
+The other half of the gate is the provider, which `/health` already answers three ways
+(`requested_provider`, `active_provider`, `provider_ready`) and which is deliberately NOT copied into
+`self_check`: a fact kept in two places is a fact that will eventually disagree with itself. A customer's
+DirectML build that silently ran on CPU is caught by reading the pair — the numbers are right and the
+hardware is wrong.
+
+The oracle itself is rebuildable here: `--write-canary-reference` (see the README).
+
+### Building a flavour, as data
+
+`build-recipes.json` at the repository root describes what to install and what to run, per platform and per
+accelerator, for all four flavours. A FILE rather than an endpoint, because it is needed before any sidecar
+exists — the whole distribution story is that the customer's machine builds what it needs. `src/recipes.rs`
+is test-only and keeps it honest in both directions: a recipe naming a cargo feature the crate does not
+have, and a feature the crate gained that no recipe builds with.
+
 ### CI
 
 `.github/workflows/` builds the crate on ubuntu (CPU flavour) and windows (DirectML), runs the tests, and
@@ -259,6 +291,11 @@ A third job checks the plan lifecycle from the shared rules submodule.
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
   `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
 - **No integration test suite** — testing is inline `#[cfg(test)]` beside what each module tests
-  (108 tests), with shared fixtures in `src/testing.rs`.
-- **Distribution is not built**: no build-recipe-as-data, no self-verification gate, no LICENSE or
-  third-party notices.
+  (135 tests), with shared fixtures in `src/testing.rs`.
+- **No published release artefact yet.** `.github/workflows/release.yml` builds, tests and packages the
+  CPU flavour for Windows and Linux on a `v*` tag — with LICENSE, NOTICE, THIRD-PARTY-NOTICES.md and
+  build-recipes.json inside every archive — and no tag has been cut, so nothing has been published. Only
+  the CPU flavour ever will be: the other three carry a vendor execution provider we may use and never
+  redistribute.
+- **The RAG console does not render the self-check yet.** The sidecar publishes `self_check`; reading it
+  into the runtime panel is `dew_flow_rag_qln`'s half of the verification gate.
