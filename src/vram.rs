@@ -201,8 +201,27 @@ pub(crate) fn record(state: &AppState, engine: &str, attribution: Attribution) {
 
 /// A non-blocking read for `/health`. A ledger busy under another thread reports nothing rather than
 /// queueing the probe — the standing rule for every field on that endpoint.
+///
+/// **Poisoned is not busy.** `try_lock().ok()` collapses the two, and the collapse is the anti-pattern the
+/// Rust doctrine names (§5: every recovery path heals AND logs): a panic elsewhere would have made this
+/// endpoint answer "the ledger was busy" forever, about a lock nobody holds. The figures are read through
+/// the poison and the lock is healed on the spot — safe here for the reason `bookkeeping::record` states,
+/// that what this mutex guards is a set of plain counters, so a panic mid-write can leave a stale number
+/// but never a half-written one.
 pub(crate) fn snapshot(state: &AppState) -> Option<VramLedger> {
-    state.vram.try_lock().ok().map(|ledger| ledger.clone())
+    match state.vram.try_lock() {
+        Ok(ledger) => Some(ledger.clone()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            let ledger = poisoned.into_inner().clone();
+            state.vram.clear_poison();
+            tracing::warn!(
+                "vram ledger was poisoned by an earlier panic — healed while reading it for /health; the \
+                 figures it held are reported as they stand"
+            );
+            Some(ledger)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -369,6 +388,46 @@ mod tests {
             sample(&app_state()),
             None,
             "no adapter resolved -> no sample, never a 0"
+        );
+    }
+
+    /// A panic must cost one write, not this field for the life of the process.
+    ///
+    /// `try_lock().ok()` — the shape every other `/health` field uses — cannot tell a poisoned lock from a
+    /// contended one, so one panic anywhere near this ledger would have made the endpoint answer "the ledger
+    /// was busy" forever, about a lock nobody holds. The doctrine's rule is that a recovery path heals and
+    /// logs; this is the read side of it.
+    #[test]
+    fn a_poisoned_ledger_still_reports_its_figures_and_is_healed_rather_than_read_as_busy() {
+        let state = app_state();
+        record(
+            &state,
+            EMBED_CACHE_ENGINE,
+            Attribution::Measured(2_280_759_296),
+        );
+
+        let poisoner = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _held = poisoner.vram.lock().expect("fresh lock");
+            panic!("a build panicked while holding the ledger");
+        })
+        .join()
+        .expect_err("the thread panicked, which is the point");
+        assert!(
+            state.vram.is_poisoned(),
+            "precondition: the ledger is poisoned before the probe reads it"
+        );
+
+        let seen = snapshot(&state).expect("a poisoned ledger is not a busy one");
+
+        assert_eq!(
+            seen.embed,
+            Some(2_280_759_296),
+            "the figure it held survives the poisoning"
+        );
+        assert!(
+            !state.vram.is_poisoned(),
+            "and the probe healed the lock instead of reporting it as busy"
         );
     }
 }
