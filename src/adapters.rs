@@ -74,8 +74,60 @@ pub fn resolve(device_id: i32) -> Option<ResolvedAdapter> {
 }
 
 #[cfg(not(windows))]
-pub fn resolve(_device_id: i32) -> Option<ResolvedAdapter> {
-    None // DirectML is Windows-only; other builds (CUDA/CPU) keep the raw id semantics.
+pub fn resolve(device_id: i32) -> Option<ResolvedAdapter> {
+    // ROCm names the card even though DXGI is not here, and until this existed the sidecar answered
+    // `adapter: null` under WSL — which made the compute ARM unnameable, because a consumer builds
+    // `host/provider/device` and refuses a partial name. Two arms of a three-arm comparison were
+    // therefore anonymous while the card sat one process call away (`rocminfo`, verified 2026-08-20:
+    // Agent 2 = AMD Radeon AI PRO R9700). `rocm-smi` is NOT the source — it wants the amdgpu kernel
+    // module, which WSL2 does not load; it reaches the card through /dev/dxg instead.
+    let index = if device_id < 0 { 0 } else { device_id as usize };
+    let report = std::process::Command::new("rocminfo").output().ok()?;
+
+    Some(ResolvedAdapter {
+        name: gpu_marketing_name(&String::from_utf8_lossy(&report.stdout), index)?,
+        // The NAME is what an arm needs, and it is all this path claims. Nothing here asks ROCm for a
+        // memory figure, so this stays the 0 the field already means as "not asked" off Windows rather
+        // than a number nobody measured.
+        vram_mb: 0,
+        // No LUID off Windows — it is a DXGI identity. Empty rather than invented.
+        luid: String::new(),
+        requested_device: device_id,
+        // The DirectML EP is not in this picture at all.
+        dml_device_id: -1,
+    })
+}
+
+/// The Nth GPU agent's marketing name in a `rocminfo` report, or nothing when there is no such agent.
+///
+/// Pure, and separate from the process call, for the reason `linux_flavour` is: the judgement is the
+/// parse, and it must be checkable without a ROCm stack to produce a report from.
+///
+/// **Only `Device Type: GPU` agents count, in report order.** Agent 1 on this machine is the CPU and its
+/// marketing name is the whole APU (`AMD Ryzen AI 9 HX 370 w/ Radeon 890M`), so taking the first name in
+/// the file would label every measurement with a processor. GPU order matches HIP order, which is what
+/// `HIP_VISIBLE_DEVICES` selects, so index 0 is the discrete card whenever the operator pinned it.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn gpu_marketing_name(report: &str, index: usize) -> Option<String> {
+    let mut pending: Option<String> = None;
+    let mut gpus: Vec<String> = Vec::new();
+
+    for line in report.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("Agent ") {
+            // A new agent: any pending name belonged to the previous one, which was not a GPU.
+            pending = None;
+        } else if let Some(name) = trimmed.strip_prefix("Marketing Name:") {
+            pending = Some(name.trim().to_string());
+        } else if trimmed.starts_with("Device Type:") && trimmed.ends_with("GPU") {
+            if let Some(name) = pending.take() {
+                gpus.push(name);
+            }
+        }
+    }
+
+    gpus.into_iter().nth(index)
 }
 
 /// How many bytes THIS PROCESS currently holds in the adapter's local memory segment, or `None` when
@@ -178,7 +230,72 @@ mod dxgi {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_device, AdapterDesc};
+    use super::{gpu_marketing_name, map_device, AdapterDesc};
+
+    /// A trimmed `rocminfo` report from this machine (2026-08-20). Agent 1 is the CPU whose marketing
+    /// name is the whole APU, Agent 2 the discrete card, Agent 3 the iGPU — which is exactly the shape
+    /// that makes "take the first Marketing Name" wrong.
+    const ROCMINFO: &str = "\
+Agent 1
+  Name:                    AMD Ryzen AI 9 HX 370 w/ Radeon 890M
+  Marketing Name:          AMD Ryzen AI 9 HX 370 w/ Radeon 890M
+  Device Type:             CPU
+Agent 2
+  Name:                    gfx1201
+  Marketing Name:          AMD Radeon AI PRO R9700
+  Device Type:             GPU
+Agent 3
+  Name:                    gfx1150
+  Marketing Name:          AMD Radeon(TM) 890M Graphics
+  Device Type:             GPU
+";
+
+    #[test]
+    fn gpu_index_zero_is_the_discrete_card_not_the_processor() {
+        // The whole point. Agent 1 is a CPU carrying an APU marketing name, so a parser that took the
+        // first name it saw would label every measurement on this machine with a processor.
+        assert_eq!(
+            gpu_marketing_name(ROCMINFO, 0).as_deref(),
+            Some("AMD Radeon AI PRO R9700")
+        );
+    }
+
+    #[test]
+    fn gpu_order_follows_the_report_so_index_one_is_the_igpu() {
+        // GPU order is HIP order, which is what HIP_VISIBLE_DEVICES selects. An operator who pinned 1
+        // must be told the iGPU rather than the card they did not choose.
+        assert_eq!(
+            gpu_marketing_name(ROCMINFO, 1).as_deref(),
+            Some("AMD Radeon(TM) 890M Graphics")
+        );
+    }
+
+    #[test]
+    fn an_index_past_the_last_gpu_is_nothing_rather_than_the_last_one() {
+        // Clamping would name a card the caller did not ask for, and the consumer's rule is that a
+        // partial or wrong arm is worse than an absent one.
+        assert_eq!(gpu_marketing_name(ROCMINFO, 2), None);
+    }
+
+    #[test]
+    fn a_report_with_no_gpu_agent_names_nothing() {
+        let cpu_only = "Agent 1\n  Marketing Name:          Some CPU\n  Device Type:             CPU\n";
+
+        assert_eq!(gpu_marketing_name(cpu_only, 0), None);
+    }
+
+    #[test]
+    fn a_pending_name_does_not_leak_across_an_agent_boundary() {
+        // An agent that names itself and then does not say GPU must not lend its name to the next one.
+        let leaky = "\
+Agent 1
+  Marketing Name:          Not A GPU
+Agent 2
+  Device Type:             GPU
+";
+
+        assert_eq!(gpu_marketing_name(leaky, 0), None);
+    }
 
     fn adapter(luid: i64, name: &str, software: bool) -> AdapterDesc {
         AdapterDesc {
