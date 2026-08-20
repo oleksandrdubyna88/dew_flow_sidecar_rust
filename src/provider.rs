@@ -220,6 +220,48 @@ pub(crate) fn pin_provider(state: &AppState, hint: &str) -> String {
         .clone()
 }
 
+/// Which operating system this process is executing on: `"windows"`, `"wsl"` or `"linux"`.
+///
+/// Reported rather than inferred by a caller, because nobody outside this process can know it — a WSL
+/// sidecar and a Windows one are both reached on `localhost`, and a launcher's configuration states what
+/// it intended rather than what is running.
+///
+/// WSL is distinguished from bare Linux by the kernel release string, which Microsoft's kernel stamps
+/// with `microsoft`. That matters because the two are not interchangeable for anything this field is read
+/// for: the filesystem crossing, the localhost forwarding and the GPU passthrough are all properties of the
+/// VM rather than of Linux, and one index pass measured 155 s of difference across that boundary alone
+/// (`dew_flow_rag_qln · research/GPU_BACKEND_WSL_VS_WINDOWS.md` §9-10). An unreadable release string reads
+/// as plain `linux`: not knowing it is a VM is a smaller error than claiming it is one.
+pub(crate) fn host_os() -> &'static str {
+    if cfg!(target_os = "windows") {
+        return "windows";
+    }
+
+    if !cfg!(target_os = "linux") {
+        return std::env::consts::OS;
+    }
+
+    match std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        Ok(release) => linux_flavour(&release),
+        // Unreadable proc: plain `linux`. Not knowing it is a VM is a smaller error than claiming it is.
+        Err(_) => "linux",
+    }
+}
+
+/// `wsl` or `linux`, from the kernel release string alone — the part with the judgement in it, split out
+/// so it can be checked without a Linux kernel to read one from.
+///
+/// Microsoft stamps its kernel release with `microsoft` (`5.15.167.4-microsoft-standard-WSL2`), and that
+/// substring is the only marker present on every WSL2 build. Matched case-insensitively because the
+/// capitalisation has moved between releases and this is not the place to be surprised by it.
+pub(crate) fn linux_flavour(osrelease: &str) -> &'static str {
+    if osrelease.to_ascii_lowercase().contains("microsoft") {
+        "wsl"
+    } else {
+        "linux"
+    }
+}
+
 /// The execution providers compiled into THIS binary flavor. Derived from the cargo features rather
 /// than from a list someone maintains by hand, so it cannot disagree with the build.
 pub(crate) fn compiled_providers() -> Vec<&'static str> {
@@ -635,6 +677,15 @@ mod tests {
             state.pinned_provider.get().is_none(),
             "and refused before pinning a provider"
         );
+    }
+
+    #[test]
+    fn a_microsoft_kernel_release_is_wsl_and_anything_else_is_linux() {
+        // Real strings: WSL2 on this machine, and a stock Ubuntu kernel.
+        assert_eq!(linux_flavour("5.15.167.4-microsoft-standard-WSL2"), "wsl");
+        assert_eq!(linux_flavour("6.14.0-1012-MICROSOFT-standard-WSL2"), "wsl");
+        assert_eq!(linux_flavour("6.8.0-45-generic"), "linux");
+        assert_eq!(linux_flavour(""), "linux");
     }
 
     /// The provenance READER never computes — that is the whole fix. A local cell, so the assertion is

@@ -51,6 +51,7 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<HealthRes
             .try_lock()
             .map(|a| a.clone())
             .unwrap_or_else(|_| "busy".to_string()),
+        host: crate::provider::host_os(),
         provider: active.clone().unwrap_or_else(|| requested.clone()),
         requested_provider: requested,
         compiled_providers: compiled_providers(),

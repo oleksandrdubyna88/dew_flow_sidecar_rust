@@ -162,6 +162,16 @@ pub(crate) struct HealthResponse {
     /// embedding N row(s)". Lets the host UI show "compiling models" instead of a dead card
     /// during a multi-minute MIGraphX first build.
     pub(crate) activity: String,
+    /// Which operating system this binary is executing on: `"windows"`, `"wsl"` or `"linux"`.
+    ///
+    /// It is reported rather than left to the caller to infer, because nobody outside this process can
+    /// know it: a WSL sidecar and a Windows one are both reached on `localhost`, and the launcher's own
+    /// configuration is a claim about what it intended rather than a fact about what is running. The
+    /// consumer pairs it with `active_provider` and `adapter` to name an ARM — `wsl/migraphx/R9700` — and
+    /// on this hardware the host and the execution provider cannot be read apart: MIGraphX exists only
+    /// under Linux/WSL and DirectML only on Windows, so a measurement labelled by one of them alone
+    /// invites a conclusion it cannot support (`dew_flow_benchmark · research/PLAN_compute_backend_axis.md` §1b).
+    pub(crate) host: &'static str,
     /// LEGACY, kept so existing callers (the C# host) do not break: the active provider once one
     /// exists, otherwise the requested one. Ambiguous by construction — read the four fields below
     /// instead, which is why they exist.
