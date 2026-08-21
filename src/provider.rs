@@ -36,7 +36,7 @@ fn load_session<T>(
     engine: &str,
     seq: usize,
     cache: &CachePathLease,
-    build: impl FnOnce(&str) -> anyhow::Result<T>,
+    build: impl FnMut(&str) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     // Checked rather than assumed, and checked FIRST so a mismatch pins nothing and builds nothing: a
     // lease taken for the other engine would point this build at the other engine's slice — the
@@ -60,32 +60,48 @@ fn load_session<T>(
         cache.shape().seq
     );
 
-    let provider = pin_provider(state, provider_hint);
-    if let Err(error) = preflight_provider(&provider, &exe_dir()) {
-        return record_session_outcome::<T>(state, &provider, Err(error));
-    }
+    // The REQUEST is pinned once per process; what it resolves to is decided per build, by trying. An
+    // `auto` request that reported itself as the answer is what this indirection exists to end — see
+    // `resolution_order`.
+    let requested = pin_provider(state, provider_hint);
+    let candidates = resolution_order(&requested);
+    let mut build = build;
 
-    // Two samples around the ONE place a session is ever built, so both engines are covered by
-    // construction and a third added later is covered for free. What the delta measures is the LOAD, not
-    // residency: a later pass may allocate more — under MIGraphX the first kernel launch allocates most
-    // of it — and nothing here re-samples. See `vram::attribute` for why a delta is published only when
-    // this build was alone.
-    let started = std::time::Instant::now();
-    let window = SoloBuildWindow::open(vram::sample(state));
-    let built = build(&provider);
-    let attribution = window.close(vram::sample(state));
-    if built.is_ok() {
-        // Only a build that produced a session: a failed one allocates and frees an unknown amount, and
-        // charging that to the engine would describe the failure rather than the engine.
-        vram::record(state, engine, attribution);
+    let (served, built) = build_on_first_working(&candidates, |provider| {
+        preflight_provider(provider, &exe_dir())?;
+
+        // Two samples around the ONE place a session is ever built, so both engines are covered by
+        // construction and a third added later is covered for free. What the delta measures is the LOAD,
+        // not residency: a later pass may allocate more — under MIGraphX the first kernel launch
+        // allocates most of it — and nothing here re-samples. See `vram::attribute` for why a delta is
+        // published only when this build was alone.
+        let started = std::time::Instant::now();
+        let window = SoloBuildWindow::open(vram::sample(state));
+        let built = build(provider);
+        let attribution = window.close(vram::sample(state));
+        if built.is_ok() {
+            // Only a build that produced a session: a failed one allocates and frees an unknown amount,
+            // and charging that to the engine would describe the failure rather than the engine.
+            vram::record(state, engine, attribution);
+            tracing::info!(
+                "{model}: session ready on provider {provider} in {:.1}s, {} (the EP compiles or loads                  its cache lazily, on the first pass — the cache path stays claimed until it has)",
+                started.elapsed().as_secs_f32(),
+                load_size_text(attribution)
+            );
+        }
+        built
+    });
+
+    if built.is_ok() && served != requested {
+        // The line an operator needs when a machine is quietly slower than the one beside it. INFO, not
+        // a warning: a CPU fallback is a working service. It is also the only moment the gap between what
+        // was asked for and what runs is cheap to see.
         tracing::info!(
-            "{model}: session ready in {:.1}s, {} (the EP compiles or loads its cache lazily, on the first \
-             pass — the cache path stays claimed until it has)",
-            started.elapsed().as_secs_f32(),
-            load_size_text(attribution)
+            "provider {requested} resolved to {served} for {model}: that is what /health reports as              active, and what the runtime panel names the arm with"
         );
     }
-    record_session_outcome(state, &provider, built)
+
+    record_session_outcome(state, &served, built)
 }
 
 /// How the build's allocation reads in the startup log — the same four states `/health` publishes, in a
@@ -516,6 +532,64 @@ pub(crate) fn effective_provider(config: &Config, hint: &str) -> String {
 /// configured id (their own numbering — HIP device order for MIGraphX, so pin the discrete card
 /// with HIP_VISIBLE_DEVICES when an iGPU is present); DirectML gets the DXGI-mapped
 /// plain-enumeration index (see adapters.rs).
+/// The concrete providers a request may resolve to, in the order they are tried.
+///
+/// **`auto` is a request, not an execution provider**, and until 2026-08-20 it was reported as though it
+/// were one: the chain was handed to ort as a soft list and whichever EP won was never captured, so
+/// `/health` answered `active_provider: "auto"` on a machine where DirectML was demonstrably serving
+/// (2 175 MB charged to the embed build; a CPU session allocates nothing on the card). That is the
+/// 2026-08-08 defect — the requested provider published as the active one — reintroduced on the one path
+/// that was not covered when it was fixed for the explicit case.
+///
+/// Resolving it by TRYING rather than predicting it from `compiled_providers()` is the whole point: a
+/// binary with DirectML compiled in still falls through to CPU on a machine whose driver will not register
+/// it, and a prediction would name `dml` for exactly the run an operator most needs to see named `cpu`.
+///
+/// An explicit request resolves to itself and offers no fallback — unchanged, and deliberately: a broken
+/// GPU setup must be visible rather than quietly served by the CPU.
+pub(crate) fn resolution_order(provider: &str) -> Vec<&'static str> {
+    match provider {
+        "cuda" => vec!["cuda"],
+        "dml" => vec!["dml"],
+        "migraphx" => vec!["migraphx"],
+        "cpu" => vec!["cpu"],
+        // ort's own chain order, narrowed to what this binary carries. An EP absent from the build cannot
+        // win a registration it will not survive, and offering it would only buy a failed session build.
+        _ => {
+            let compiled = compiled_providers();
+            let mut order: Vec<&'static str> = ["cuda", "migraphx", "dml"]
+                .into_iter()
+                .filter(|candidate| compiled.contains(candidate))
+                .collect();
+            order.push("cpu");
+            order
+        }
+    }
+}
+
+/// Builds on the first candidate that works, and returns **which one did**.
+///
+/// The returned name is the fact `/health.active_provider` publishes and `ComputeArm` (over in
+/// `dew_flow_rag_qln`) names an arm with, so it has to be observed rather than assumed. When nothing
+/// builds the name is empty — nothing served, so nothing may be reported as having served — and the error
+/// is the LAST candidate's, because a CPU fallback that also failed is the reason a reader needs.
+fn build_on_first_working<T>(
+    candidates: &[&str],
+    mut attempt: impl FnMut(&str) -> anyhow::Result<T>,
+) -> (String, anyhow::Result<T>) {
+    let mut last = anyhow::anyhow!("no execution provider was offered to try");
+    for candidate in candidates {
+        match attempt(candidate) {
+            Ok(built) => return (candidate.to_string(), Ok(built)),
+            Err(error) => {
+                tracing::warn!("provider {candidate} could not build a session: {error:#}");
+                last = error;
+            }
+        }
+    }
+    (String::new(), Err(last))
+}
+
 pub(crate) fn execution_providers(
     provider: &str,
     cuda_device_id: i32,
@@ -564,6 +638,108 @@ mod tests {
         assert_eq!(execution_providers("migraphx", 0, 0).len(), 1);
         assert_eq!(execution_providers("cpu", 0, 0).len(), 0);
         assert_eq!(execution_providers("auto", 0, 0).len(), 3);
+    }
+
+    // ---- what `auto` resolves TO (2026-08-20) ----------------------------------------------------
+    //
+    // Observed live on an R9700 the day the runtime panel started naming ARMS: `/health` answered
+    // `active_provider: "auto"` while DirectML was demonstrably serving (2 175 MB of adapter memory
+    // charged to the embed build; a CPU session allocates nothing on the card). `auto` is the DEFAULT,
+    // so this was the shipping configuration.
+    //
+    // It is the 2026-08-08 defect wearing different clothes. That one reported the REQUESTED provider as
+    // the active one and was fixed for the explicit case; `auto` reintroduced it, because the chain was
+    // handed to ort as a list and whichever EP won was never captured. The symptom is milder — it names
+    // no wrong EP, it names no EP at all — and the consequence is not: `ComputeArm` over in
+    // `dew_flow_rag_qln` says in as many words that it uses the active provider "rather than the
+    // requested one, deliberately: a provider that was asked for and never registered is exactly the
+    // failure this naming exists to expose". Under `auto` the active provider IS the requested one, so
+    // the exposure does not happen — and it fails SILENTLY, because "auto" is a non-empty string and
+    // passes that consumer's "three segments or nothing" guard.
+    //
+    // What makes it worth code rather than a note: the self-check cannot cover for it. A silent CPU
+    // fallback still scores cosine ~1.0, because CPU computes the same numbers. The pair of fields that
+    // answers "right numbers, AND right hardware" would then answer only the first half.
+
+    #[test]
+    fn an_auto_request_resolves_to_concrete_providers_and_never_to_auto_itself() {
+        let order = resolution_order("auto");
+
+        assert!(
+            !order.contains(&"auto"),
+            "`auto` is a request, not an execution provider; resolving it to itself is the whole defect: {order:?}"
+        );
+        assert_eq!(
+            order.last(),
+            Some(&"cpu"),
+            "ort falls through to CPU, so CPU is the last candidate and the chain can always conclude: {order:?}"
+        );
+        for candidate in &order {
+            assert!(
+                compiled_providers().contains(candidate),
+                "`{candidate}` is not in this binary, so it can never win a registration it will not survive"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_request_resolves_to_itself_and_offers_no_fallback() {
+        // The existing doctrine, pinned so the auto work cannot quietly soften it: an explicit choice
+        // fails hard, because a broken GPU setup must be visible rather than silently served by CPU.
+        assert_eq!(resolution_order("dml"), vec!["dml"]);
+        assert_eq!(resolution_order("cuda"), vec!["cuda"]);
+        assert_eq!(resolution_order("migraphx"), vec!["migraphx"]);
+        assert_eq!(resolution_order("cpu"), vec!["cpu"]);
+    }
+
+    #[test]
+    fn the_provider_reported_is_the_one_that_actually_built_not_the_one_asked_for() {
+        // THE test. A machine whose DirectML cannot register — a driver rollback, a card off the bus —
+        // is served by CPU, and that is exactly the state an operator must be able to SEE.
+        let (served, built) = build_on_first_working(&["dml", "cpu"], |provider| match provider {
+            "dml" => anyhow::bail!("DXGI: no compatible adapter"),
+            _ => Ok(provider.to_string()),
+        });
+
+        assert_eq!(
+            served, "cpu",
+            "the fallback served, so the fallback is what is reported"
+        );
+        assert_eq!(built.expect("cpu builds"), "cpu");
+    }
+
+    #[test]
+    fn the_first_candidate_that_builds_wins_and_the_rest_are_never_tried() {
+        let mut tried = Vec::new();
+        let (served, built) = build_on_first_working(&["dml", "cpu"], |provider| {
+            tried.push(provider.to_string());
+            Ok(provider.to_string())
+        });
+
+        assert_eq!(served, "dml");
+        assert!(built.is_ok());
+        assert_eq!(
+            tried,
+            vec!["dml"],
+            "a working provider must not cost a second session build"
+        );
+    }
+
+    #[test]
+    fn a_chain_that_builds_nowhere_fails_with_the_last_reason_rather_than_a_provider() {
+        // Nothing served, so nothing may be named as having served. The error text is the last
+        // candidate's, because the CPU fallback failing is the reason a reader needs.
+        let (served, built) = build_on_first_working::<String>(&["dml", "cpu"], |provider| {
+            anyhow::bail!("{provider} refused")
+        });
+
+        assert!(
+            served.is_empty(),
+            "nothing served, so nothing may be named as having served — got `{served}`"
+        );
+
+        let error = format!("{:#}", built.expect_err("every candidate failed"));
+        assert!(error.contains("cpu refused"), "{error}");
     }
 
     // ---- provider truthfulness + fail-fast (2026-08-08) --------------------------------------

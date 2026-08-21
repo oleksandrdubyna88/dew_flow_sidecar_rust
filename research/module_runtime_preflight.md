@@ -65,6 +65,58 @@ a real deployment runs on until a request overrides it. The old default of 4 sil
 | `seed_model_cache_from_env` / `copy_missing_files` | Weights are missing from the cache. Copies what is absent, repairs a truncated earlier copy, and skips what is already there |
 | `adapters::resolve` / `map_device` | The device id means a different card than the operator picked |
 
+## `auto` is a request, and the answer is now observed rather than assumed (2026-08-20)
+
+`ORT_PROVIDER` may name an execution provider or leave the choice open. The open case is the DEFAULT, and
+until this date it was the one case where `/health` published a request as though it were an outcome.
+
+**What was observed.** On an R9700, on a live stack, `/health` answered:
+
+```
+"requested_provider": "auto",  "active_provider": "auto",  "provider_ready": true
+```
+
+while DirectML was demonstrably serving — `vram_at_load.embed_bytes` charged **2 175 MB** to the embed
+build, and a CPU session allocates nothing on the adapter. So the field that exists to name the hardware
+named nothing, on the configuration every customer gets by default.
+
+**Why that is the 2026-08-08 defect again.** That one had `/health` reporting the REQUESTED provider as the
+active one, so a binary whose CUDA EP never registered still answered `provider: "cuda"` while every embed
+failed in 4 ms. It was fixed for the explicit case — `record_session_outcome` writes `active_provider` only
+after a session succeeds. `auto` slipped through, because the fix recorded *the string that was asked for*,
+and for `auto` that string is `"auto"`. The symptom is milder (it names no wrong EP; it names no EP) and the
+consequence is not:
+
+- `ComputeArm` in `dew_flow_rag_qln` says in as many words that it uses the active provider *"rather than
+  the requested one, deliberately: a provider that was asked for and never registered is exactly the failure
+  this naming exists to expose"*. Under `auto` the active provider **is** the requested one.
+- It failed **silently**, because `"auto"` is a non-empty string and passes that consumer's "three segments
+  or nothing" guard. The arm read `windows/auto/R9700` — complete, and uninformative.
+- **The canary cannot cover for it.** A silent CPU fallback still scores cosine ~1.0, because CPU computes
+  the same numbers. The pair of fields that answers *"right numbers, AND right hardware"* would have
+  answered only the first half — which is the exact failure the verification gate was built for.
+
+**The fix: try, do not predict.** `resolution_order` turns a request into the concrete providers it may
+resolve to — an explicit one to itself with no fallback (unchanged: a broken GPU setup must be visible),
+`auto` to this binary's compiled GPU EPs in ort's own chain order, then `cpu`. `build_on_first_working`
+then builds on each in turn, fail-hard, and returns **which one did**; that name is what
+`record_session_outcome` records.
+
+Predicting the winner from `compiled_providers()` was considered and rejected, and the reason is the whole
+point: a binary with DirectML compiled in still falls through to CPU on a machine whose driver will not
+register it, and a prediction would name `dml` for exactly the run an operator most needs to see named
+`cpu`.
+
+Cost: none in the ordinary case. Uncompiled EPs are filtered out before any build, so a `dml`+`cpu` binary
+under `auto` tries exactly one candidate — where it previously handed ort a three-element soft list. When a
+fallback does happen it is logged at INFO, naming both the request and what served, because a CPU fallback
+is a working service rather than an error, and that log line is the only cheap moment to see the gap.
+
+**Verified on the card, not only in tests.** Same machine, same request, rebuilt binary:
+`active_provider` `"auto"` → `"dml"`, and the arm `windows/auto/R9700` → `windows/dml/AMD Radeon AI PRO
+R9700`. `self_check` was unchanged at cosine 1.0000004, which is the point — it never had anything to say
+about this.
+
 ## The compiled-model cache slice — one per engine AND one per shape (2026-08-19)
 
 Under MIGraphX the compiled-model cache is mandatory, and its layout is a correctness matter rather than a
@@ -143,7 +195,7 @@ consumes it is `src/vram.rs` (see [PLAN_vram_per_engine.md](PLAN_vram_per_engine
 | `pinned_provider` | The provider of the first successful session, fixed until restart |
 | `committed_embed_cap` / `loaded_max_batch` | What actually ran, as opposed to what was configured. The cap is an atomic mirror of the engine cache's occupancy — written under that lock, read without it; see *A cap is a commitment* in [module_inference.md](module_inference.md) |
 | `vram` | What each engine's BUILD cost on the adapter, and how many samples were discarded as unattributable |
-| `active_provider` / `last_provider_error` | Filled by session creation; read by `/health` with `try_lock` |
+| `active_provider` / `last_provider_error` | Filled by session creation with the provider that ACTUALLY built — never the requested one, and since 2026-08-20 never the literal `auto` either; read by `/health` with `try_lock` |
 | `exe_sha256` / `runtime_manifest_sha256` | Identity of the binary and of the provider libraries beside it |
 
 ## Dependencies
@@ -159,5 +211,8 @@ consumes it is `src/vram.rs` (see [PLAN_vram_per_engine.md](PLAN_vram_per_engine
 
 Inline: `compiled_providers` matching the build flavour, an uncompiled provider refused with a rebuild
 instruction, `auto`/`cpu` never refused, provider-token resolution (env wins, unknown degrades to
-`auto`), the dylib and cache verdicts including the version-mismatch message, model-cache seeding
+`auto`), **what `auto` then resolves TO** (five tests: it never resolves to itself, it ends at `cpu`, every
+candidate is compiled into this binary, an explicit request gets no fallback, the provider reported is the
+one that actually built — and a chain that builds nowhere names nobody), the dylib and cache verdicts
+including the version-mismatch message, model-cache seeding
 (empty target, partial copy, truncated repair), and `map_device`'s ordering contract without DXGI.
