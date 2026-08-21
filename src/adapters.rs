@@ -279,7 +279,8 @@ Agent 3
 
     #[test]
     fn a_report_with_no_gpu_agent_names_nothing() {
-        let cpu_only = "Agent 1\n  Marketing Name:          Some CPU\n  Device Type:             CPU\n";
+        let cpu_only =
+            "Agent 1\n  Marketing Name:          Some CPU\n  Device Type:             CPU\n";
 
         assert_eq!(gpu_marketing_name(cpu_only, 0), None);
     }
