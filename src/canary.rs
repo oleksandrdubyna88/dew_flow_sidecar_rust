@@ -48,7 +48,9 @@ pub(crate) const CANARY_MIN_COSINE: f32 = 0.99;
 ///   should stop the service.
 ///
 /// Measured on the reference build 2026-08-19: 1.000000000. The gap between the bars is where a genuine
-/// EP difference lives, and it is small on purpose.
+/// EP difference lives, and it is small on purpose — measured 2026-08-21 for the first time: the published
+/// CPU artefact scores 0.99999994 against this DirectML build's 1.0000004, so two providers differ in the
+/// EIGHTH decimal while the garbage this gate exists to catch scored 0.13.
 pub(crate) const VERIFIED_MIN_COSINE: f32 = 0.999;
 
 /// What the canary observed — the number itself, not just whether it passed.

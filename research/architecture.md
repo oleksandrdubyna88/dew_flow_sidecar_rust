@@ -234,7 +234,22 @@ the last time an engine was built, against **two** bars, because there are two q
   verified: false`: it works, and somebody should look at it.
 
 Both bars travel on the wire beside the number, so a reader judges it without this source — the same reason
-`in_flight[]` carries `ceiling_seconds` beside `elapsed_seconds`. Measured on the reference build: 1.0000004.
+`in_flight[]` carries `ceiling_seconds` beside `elapsed_seconds`.
+
+**The gap between the bars, measured rather than reasoned about (2026-08-21).** Until this date the looser
+serving bar rested on an argument: *providers will disagree slightly, so leave room*. The published v0.1.2 CPU
+artefact supplied the first number on the other side of that gap — the same canary text, the same committed
+reference vector, a different execution provider:
+
+| build | provider | cosine |
+|---|---|---|
+| reference / dev build on an R9700 | `dml` | **1.0000004** |
+| published CPU artefact, same machine | `cpu` | **0.99999994** |
+
+Two providers, disagreeing in the **eighth** decimal, both far above the 0.999 trust bar. So the 0.99 serving
+bar is roughly five orders of magnitude looser than the difference it was set to tolerate — which is the
+correct direction for a corruption detector (the garbage it exists to catch scored **0.13**), and now a
+measured claim instead of a plausible one.
 
 The other half of the gate is the provider, which `/health` already answers three ways
 (`requested_provider`, `active_provider`, `provider_ready`) and which is deliberately NOT copied into
