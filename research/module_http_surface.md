@@ -145,13 +145,27 @@ is an engine held past its ceiling by an ONNX Runtime call nothing can cancel:
 | `in_flight[]` | Per held engine: `engine`, `phase` (`building` \| `running`), `activity`, `elapsed_seconds`, `ceiling_seconds`, `wedged`. Empty when nothing holds an engine |
 | `provenance_ready` | The two hashes are final. `false` = still being computed, so an empty hash means "not yet", not "unreadable" |
 
+| `host` (2026-08-20) | Which operating system this process runs on — `windows`, `wsl` or `linux`. **Reported
+rather than inferred**, because nobody outside the process can know it: a WSL sidecar and a Windows one are
+both reached on `localhost`, and a launcher's configuration states what it intended rather than what is
+running. WSL is told from bare Linux by the `microsoft` stamp in the kernel release string, because the two
+are not interchangeable for anything this field is read for — the filesystem crossing, the localhost
+forwarding and the GPU passthrough are properties of the VM, and one index pass measured 155 s of difference
+across that boundary alone. With `active_provider` and `adapter` it completes an **ARM** — `wsl/migraphx/R9700`
+— which is what `dew_flow_rag_qln` names a measurement with so that two of our own sidecars stop collapsing
+into one result row. An empty value makes the whole arm unknown rather than a two-part guess |
+
 Plus four provider facts that a single field used to conflate:
 
 | Field | Answers |
 |---|---|
 | `requested_provider` | What was asked for. Says nothing about whether it works |
 | `compiled_providers` | What this binary was **built** with. A provider absent here can never become active, however it is configured |
-| `active_provider` | The provider of a successfully created session; `null` until one exists |
+| `active_provider` | The provider of a successfully created session; `null` until one exists. **Never the
+literal `auto`** — that is a request, and reporting it here was the 2026-08-08 defect on the one path the
+original fix missed. Since v0.1.2 an `auto` request is resolved by TRYING each compiled provider fail-hard
+in ort's chain order and reporting the one that built (`module_runtime_preflight.md`, *`auto` is a
+request*). A binary older than v0.1.2 still answers `auto`, and consumers refuse it as a provider name |
 | `provider_ready` / `last_provider_error` | Whether inference has ever succeeded, and the last registration failure verbatim |
 
 Plus `exe_sha256` and `runtime_manifest_sha256` — so a benchmark can prove it measured the same binary

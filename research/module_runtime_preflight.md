@@ -37,7 +37,7 @@ Every knob is an environment variable, injected by the AppHost.
 | Variable | Default | What it decides |
 |---|---|---|
 | `PORT` | 5320 | The bind port. The AppHost owns the number |
-| `ORT_PROVIDER` | *(empty)* | `auto \| cuda \| dml \| migraphx \| cpu`. Empty ⇒ the first request's hint, else `auto`. An explicit choice **fails hard** rather than silently falling back to CPU |
+| `ORT_PROVIDER` | *(empty)* | `auto \| cuda \| dml \| migraphx \| cpu`. Empty ⇒ the first request's hint, else `auto`. An explicit choice **fails hard** rather than silently falling back to CPU; what `auto` resolves to, and how it is reported, is its own section below |
 | `ORT_DEVICE_ID` | 0 | GPU index in DXGI **high-performance order** (0 = fastest card) |
 | `MAX_BATCH` | 64 | Default batch. Linear in the attention peak |
 | `EMBED_MAX_LENGTH` | 256 | Default token cap. **The** memory driver — cost grows with its square |
