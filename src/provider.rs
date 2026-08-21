@@ -16,11 +16,16 @@ use std::time::Instant;
 
 /// Everything a session load does around the one line that differs — building the options.
 ///
-/// The two loaders below were the same seven steps twice: pin the provider, preflight it, log the
-/// intent, build the options, build the session inside the engine's own cache slice while timing it, log
-/// the duration, record the outcome. Only the options builder genuinely differed, and the two types
+/// The two loaders below were the same steps twice: resolve the provider, log the intent, build the
+/// options, build the session inside the engine's own cache slice while timing it, log the duration,
+/// record the outcome. Only the options builder genuinely differed, and the two types
 /// (`Bgem3DualInitOptions`, `RerankInitOptions`) share no trait — so the shape that removes the copy is
 /// a closure that receives the resolved provider and returns a session.
+///
+/// **Resolving is a loop, not a step** (2026-08-20). The pinned value is the REQUEST; `auto` names no
+/// execution provider, so each candidate `resolution_order` offers is preflighted and BUILT in turn,
+/// fail-hard, and the first that succeeds is what gets recorded as active. The closure is therefore
+/// `FnMut`: it may be called once per candidate, and it is handed the candidate rather than the request.
 ///
 /// The preflight is here rather than only at startup because when `ORT_PROVIDER` is empty the provider
 /// is not known until the first request names it: the check has to run before the first session, not at

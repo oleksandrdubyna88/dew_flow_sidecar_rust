@@ -110,7 +110,7 @@ has exactly this shape: a `#[cfg(windows)]` DXGI module and an `None` for everyt
 1. **`adapters::process_vram_bytes() -> Option<u64>`** beside the existing DXGI code in
    `src/adapters.rs`, `#[cfg(windows)]`, resolving the same adapter the EP targets (the module already
    resolves `ORT_DEVICE_ID` to an adapter — reuse that resolution, do not re-enumerate).
-2. **The build counter and the two samples in `load_session`** (`src/provider.rs:29`) — one place, so
+2. **The build counter and the two samples in `load_session`** (`src/provider.rs:32`; the samples now sit at `:79`/`:81`, inside the per-candidate attempt, since `auto` resolves by trying) — one place, so
    both engines are covered by construction and a third engine added later is covered for free.
 3. **`LoadedModels` gains the figures** (`src/wire.rs:213`). Three booleans become three entries each
    carrying `loaded: bool` and `load_bytes: Option<u64>`; `/health` consumers that only read the boolean
