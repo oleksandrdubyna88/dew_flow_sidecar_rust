@@ -1,7 +1,8 @@
 # PLAN — the sidecar: from a binary that runs here to one a customer can build
 
-> Status: **IMPLEMENTED, 2026-08-19**. Its console half was closed the same day in `dew_flow_rag_qln`; one
-> item is left, and it is an operator's decision rather than work — see
+> Status: **IMPLEMENTED, 2026-08-19; fully closed 2026-08-21.** Its console half was closed the same day in
+> `dew_flow_rag_qln`, and the last item — the release tag, which was an operator's decision rather than work —
+> was taken on 2026-08-20/21: `v0.1.0`, then `v0.1.1` and `v0.1.2` for two defects the first tag exposed. See
 > [The open tail](#the-open-tail). Scope as built: `src/` (`canary`, `recipes`, `introspection`, `config`,
 > `state`, `wire`, `handlers`), `build-recipes.json`, `.github/workflows/{ci,release}.yml`, `LICENSE`,
 > `NOTICE`, `THIRD-PARTY-NOTICES.md`, `Cargo.toml` and the README.
@@ -162,19 +163,27 @@ wrong".
 - [x] README, LICENSE and notices exist, with the vendored fork's licence and the never-redistributed vendor
       providers both stated (2026-08-19). The one thing they say that was not anticipated: a shipped MPL-2.0
       dependency, `option-ext`.
-- [~] The CPU flavour has a published release artefact — the workflow exists and packages it for Windows
-      and Linux on a `v*` tag, with LICENSE, NOTICE, THIRD-PARTY-NOTICES.md and build-recipes.json inside
-      every archive, and a `workflow_dispatch` rehearsal path that publishes nothing. **No tag has been
-      cut**, so nothing is published yet: that is an operator's decision, not code.
+- [x] The CPU flavour has a published release artefact. **Published 2026-08-20**: `v0.1.0` for Windows and
+      Linux x86_64, with LICENSE, NOTICE, THIRD-PARTY-NOTICES.md and build-recipes.json inside every archive
+      — verified by downloading the published assets rather than trusting the workflow, after a
+      `workflow_dispatch` rehearsal that built both legs and published nothing.
+
+      **Two defects followed, and both were found by the release rather than by the tests**, which is the
+      argument for having cut it: `v0.1.0` was tagged two commits before `/health.host` existed, so the
+      console that names an ARM shipped hours later against a binary that could not fill its first segment
+      (`v0.1.1`). Then the live verification of that very arm found the SECOND segment reporting `auto` —
+      the request, not an execution provider — on the default configuration, while DirectML was demonstrably
+      serving (`v0.1.2`, see `research/module_runtime_preflight.md`). Neither was reachable from a unit
+      test: the first is a question about what a tag contains, the second only appears on real hardware.
 - [x] Formatting is decided on its own merits, in its own commit, and the CI gate is switched back on
       (2026-08-19).
 - [x] The canary reference has a generator that lives in THIS repository, so a deliberate model change can
       produce a new one (raised and built 2026-08-19: `--write-canary-reference`, verified on the card at
       cosine 1.000000000 against the committed oracle).
 
-## The open tail
+## The open tail — now empty
 
-One item, and it is a decision rather than work:
+Both items closed. Kept in full rather than deleted: what each cost to close is the part a later reader needs.
 
 1. ~~**The RAG console has to render the self-check.**~~ **Closed 2026-08-19**, the same day it was written
    down — which is the whole point of having written it down: the `vram_at_load` hand-off took a day to be
@@ -183,8 +192,24 @@ One item, and it is a decision rather than work:
    because the failure the gate exists for — a DirectML build that silently ran on CPU — has correct
    numbers and wrong hardware. Recorded there in `research/module_runtime.md`.
 
-2. **The first release tag.** Cutting `v0.1.0` publishes the CPU archives. Nobody has decided to, and the
-   `{{COPYRIGHT_HOLDER}}` placeholder in LICENSE and NOTICE should be resolved by counsel before a binary
-   carries them to a third party.
+2. ~~**The first release tag.**~~ **Cut 2026-08-20** — `v0.1.0`, after a `workflow_dispatch` rehearsal that
+   built both legs and published nothing, and verified by downloading the published archives rather than by
+   trusting the run. The `{{COPYRIGHT_HOLDER}}` placeholder was raised before publishing and the operator
+   accepted it as-is; it is still literal in every shipped LICENSE and NOTICE, and replacing it is one edit
+   and one tag whenever counsel answers.
 
-Everything else this plan asked for is in the repository and tested.
+   **The release then earned its keep twice, which is worth recording because neither defect was reachable
+   from a test.** `v0.1.0` had been tagged two commits before `/health.host` existed, so the console that
+   names an ARM shipped hours later against a binary that could not fill the arm's first segment —
+   `v0.1.1`. And the live verification of that arm, run on the card once it was free, found the SECOND
+   segment answering `auto` on the default configuration while DirectML was demonstrably serving: the
+   request published as the outcome, the same defect this repository fixed for explicit providers in
+   August and never covered for `auto` — `v0.1.2`, recorded in
+   [module_runtime_preflight.md](module_runtime_preflight.md).
+
+   The lesson the plan did not anticipate: **a tag is an instrument.** Two defects that every unit test
+   passed over were found by asking what the artefact actually contains and what the binary actually says
+   on hardware.
+
+Everything this plan asked for is in the repository, tested, and — for the one flavour that may legally
+ship — published.
