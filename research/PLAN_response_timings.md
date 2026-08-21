@@ -4,6 +4,12 @@
 > (request/response structs and the two blocking inference paths), `README.md` endpoint contract,
 > `todo/README.md` index.
 >
+> **Its `src/main.rs:NNNN` references are historical.** They were written when `main.rs` was one
+> 4 744-line file; [PLAN_reliability_tail.md](PLAN_reliability_tail.md) split it into 17 modules on
+> 2026-08-16, so those numbers now point past the end of a 400-line file. They are left as written
+> rather than renumbered — the code did not move within a file, it moved to different files, and a
+> design record is a statement about the day it was made. Follow the NAMES, not the numbers.
+>
 > **Deviations.** One: the DoD's original `cargo fmt --check` gate was dropped — the checkout carries
 > 109 pre-existing rustfmt diffs (the fmt gate is `todo/PLAN_sidecar_product.md`'s open work), so the
 > new code matches the surrounding style instead of introducing a second one. Everything else shipped
