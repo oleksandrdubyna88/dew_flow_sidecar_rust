@@ -61,6 +61,44 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --package bge-sidecar --check
 
+  # The six routes over the wire, against a running binary: routing, the JSON extractor's refusals,
+  # the batch caps and the body limit — which is a LAYER, so nothing below the router can prove one is
+  # applied. Runs the CPU flavour on ubuntu and never asks for an inference: an engine build takes the
+  # GPU, and gpu-lease.md says a tool claims the card through a lease or not at all.
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git submodule update --init --depth 1 .claude/rules/shared
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-latest-cpu-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install the pinned httpyac
+        run: npm ci --prefix http
+
+      - name: Start the sidecar and run the suite
+        run: |
+          cargo build --release --locked --no-default-features
+          PORT=5320 ./target/release/bge-sidecar &
+          for _ in $(seq 1 30); do
+            curl -fsS -o /dev/null http://127.0.0.1:5320/health && break
+            sleep 2
+          done
+          node .claude/rules/shared/tools/http-run.mjs --env local --target http://127.0.0.1:5320
+
+      - name: Every route has a request
+        run: node .claude/rules/shared/tools/http-coverage.mjs --source src
+
+      - name: The post-deploy checklist is still well formed
+        run: node .claude/rules/shared/tools/post-deploy-check.mjs
+
   # The plan lifecycle, enforced from the shared rules repository rather than four times over — the check
   # reads markdown, not code, so one implementation serves every consumer (see .claude/rules/shared/README.md).
   # Only that ONE submodule is fetched: `submodules: true` would drag every other one in for a markdown walk.

@@ -31,3 +31,8 @@ target-wsl/
 
 # Host logs: a folder per day, a file per run (.claude/rules/shared/common/logging-serilog.md)
 logs/
+
+# Node dependencies of the .http contract suite, and what a run of it produces. The suite and its
+# lockfile are committed; a report you did not just produce proves nothing.
+node_modules/
+.http-artifacts/

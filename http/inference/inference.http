@@ -1,0 +1,143 @@
+# The four routes that do work: embed, rerank, tokenize, and the lever that hands the card back.
+#
+# WHAT THIS FILE DELIBERATELY DOES NOT DO: run a real inference. A non-empty /embed or /rerank builds
+# an engine on the GPU, and `.claude/rules/shared/common/gpu-lease.md` says the card is claimed
+# through a lease and never grabbed. A contract suite has to be runnable by anyone, at any time, in
+# CI — so it exercises the routing, the validation and the refusals, and leaves the card alone. That
+# is a smaller claim than "the sidecar embeds correctly", and it is the honest one: the quality of an
+# embedding is measured by the benchmark, not asserted by a smoke test.
+
+# @name tokenize_counts_without_touching_a_model
+# @prod
+POST {{baseUrl}}/tokenize
+Content-Type: application/json
+
+{ "texts": ["hello world", "a second text"] }
+
+?? status == 200
+
+{{
+  const assert = require('node:assert');
+  const body = response.parsedBody;
+  test('one count per text, in order', () => {
+    assert.ok(Array.isArray(body.token_count) || Array.isArray(body.counts),
+      `no per-text counts on the wire: ${JSON.stringify(Object.keys(body))}`);
+  });
+}}
+
+###
+# 422, not 400 — the JSON extractor refuses before the handler is entered, and that is part of the
+# contract a client meets. Asserting 400 here would be asserting a handler that never runs.
+# @name tokenize_without_the_required_field_is_422
+POST {{baseUrl}}/tokenize
+Content-Type: application/json
+
+{}
+
+?? status == 422
+
+###
+# The handler's OWN refusal, with a message that names the cap and the variable that sets it.
+# @name tokenize_over_the_batch_cap_is_400_and_says_the_number
+{{
+  exports.tooManyTexts = JSON.stringify(Array.from({ length: 4097 }, () => 'x'));
+}}
+POST {{baseUrl}}/tokenize
+Content-Type: application/json
+
+{ "texts": {{tooManyTexts}} }
+
+?? status == 400
+
+{{
+  const assert = require('node:assert');
+  test('the refusal names the count, the cap and the knob — not just "bad request"', () => {
+    const error = response.parsedBody.error;
+    assert.match(error, /4097/);
+    assert.match(error, /4096/);
+    assert.match(error, /TOKENIZE_MAX_TEXTS/);
+  });
+}}
+
+###
+# An empty batch is a legitimate request with an empty answer — and it proves the route, the
+# serialization and the response shape without loading anything.
+# @name embed_with_an_empty_batch_answers_empty_without_loading
+POST {{baseUrl}}/embed
+Content-Type: application/json
+
+{ "texts": [] }
+
+?? status == 200
+
+{{
+  const assert = require('node:assert');
+  const body = response.parsedBody;
+  test('every parallel array is present and empty, so a caller can index them together', () => {
+    for (const field of ['dense', 'sparse', 'token_count', 'truncated']) {
+      assert.ok(Array.isArray(body[field]) && body[field].length === 0, `${field} is not an empty array`);
+    }
+  });
+  test('the timings envelope is there even when nothing was computed', () => {
+    assert.ok(body.timings, 'no timings — the host reads them to tell slow from wedged');
+  });
+}}
+
+###
+# @name embed_without_the_required_field_is_422
+POST {{baseUrl}}/embed
+Content-Type: application/json
+
+{}
+
+?? status == 422
+
+###
+# The body limit is a LAYER, and nothing below the router can prove one is applied — which is exactly
+# why it is asserted here rather than in a unit test. 2 MiB by default; /health publishes the number.
+# @name a_body_over_the_limit_is_413_before_any_handler_runs
+{{
+  exports.oversizedBody = JSON.stringify({ texts: ['x'.repeat(2200000)] });
+}}
+POST {{baseUrl}}/embed
+Content-Type: application/json
+
+{{oversizedBody}}
+
+?? status == 413
+
+###
+# @name rerank_without_the_required_field_is_422
+POST {{baseUrl}}/rerank
+Content-Type: application/json
+
+{}
+
+?? status == 422
+
+###
+# NOT tagged @prod, and the reason matters: this is the recovery lever. Against a sidecar somebody is
+# using, it evicts the engine out from under them. It is safe HERE because this suite never loads one.
+# @name unload_answers_with_the_state_it_left_behind
+POST {{baseUrl}}/unload
+Content-Type: application/json
+
+{}
+
+?? status == 200
+
+{{
+  const assert = require('node:assert');
+  test('the answer is the health document, so a caller sees what is loaded AFTER the unload', () => {
+    for (const head of ['dense', 'sparse', 'rerank']) {
+      assert.strictEqual(response.parsedBody.loaded[head], false,
+        `${head} is still loaded after /unload answered ok`);
+    }
+  });
+}}
+
+###
+# @uncovered 200 from a REAL /embed and /rerank — the answer that matters, and the one this suite
+#            must not ask for: it builds an engine on the GPU, and the card is taken through a lease
+#            (gpu-lease.md), never by a smoke test. Their correctness is the benchmark's subject.
+# @uncovered 503 / engine errors — reachable only once an engine exists to fail.

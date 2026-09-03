@@ -1,0 +1,72 @@
+# What the sidecar says about itself: whether it is alive, what it is holding, and what it would do
+# with a request. Both routes are read-only and both are safe against anything running.
+#
+# The group is the one the source already uses — `src/introspection.rs`.
+
+# @name health_answers_without_loading_anything
+# @prod
+GET {{baseUrl}}/health
+Accept: application/json
+
+?? status == 200
+?? header content-type matches ^application\/json
+
+{{
+  const assert = require('node:assert');
+  const body = response.parsedBody;
+  test('the verdict is present and the process says which host it is on', () => {
+    assert.strictEqual(body.status, 'ok');
+    assert.ok(typeof body.host === 'string' && body.host.length > 0);
+  });
+  test('activity distinguishes idle from working — a probe that cannot is a constant', () => {
+    assert.ok(typeof body.activity === 'string' && body.activity.length > 0);
+  });
+  test('`wedged` is reported, so "slow but alive" is separable from "stuck"', () => {
+    assert.strictEqual(typeof body.wedged, 'boolean');
+    assert.ok(Array.isArray(body.in_flight));
+  });
+  test('the providers COMPILED into this binary are listed, not the one that was asked for', () => {
+    assert.ok(Array.isArray(body.compiled_providers) && body.compiled_providers.length > 0);
+    assert.ok('requested_provider' in body, 'what was asked for and what is active are two facts');
+    assert.ok('active_provider' in body);
+  });
+  test('what is loaded is reported per head, so an unload can be seen to have happened', () => {
+    for (const head of ['dense', 'sparse', 'rerank']) {
+      assert.strictEqual(typeof body.loaded[head], 'boolean', `loaded.${head} is missing`);
+    }
+  });
+  test('the limits it will actually enforce are on the wire, including the body cap', () => {
+    assert.ok(body.limits.max_body_bytes > 0, 'a body limit nobody can read is a limit nobody can respect');
+    assert.ok(body.limits.tokenize_max_texts > 0);
+  });
+  test('the binary identifies itself by hash — the answer to "which build is this"', () => {
+    assert.match(body.exe_sha256, /^[0-9a-f]{64}$/);
+  });
+}}
+
+###
+# @name models_lists_what_could_be_served_and_whether_it_is_there
+# @prod
+GET {{baseUrl}}/models
+Accept: application/json
+
+?? status == 200
+
+{{
+  const assert = require('node:assert');
+  const models = response.parsedBody.models;
+  test('every model names itself, its kind, and whether it is actually available', () => {
+    assert.ok(Array.isArray(models) && models.length > 0);
+    for (const model of models) {
+      assert.ok(model.id.length > 0);
+      assert.ok(model.kind.length > 0);
+      assert.strictEqual(typeof model.available, 'boolean',
+        `${model.id} does not say whether it is available — which is the only field a caller can act on`);
+    }
+  });
+}}
+
+###
+# @uncovered "wedged": true — reported when an inference exceeds the staleness threshold. Reaching it
+#            needs a real inference AND a wait, which is the GPU this suite deliberately does not take.
+#            The condition itself is unit-tested in src/introspection.rs.
