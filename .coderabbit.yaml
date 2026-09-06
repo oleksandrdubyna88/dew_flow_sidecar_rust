@@ -1,0 +1,109 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit for dew_flow_sidecar_rust — the embedding sidecar (Rust, ONNX Runtime with MIGraphX).
+#
+# The FAMILY baseline, mirrored from dew_flow_connect_other_ais on 2026-09-06, where the settings
+# were argued out with a measurement behind each one. What is deliberately NOT here: path
+# instructions. They must be true of THIS repository, and the person who works in it writes them —
+# a copied instruction that names the wrong directory is worse than none, because a reviewer will
+# apply it. The knowledge base below already reads this repository's own rules.
+language: "en-US"
+
+reviews:
+  # Assertive, on evidence: five findings over two manually-triggered reviews in the gate repository
+  # on 2026-09-06, five of them true, at the quiet default. A precision of 100 % says we are
+  # under-asking. If it falls under ~70 % here, drop to "chill" and say so in that commit.
+  profile: "assertive"
+  # The family blocks a merge until every review conversation is resolved (branch protection), which
+  # is the same gate one layer up.
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+  path_filters:
+    - "!target/**"
+    - "!**/*.onnx"
+    - "!**/*.f32le"
+    - "!Cargo.lock"
+  # What must be TRUE of a pull request, not merely mentioned in it. Each was bought by a defect in
+  # this family during the week of 2026-09-01, and the date is in the instruction so a reader can go
+  # and read what it cost. All in `warning` but one: a check nobody has watched behave is not a check
+  # to block a merge with.
+  pre_merge_checks:
+    description:
+      mode: "warning"
+    docstrings:
+      mode: "off"
+    custom_checks:
+      - name: "A measurement states its sample size"
+        mode: "warning"
+        instructions: |
+          Pass/fail criteria: if the pull request description or the code comments quote a NUMBER as
+          evidence — a percentage, a count of findings, a token figure, a latency — the same sentence
+          or the one beside it must say what it was measured over: how many runs, how many commits,
+          how many models. A number without its sample is an advertisement. Bought on 2026-09-06,
+          when a fast-mode measurement of one commit was nearly published as a general claim.
+          Not applicable to a version number, a line number, a test count, or a size in bytes.
+      - name: "A release-only check has a test that runs on every push"
+        mode: "warning"
+        instructions: |
+          Pass/fail criteria: if the diff adds or changes logic that executes ONLY while a release is
+          being cut — a shell condition in a release workflow, a packaging step, a version comparison,
+          a tag-triggered job — the same pull request must add or change a test that exercises that
+          logic in the ordinary suite. Bought on 2026-09-06: an archive check written to protect the
+          release passed on `tar` output and failed on `7z` output, and would have broken both Windows
+          builds at the last step of the release. Its only execution was the release itself.
+      - name: "A bug fix carries a test that reproduces the defect"
+        mode: "warning"
+        instructions: |
+          Pass/fail criteria: if the pull request describes fixing a defect — wrong output, a crash, a
+          regression, a silent failure — it must also add or change a test that fails without the fix.
+          The description or a comment should say what the failing test reported. Not applicable to a
+          rename, a comment, a formatting change, or a documentation-only pull request.
+      - name: "A test does not read the wall clock"
+        mode: "warning"
+        instructions: |
+          Pass/fail criteria: a test added or changed by this pull request must not depend on the
+          current date or time. A clock call with no argument inside a test, or a fixture with a
+          hard-coded date compared against code that asks what day it is, fails this check unless the
+          clock is frozen or injected. Bought twice on 2026-09-06: a guard against an empty page was
+          green the day it was written and red the next morning, with a message about the page and a
+          cause in the calendar.
+
+  tools:
+    markdownlint:
+      enabled: false
+    clippy:
+      enabled: true
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    gitleaks:
+      enabled: true
+
+  # OFF deliberately. All of these are ON by default and all of them write code: a family where every
+  # change goes through a gate, a red test and a review round does not want a second author proposing
+  # commits nobody planned.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "CLAUDE.md"
+      - ".claude/rules/**/*.md"
