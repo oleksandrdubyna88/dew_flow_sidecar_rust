@@ -35,7 +35,7 @@ sha2 = "0.10"
 # never surfaces the count, and that count is the only thing that can turn "nothing was lost" from a
 # host-side estimate into a fact — the host cannot tokenize, so silent truncation is invisible to it.
 # Same version and features fastembed pins, so this shares its copy instead of adding a second one.
-tokenizers = { version = "0.22.2", features = ["onig"], default-features = false }
+tokenizers = { version = "0.23.2", features = ["onig"], default-features = false }
 # Startup preflight of ORT_DYLIB_PATH in the load-dynamic (migraphx) flavor only: ort rc.12's own
 # version check DEADLOCKS instead of erroring when the dylib is older than the crate requires (its
 # error path re-enters the API OnceLock it is initializing), so we probe the C ABI ourselves first.
