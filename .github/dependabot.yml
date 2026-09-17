@@ -3,10 +3,20 @@
 #
 # Security updates are separate and immediate (enabled in the repository settings, 2026-09-05).
 #
-# The `github-actions` entry is the load-bearing one: requirement 9 of the family CI hardening plan
-# pins every `uses:` line to a 40-character commit SHA, and a pinned SHA with no bot behind it rots
-# into an action that never gets its security fixes — a worse place than the tag it replaced. This
-# group is what makes that pinning maintainable, so it exists BEFORE the pinning does.
+# The `github-actions` entry matters for requirement 9 of the family CI hardening plan, which pins
+# every `uses:` line to a 40-character commit SHA. A pin only stays current because a bot proposes
+# the next SHA — and it is this ENTRY that enables those updates. The `groups:` block only batches
+# them into one pull request, so enabling and pinning may land together; neither has to come first.
+# (An earlier draft of this comment said the GROUP had to exist before the pinning. It did not.)
+#
+# Verified in this family rather than assumed — connect_other_ais PR #14 bumped a SHA-pinned action
+# and rewrote the trailing version comment with it:
+#   -  uses: amannn/action-semantic-pull-request@e32d7e60… # v5
+#   +  uses: amannn/action-semantic-pull-request@48f25628… # v6.1.1
+#
+# The limit worth knowing: these are scheduled VERSION updates. Dependabot ALERTS do not cover
+# SHA-versioned actions, so the "security updates are separate and immediate" line above is NOT a
+# safety net for a pinned action — this weekly schedule is the only thing keeping those pins current.
 #
 # `vendor-fastembed/` IS DELIBERATELY ABSENT FROM EVERY ENTRY. It is a vendored third-party crate —
 # its own LICENSE, its own release workflow, its own `.github/dependabot.yml`, and an entry in
