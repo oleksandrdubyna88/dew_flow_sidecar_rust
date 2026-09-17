@@ -14,6 +14,9 @@ on:
 # cuda and migraphx are deliberately NOT built here. Both need a vendor toolchain the runner does
 # not have (CUDA Toolkit; ROCm plus an ONNX Runtime built from source with --use_migraphx), and a
 # job that cannot install them would only ever report a missing dependency.
+permissions:
+  contents: read
+
 jobs:
   build-test:
     strategy:
