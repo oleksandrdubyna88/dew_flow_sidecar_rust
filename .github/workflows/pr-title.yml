@@ -1,0 +1,39 @@
+name: pr · title
+
+# The subject is free text on purpose: proper nouns start with capitals — SonarCloud, CodeRabbit,
+# Dependabot — and a pattern forbidding a capital first letter rejected six real pull requests in a
+# row, including every one Dependabot opens. The TYPE prefix is the rule; the sentence after it is
+# somebody's writing.
+#
+# The pull request title becomes the line in main's history (rebase keeps commits, squash uses the
+# title), so it has to say what changed in the family's own shape: `type: what changed`.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  semantic:
+    name: pr · semantic title
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit, not a tag: a tag can be moved under you, and this action reads the
+      # pull request with a token. SonarCloud githubactions:S7637, 2026-09-05. Dependabot keeps the
+      # comment's version current — it rewrites both the SHA and the trailing tag.
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            test
+            chore
+            refactor
+            perf
+            ci
+            build
+          requireScope: false
