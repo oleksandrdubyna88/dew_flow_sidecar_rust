@@ -1,0 +1,60 @@
+name: release-please
+
+# ---------------------------------------------------------------------------
+# WHY THIS RUNS ON A BUTTON AND NOT ON `push: main`, WHICH IS WHERE IT BELONGS.
+#
+# release-please's own README says it, and it decides the whole shape of this epic:
+#
+#   > By default, Release Please uses the built-in `GITHUB_TOKEN` secret. However, all resources
+#   > created by `release-please` (release tag or release pull request) will not trigger future
+#   > GitHub actions workflows, and workflows normally triggered by `release.created` events will
+#   > also not run.
+#
+# So with the default token the tag this cuts would NOT start `release.yml`, and a release would
+# silently produce nothing — the exact failure the plan warned about for the tag SHAPE, arriving
+# from a different direction entirely. A no-op that looks like a release is worse than no
+# automation, so this does not go on `push: main` until it can actually finish the job.
+#
+# WHAT IT NEEDS: a token that is not `GITHUB_TOKEN` — a PAT with `contents: write` and
+# `pull-requests: write`, or better a GitHub App installation token, which is short-lived and
+# scoped rather than a long-lived credential in a secret. Either is a decision with a real blast
+# radius, and it is the operator's: `todo/PLAN_release_please_meets_a_narrative_changelog.md`
+# records it beside the other credential question this family already has open.
+#
+# TURNING IT ON is then two lines: add the `push: branches: [main]` trigger below, and point
+# `token` at the secret. Everything else here has been reviewed already.
+# ---------------------------------------------------------------------------
+
+on:
+  # push:
+  #   branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    name: release · propose
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # What the action needs to open and update the release pull request, and to cut the tag when
+      # that pull request merges. Narrower than the release workflow's, and — unlike that one —
+      # this job is started by a push to main rather than by a tag, so it never runs code a tag
+      # points at. That distinction is the subject of Epic 5.
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          # The plan named v4 because it was written before v5 existed. v5.0.0's only breaking
+          # change is the action's own Node runtime (node24); its inputs are unchanged.
+          #
+          # token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
