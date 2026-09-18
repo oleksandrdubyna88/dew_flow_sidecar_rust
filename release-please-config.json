@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "$note": [
+    "How a release is decided here: release-please reads the conventional commits since the last",
+    "tag, opens a pull request that bumps the version and writes RELEASES.md, and cutting the tag",
+    "is what MERGING that pull request does. The release workflow already in this repository is",
+    "what the tag then starts.",
+    "",
+    "include-component-in-tag is FALSE, deliberately and only here. This repository ships ONE",
+    "product, so a component prefix distinguishes it from nothing; its release workflow triggers on",
+    "`v*` and a prefixed tag would not start it at all — the release would silently produce nothing.",
+    "The sibling repositories carry prefixes because four products share one tag namespace there."
+  ],
+  "release-type": "rust",
+  "include-component-in-tag": false,
+  "changelog-path": "RELEASES.md",
+  "packages": {
+    ".": {}
+  }
+}
