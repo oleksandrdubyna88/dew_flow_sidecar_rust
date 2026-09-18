@@ -15,14 +15,19 @@ name: release-please
 # from a different direction entirely. A no-op that looks like a release is worse than no
 # automation, so this does not go on `push: main` until it can actually finish the job.
 #
-# WHAT IT NEEDS: a token that is not `GITHUB_TOKEN` — a PAT with `contents: write` and
-# `pull-requests: write`, or better a GitHub App installation token, which is short-lived and
-# scoped rather than a long-lived credential in a secret. Either is a decision with a real blast
-# radius, and it is the operator's: `todo/PLAN_release_please_meets_a_narrative_changelog.md`
-# records it beside the other credential question this family already has open.
+# WHAT IT NEEDS: a token that is not `GITHUB_TOKEN`. The operator chose a GITHUB APP over a PAT on
+# 2026-09-18, and the job below is wired for it: the token is MINTED PER RUN from an app
+# installation, expires in an hour, and is scoped to the repositories the app is installed on. A
+# PAT would have been one long-lived credential with the same rights as the person holding it.
 #
-# TURNING IT ON is then two lines: add the `push: branches: [main]` trigger below, and point
-# `token` at the secret. Everything else here has been reviewed already.
+# WHAT IS LEFT, and it is not work this repository can do: creating a GitHub App and installing it
+# are BROWSER-ONLY operations — GitHub has no REST endpoint that creates an app, and the manifest
+# flow still goes through a form and a redirect. The two secrets below are what that produces.
+# `todo/PLAN_release_please_meets_a_narrative_changelog.md` in `dew_flow_connect_other_ais` carries
+# the manifest, the exact permissions, and the four steps.
+#
+# TURNING IT ON is then: add the two secrets, uncomment the `push: branches: [main]` trigger, and
+# dispatch once to watch a release pull request appear. Everything else here has been reviewed.
 # ---------------------------------------------------------------------------
 
 on:
@@ -50,6 +55,42 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      # SAY WHAT IS MISSING, rather than letting the mint below fail on an empty input. Until the
+      # app exists these secrets are absent, and `create-github-app-token` answers that with a
+      # message about a malformed private key — which reads like a broken secret rather than an
+      # absent one, and sends whoever dispatched this looking in the wrong place.
+      - name: The app must exist before anything can be minted from it
+        env:
+          # `secrets` is NOT one of the contexts a step's `if:` can read, so this is a step that
+          # always runs and decides in the shell. The PRIVATE KEY never reaches the environment:
+          # the expression compares it and hands over `true` or `false`, which is the only thing
+          # this step has any business knowing about it.
+          APP_ID_SET: ${{ secrets.RELEASE_PLEASE_APP_ID != '' }}
+          APP_KEY_SET: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$APP_ID_SET" = "true" ] && [ "$APP_KEY_SET" = "true" ]; then
+            echo "release-please: app credentials present."
+            exit 0
+          fi
+          echo "release-please: this repository has no app credentials yet." >&2
+          echo "  RELEASE_PLEASE_APP_ID          set: $APP_ID_SET" >&2
+          echo "  RELEASE_PLEASE_APP_PRIVATE_KEY set: $APP_KEY_SET" >&2
+          echo "  Creating and installing a GitHub App are BROWSER-ONLY steps — GitHub has no REST" >&2
+          echo "  endpoint that creates an app. The manifest, the exact permissions and the four" >&2
+          echo "  steps are in PLAN_release_please_meets_a_narrative_changelog.md in" >&2
+          echo "  dew_flow_connect_other_ais. Nothing here is broken; it is not set up yet." >&2
+          exit 1
+
+      # A token that lives for an hour and is scoped to this installation, minted here rather than
+      # stored anywhere. This is the whole reason an app was chosen over a PAT: what a leak would
+      # cost is bounded by the app's permissions and by the hour, not by whatever the person who
+      # minted the PAT happens to have access to.
+      - id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           config-file: release-please-config.json
@@ -57,4 +98,7 @@ jobs:
           # The plan named v4 because it was written before v5 existed. v5.0.0's only breaking
           # change is the action's own Node runtime (node24); its inputs are unchanged.
           #
-          # token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          # THE POINT OF THE WHOLE FILE. With `GITHUB_TOKEN` the tag this cuts starts nothing, so
+          # the release produces nothing and says nothing. An app installation token is an ordinary
+          # actor to GitHub, so `release.yml` runs when the release pull request merges.
+          token: ${{ steps.token.outputs.token }}
