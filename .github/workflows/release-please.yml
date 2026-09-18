@@ -21,10 +21,14 @@ name: release-please
 # PAT would have been one long-lived credential with the same rights as the person holding it.
 #
 # WHAT IS LEFT, and it is not work this repository can do: creating a GitHub App and installing it
-# are BROWSER-ONLY operations — GitHub has no REST endpoint that creates an app, and the manifest
-# flow still goes through a form and a redirect. The two secrets below are what that produces.
+# both need a browser. An earlier version of this comment said GitHub has no REST endpoint that
+# creates an app, and that was WRONG — `POST /app-manifests/{code}/conversions` does, and it is what
+# the manifest flow calls. What needs the browser is the `code`: GitHub hands it out only by
+# redirecting a browser that has just submitted the manifest form and had a human confirm it, and it
+# expires in an hour. The conclusion is the same, the reason is not.
 # `todo/PLAN_release_please_meets_a_narrative_changelog.md` in `dew_flow_connect_other_ais` carries
-# the manifest, the exact permissions, and the four steps.
+# the manifest, the exact permissions, the four steps, and the faster manifest route with its cost —
+# the conversion answer contains the PRIVATE KEY, so that route is not the safer one.
 #
 # TURNING IT ON is then: add the two secrets, uncomment the `push: branches: [main]` trigger, and
 # dispatch once to watch a release pull request appear. Everything else here has been reviewed.
@@ -75,10 +79,11 @@ jobs:
           echo "release-please: this repository has no app credentials yet." >&2
           echo "  RELEASE_PLEASE_APP_ID          set: $APP_ID_SET" >&2
           echo "  RELEASE_PLEASE_APP_PRIVATE_KEY set: $APP_KEY_SET" >&2
-          echo "  Creating and installing a GitHub App are BROWSER-ONLY steps — GitHub has no REST" >&2
-          echo "  endpoint that creates an app. The manifest, the exact permissions and the four" >&2
-          echo "  steps are in PLAN_release_please_meets_a_narrative_changelog.md in" >&2
-          echo "  dew_flow_connect_other_ais. Nothing here is broken; it is not set up yet." >&2
+          echo "  Creating and installing a GitHub App both need a browser: the manifest route has" >&2
+          echo "  a REST endpoint, but the code it consumes comes only from a browser redirect." >&2
+          echo "  The manifest, the exact permissions and the four steps are in" >&2
+          echo "  PLAN_release_please_meets_a_narrative_changelog.md in dew_flow_connect_other_ais." >&2
+          echo "  Nothing here is broken; it is not set up yet." >&2
           exit 1
 
       # A token that lives for an hour and is scoped to this installation, minted here rather than
