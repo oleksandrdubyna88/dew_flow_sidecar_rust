@@ -47,6 +47,27 @@
     "`ci:` and `chore:` remain the right types for such a commit regardless. This stops the mistake",
     "from reaching a version number; it does not make the type meaningless."
   ],
+  "$draft": [
+    "NOTHING IS PUBLIC UNTIL IT IS WHOLE, and this repository was the one that looked fine while not",
+    "being so. MEASURED on its own first release through release-please, v0.2.0:",
+    "",
+    "    release published  08:16:55",
+    "    first asset        08:20:44   (+3m49s)",
+    "    second asset       08:25:05   (+8m10s)",
+    "",
+    "So it sat PUBLIC AND EMPTY for nearly four minutes and incomplete for over eight. Nobody looked,",
+    "which is the only reason it read as a success — the sibling repository produced exactly the same",
+    "state and was caught because its release workflow refused to create a release that already",
+    "existed.",
+    "",
+    "`draft` holds the release back; `force-tag-creation` is what keeps the TAG appearing anyway,",
+    "because GitHub does not create one for a draft until it is published and `release.yml` triggers",
+    "on `push: tags`. Without the second there is no tag and nothing runs at all.",
+    "",
+    "The publish step is now the last thing that happens, after every target has been asserted."
+  ],
+  "force-tag-creation": true,
+  "draft": true,
   "exclude-paths": [
     ".github"
   ],
