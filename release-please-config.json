@@ -11,6 +11,30 @@
     "`v*` and a prefixed tag would not start it at all — the release would silently produce nothing.",
     "The sibling repositories carry prefixes because four products share one tag namespace there."
   ],
+  "$exclude": [
+    "A COMMIT THAT ONLY TOUCHES CI IS NOT A RELEASE, and this is the mechanism rather than the",
+    "reminder. From the action's own schema: \"Path of commits to be excluded from parsing. If ALL",
+    "files from commit belong to one of the paths it will be skipped.\"",
+    "",
+    "Why it is here: `feat(ci): release-please runs on main` — a change to nothing but a workflow —",
+    "duly proposed 0.3.0, a MINOR release of a product whose code had not moved. release-please reads",
+    "the type literally, and `feat` means a feature. It then happened twice more in the sibling",
+    "repositories on 2026-09-21, after the rule had been written down. A note that fails three times",
+    "is not a rule, it is a wish; this is configuration, and it cannot be forgotten.",
+    "",
+    "THE TRADE, said out loud: a change to `.github` that genuinely alters the product — a compiler",
+    "flag, a build argument — is now skipped too. It rides along with the next real change, or its",
+    "author adds a `Release-As:` footer. That is the smaller of the two errors: the other one inflates",
+    "a version every single time anybody edits a workflow.",
+    "",
+    "`ci:` and `chore:` remain the right types for such a commit regardless. This stops the mistake",
+    "from reaching a version number; it does not make the type meaningless."
+  ],
+  "exclude-paths": [
+    ".github",
+    "release-please-config.json",
+    ".release-please-manifest.json"
+  ],
   "release-type": "rust",
   "include-component-in-tag": false,
   "changelog-path": "RELEASES.md",
