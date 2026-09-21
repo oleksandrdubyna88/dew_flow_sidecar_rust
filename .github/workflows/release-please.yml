@@ -30,13 +30,27 @@ name: release-please
 # the manifest, the exact permissions, the four steps, and the faster manifest route with its cost —
 # the conversion answer contains the PRIVATE KEY, so that route is not the safer one.
 #
-# TURNING IT ON is then: add the two secrets, uncomment the `push: branches: [main]` trigger, and
-# dispatch once to watch a release pull request appear. Everything else here has been reviewed.
+# IT IS ON. The two secrets exist, the `push: branches: [main]` trigger below is live, and the
+# acceptance test ran on 2026-09-21 — see the note on that trigger for what it measured.
+#
+# ONE THING THE SHAPE HIDES, and it cost a puzzled minute the first time: the tag is NOT cut by
+# merging the release pull request. It is cut by the NEXT run of this workflow, which the merge
+# itself triggers. On workflow_dispatch that meant dispatching twice; on `push: main` it is
+# automatic, which is most of why the trigger is worth turning on at all.
 # ---------------------------------------------------------------------------
 
 on:
-  # push:
-  #   branches: [main]
+  # ON SINCE 2026-09-21, after the acceptance test the header demanded actually ran. What it proved,
+  # in order: the app minted a token, the robot opened its own pull request (author
+  # `app/dew-flow-release-please`), merging it and re-running cut `v0.2.0`, and — the whole point —
+  # THAT TAG STARTED `release.yml` (`ref=v0.2.0 event=push`). The artefacts match the release before
+  # it by name, and by size to within 0.2 %.
+  #
+  # What changes now is only WHO presses the button: a merge to main opens or updates the release
+  # pull request by itself. Nothing is published by this trigger — the tag is still cut by merging
+  # that pull request, which is a person deciding, exactly as before.
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
