@@ -97,10 +97,17 @@ jobs:
           name: bge-sidecar-cpu-${{ matrix.target }}
           path: bge-sidecar-cpu-${{ matrix.target }}.*
 
-      - name: Publish to the release
+      # ONTO THE DRAFT, and it STAYS a draft. Each leg uploads its own archive, so without this the
+      # release goes public the moment the FIRST leg finishes — measured on v0.2.0, which was public
+      # and empty for 3m49s and incomplete for 8m10s, and read as a success because nobody looked.
+      # The `publish` job below is the only thing that takes the draft down, after both targets are
+      # asserted. release-please makes the draft in the first place (`draft` + `force-tag-creation`
+      # in release-please-config.json); this never creates one.
+      - name: Upload onto the draft release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
+          draft: true
           files: bge-sidecar-cpu-${{ matrix.target }}.*
           fail_on_unmatched_files: true
           body: |
@@ -114,3 +121,50 @@ jobs:
             committed reference vector plus the two thresholds it is judged against.
 
             LICENSE, NOTICE and THIRD-PARTY-NOTICES.md are inside the archive and must stay with it.
+
+  # THE STEP THAT MAKES THE PROMISE TRUE. Every leg uploads its own archive, so a leg that fails, or
+  # sits queued on a retired runner image, would otherwise leave a release carrying one target and
+  # nothing anywhere reporting a problem. `needs:` keeps a single failed leg from publishing
+  # anything, and the assertion below is asked of the RELEASE rather than of this workflow's opinion
+  # of itself: a matrix that silently shrinks passes every job-level check there is.
+  #
+  # This is the guarantee dew_flow_creds_for_devs already had and this repository did not, which is
+  # why its v0.2.0 was public and empty for four minutes.
+  publish:
+    name: publish the release
+    needs: cpu
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Every target has an asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_TARGETS: x86_64-unknown-linux-gnu x86_64-pc-windows-msvc
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAMES="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | tr '\n' ' ')"
+          MISSING=""
+          for target in $EXPECTED_TARGETS; do
+            case "$NAMES" in *"$target"*) ;; *) MISSING="$MISSING $target" ;; esac
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::the release is missing an archive for:$MISSING"
+            echo "Nothing is public: the release is still a DRAFT, and the step below is the only"
+            echo "thing that takes it down. Fix the leg and re-run — the upload replaces rather than"
+            echo "duplicates. If the version has to be abandoned, ship the next patch; never move or"
+            echo "delete the tag."
+            exit 1
+          fi
+          echo "both targets present: $NAMES"
+
+      - name: Publish it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
