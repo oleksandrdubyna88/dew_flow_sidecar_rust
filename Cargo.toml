@@ -1,6 +1,6 @@
 [package]
 name = "bge-sidecar"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "ONNX embedding + rerank sidecar: BGE-M3 dense+sparse (FP32) and BGE-Reranker-v2-M3 over fastembed/ONNX Runtime"
 # `license-file` rather than `license`: the terms are proprietary and SPDX has no expression for them.
