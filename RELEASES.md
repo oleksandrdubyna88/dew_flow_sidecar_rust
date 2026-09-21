@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.1](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/compare/v0.2.0...v0.2.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* **ci:** a commit that only touches CI is not a release ([ba273ec](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/commit/ba273ec9d21232e8f00b6b15a4965fb0897310e2))
+* **ci:** nothing is public until it is whole — v0.2.0 was empty for four minutes ([0cd0111](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/commit/0cd01111638eb86818f6ae17f7457a2c1deea8d3))
+* **ci:** two of the three exclude paths were dead, and Release-As was never an escape hatch ([fc71404](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/commit/fc7140499ad8e67073f6dafea97242cdfc07097a))
+
 ## [0.2.0](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/compare/v0.1.2...v0.2.0) (2026-09-21)
 
 
