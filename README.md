@@ -12,7 +12,8 @@ retrieval product's side is `dew_flow_rag_qln · research/architecture.md`):
 
 ## Build (once per machine, like `tools/ts-parser` needs `npm install`)
 
-Requires Rust (rustup, MSVC toolchain) + VS Build Tools with C++.
+Requires Rust (rustup, MSVC toolchain) + VS Build Tools with C++, and Node.js for the shared rules'
+`low-priority.mjs` wrapper that the local commands below run through (`git submodule update --init` first).
 
 ```bash
 # AMD GPU (DirectML — the default feature)
