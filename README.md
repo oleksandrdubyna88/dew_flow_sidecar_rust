@@ -16,20 +16,24 @@ Requires Rust (rustup, MSVC toolchain) + VS Build Tools with C++.
 
 ```bash
 # AMD GPU (DirectML — the default feature)
-cargo build --release
+node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8
 
 # NVIDIA GPU (CUDA)
-cargo build --release --no-default-features --features cuda
+node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8 --no-default-features --features cuda
 
 # Both EPs in one binary
-cargo build --release --features cuda
+node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8 --features cuda
 
 # CPU only
-cargo build --release --no-default-features
+node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8 --no-default-features
 
 # AMD on Linux/WSL (ROCm via the MIGraphX EP) — run INSIDE WSL, see the dedicated section below
-cargo build --release --no-default-features --features migraphx --target-dir target-wsl
+nice -n 19 cargo build --release -j 8 --no-default-features --features migraphx --target-dir target-wsl
 ```
+
+Local builds are capped at 8 jobs and run at lowered CPU priority (the shared rule
+`common.local-cpu-budget`): through `.claude/rules/shared/tools/low-priority.mjs` on Windows, under `nice -n 19`
+inside WSL. On a machine with fewer than 8 threads, use its thread count. CI runs the bare commands.
 
 The Windows binary lands at `target/release/bge-sidecar.exe` (the WSL flavor at
 `target-wsl/release/bge-sidecar` — separate target dir so the two OS flavors never clobber each
@@ -294,7 +298,7 @@ sudo cp -a build/Linux/Release/libonnxruntime*.so* \
 #    (Windows uses Schannel, so the Windows build never needed them).
 sudo apt install -y pkg-config libssl-dev
 cd /mnt/<drive>/<repo>/tools/bge-sidecar
-cargo build --release --no-default-features --features migraphx --target-dir target-wsl
+nice -n 19 cargo build --release -j 8 --no-default-features --features migraphx --target-dir target-wsl
 ```
 
 AppHost config (`Aspire:BgeSidecar:*`): set `WslDistro` (e.g. `Ubuntu`) to flip the sidecar into WSL
