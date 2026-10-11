@@ -129,6 +129,13 @@ behaviour and LRU eviction order; `pin_shape`/`unpin_rows` round-tripping; `embe
 exactly one run when settled; `aligned_scores` returning document order; `cap_for`; the pass log line;
 and the `PassTimings` wire field names.
 
+`tests/local_cpu_budget.rs` (2026-10-11) is about how the crate is BUILT and TESTED, not about what it does.
+Every fenced `cargo build`/`cargo test` command in CLAUDE.md and README must be capped at 8 workers (`-j`, and
+`--test-threads` for tests) and lowered: the shared rules' `low-priority.mjs` on Windows, `nice -n 19` for the WSL
+builds. The scan must find at least one of each. This is the shared rule `common.local-cpu-budget`; the measurement
+here was a 20-test probe at 20 concurrent by default and 8 capped. CI runs the bare commands, because CI is exempt
+and a `.cargo/config.toml` cap would raise its 4 vCPUs to 8.
+
 The wedge guards are tested with a held mutex and an `Instant` moved into the past — no GPU, no clock
 abstraction: a wedged holder is refused within milliseconds and the message names it; a **healthy** cold
 compile is still waited out (the counter-guarantee, and the reason the ceilings are minutes); an

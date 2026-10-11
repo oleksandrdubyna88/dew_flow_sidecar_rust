@@ -21,16 +21,20 @@ here), which is the deliberate shape of a cross-language boundary.
 ## Commands
 
 ```bash
+# Local runs are capped and lowered (shared rule common.local-cpu-budget): at most 8 workers (-j 8,
+# --test-threads=8; on a machine with fewer threads, use its thread count), BelowNormal / nice 19
+# through the mount's wrapper. CI runs the same commands bare: it is exempt, and 8 would RAISE its 4 vCPUs.
+
 # Build — the execution provider is a COMPILE-TIME feature; pick the machine's flavor
-cargo build --release                                    # AMD on Windows (DirectML, the default)
-cargo build --release --no-default-features              # CPU only
-cargo build --release --no-default-features --features cuda   # NVIDIA
+node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8                                    # AMD on Windows (DirectML, the default)
+node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8 --no-default-features              # CPU only
+node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8 --no-default-features --features cuda   # NVIDIA
 # AMD on Linux/WSL (ROCm via MIGraphX): build INSIDE WSL with the separate target dir —
 # see README.md; the two OS flavors must never clobber each other's target/.
 
-# Tests (CI runs exactly this, per flavor)
-cargo test --release --locked
-cargo test --release --locked --no-default-features      # the CPU leg
+# Tests (CI runs these per flavor, bare)
+node .claude/rules/shared/tools/low-priority.mjs cargo test --release --locked -j 8 -- --test-threads=8
+node .claude/rules/shared/tools/low-priority.mjs cargo test --release --locked -j 8 --no-default-features -- --test-threads=8   # the CPU leg
 ```
 
 `--locked` always: a lockfile drift is a build failure, not a surprise. `cargo fmt --check` runs in
