@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/compare/v0.2.1...v0.3.0) (2026-10-14)
+
+
+### Features
+
+* **docs:** local cargo builds and tests take at most 8 workers, at lowered CPU priority ([#53](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/issues/53)) ([6a01579](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/commit/6a01579db4edff488ebbdc934c8d24b6706ee684))
+
 ## [0.2.1](https://github.com/oleksandrdubyna88/dew_flow_sidecar_rust/compare/v0.2.0...v0.2.1) (2026-09-21)
 
 
