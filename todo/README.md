@@ -13,6 +13,7 @@ Definition of Done.
 
 | plan | status | scope |
 |---|---|---|
+| [PLAN_test_leftovers_E4.md](PLAN_test_leftovers_E4.md) | plan only, blocked on the E1 release | test scratch folders: `TestScratch` (claim, `Drop`, start-of-run sweep), the nine `temp_dir()` sites, the guard |
 
 Implemented plans live in [`../research/`](../research/).
 
