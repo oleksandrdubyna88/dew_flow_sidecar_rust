@@ -150,6 +150,14 @@ is a resource the run does not create". `Drop` calls `teardown(&path, &mut std::
    for a FAILED test, while a teardown that gives up usually does so in a passing one;
 4. never panic, never `unwrap` — a panic in `Drop` during unwinding aborts the process (rule §2).
 
+**The order is the contract's for a folder: create → register → claim** (rule §2; `owned.mjs` `ownedDir` does the
+same). The claim is written in the statements right after `create_dir` succeeds, never before it: "claim first, then
+create" is the contract's form for a claim held in a store (a held lock, a registry row), not for a folder. So a folder
+of the new form exists unclaimed only for the few statements between `create_dir` and the `create_new` write. The
+sweep (D5) relies on exactly that: an UNMARKED new-form folder is removed only once it is older than the 10-minute
+minimum age, which a live creator could reach only by stalling more than ten minutes between two adjacent statements —
+the window the contract accepts. A folder with a LIVE claim is never removed, whatever its mtime.
+
 The folder goes first and its claim last, so a leftover is always prefixed AND claimed. `TestScratch` is the FIRST
 binding of every test that uses one, so it drops LAST, after every handle into it (`DaySegments`, `CachePathLease`,
 an open file) — locals drop in reverse order of declaration.
@@ -162,16 +170,24 @@ constructor", which rule §4 names: the first `TestScratch` constructor in a tes
 - a folder holding a `.git` FILE is never removed (this crate makes no worktrees; one is some clone's — rule §4);
 - age = now − mtime; younger than **10 minutes** → not considered, silently;
 - claim → `owner_state`: `gone` → removed with its marker; `live` / `unknown` → kept, one line naming it and the
-  reason; an UNMARKED folder of the new form, old enough → removed (rule §4: the helper claims within milliseconds
-  or does not create);
+  reason — a `live` claim is kept however old the folder's mtime is (age only SELECTS; it never authorises); an
+  UNMARKED folder of the new form, old enough → removed (rule §4: the helper claims in the statements right after
+  creating, D4, so ten unclaimed minutes mean nobody is creating it);
+- a removal the sweep attempts and `teardown` gives up on → the folder stays (prefixed and claimed) and is recorded
+  in `SweepReport.kept` with the reason `could not remove: <error>` — never silently dropped from the report;
 - a `.owner` file whose folder is absent and which is old enough → removed;
 - anything else in the temp root — another token, the old `mxr-*`/`bge-*` names — is not looked at.
+- **Every I/O error is reported**: the `read_dir` of the root itself, an entry's metadata, a claim that cannot be
+  read for a reason other than "absent", a marker removal — each is one entry of `SweepReport.errors` naming the path
+  and the error, and the `Once` wrapper writes every `errors` entry as one line to `std::io::stderr()`. A failure on
+  one entry never stops the next.
 
 The sweep is `sweep(root, now, min_age, probe) -> SweepReport`, pure apart from the file system it is handed, so
 every decision is testable on a private root with an injected clock and probe. The `Once` body wraps it in
 `std::panic::catch_unwind`: a panic inside `call_once` would poison the `Once` and fail every later test, and a sweep
-never fails the run (rule §4) — a caught panic or an I/O error is one reported line. Report lines go to
-`std::io::stderr()` directly (D4.3); a sweep that found nothing prints nothing.
+never fails the run (rule §4) — a caught panic or an I/O error is one reported line. Report lines are written by
+`print_report(&SweepReport, &mut dyn Write)` (one line per `kept` entry with its reason and per `errors` entry), which
+the `Once` body calls with `std::io::stderr()` directly (D4.3); a sweep that found nothing prints nothing.
 
 **D6 — The old names are not the sweep's business.** None of `mxr-race-`, `mxr-wipe-`, `mxr-scope-`, `bge-log-`,
 `bge-preflight-`, `bge-seed-`, `bge-reg-`, `bge-tok-`, `bge-tok-empty-` ever carried the prefix, so (as E1's D5
@@ -189,10 +205,16 @@ shape in the same change, and the cure sentence says so.
 
 **Growth surface** (the shared planning rule § *A plan that creates something that GROWS*). Scratch folders: 24
 tests use one after S3 (11 log, 4 seed, 3 model cache, 3 compile cache, 2 tokens, 1 cuda-only) plus S2's own ~15;
-the largest is `compile_cache.rs:498`'s at 7 MB (`write_mb` 1 + 1 + 3 + 2), the run's peak is about 10 MB at
-`--test-threads=8`, and a marker is ~40 bytes. Retired by `Drop` on every path that unwinds; by the next run's sweep
-after a kill (10 minutes, owner `gone`); by the janitor (`bash .claude/rules/shared/tools/janitor.sh`, one hour)
-when this crate's tests do not run again. A teardown that gave up leaves the folder prefixed and claimed by a pid that
+a marker is ~40 bytes. **The peak, recomputed from the fixtures that can run at once** (verified on 1c1282e): only
+the three compile-cache tests write megabytes (`write_mb`, `src/testing.rs:206`) — `mxr-scope` 7 MB
+(`compile_cache.rs:499`, `:500` 1 + 1, `:505` 3, `:517` 2), `mxr-wipe` 2 MB (`:430`, `:431`), `mxr-race` none (lease
+folders only) — and nothing serialises them (`CACHE_PATH_LOCK`, `compile_cache.rs:162`, serialises the lease, not
+the writes). At `--test-threads=8` all three can run at once beside five other scratches of a few KB each (the log,
+seed, model-cache and token fixtures write bytes, not megabytes): **≈ 9 MB**, plus S2's sc. 5–6 child of a few KB.
+The upper bound if every concurrent compile-cache test were the largest (3 × 7 MB) is ≈ 21 MB; the tests are NOT
+serialised for this, because 21 MB is not a budget worth a lock. Retired by `Drop` on every path that unwinds; by the
+next run's sweep after a kill (10 minutes, owner `gone`); by the janitor (`bash .claude/rules/shared/tools/janitor.sh
+--token sidecar`, or without `--token` for every repository; one hour) when this crate's tests do not run again. A teardown that gave up leaves the folder prefixed and claimed by a pid that
 dies with the run, so the next sweep collects it.
 
 ## Order
@@ -238,9 +260,16 @@ parent as a note, not into the mounted copy.
   3. The mounted rule carries the table and this repository's row:
      `git -C .claude/rules/shared grep -n "^| \`sidecar\` |" common/test-leftovers.md` → one line.
   4. Both cargo legs green (the pin changes no Rust; `tests/local_cpu_budget.rs` reads only `CLAUDE.md`/`README.md`).
+  5. **S2's constants and sweep logic re-checked against the released contract, before S2 merges.** With the pin on
+     the release, compare with the mounted `common/test-leftovers.md`: `PREFIX` and `REPO_TOKEN` (rule §1 and the
+     `## Tokens` row), `START_TOLERANCE_S` (rule §3, 2 s), `SWEEP_MIN_AGE` (rule §4, 10 minutes), and D5's sweep
+     decisions one by one (own token only, anchored and case-insensitive; age selects, `gone` alone removes, `live`
+     and `unknown` keep; an unmarked new-form folder removed once old; orphan markers; a `.git` file never removed;
+     never fails the run). The comparison is a table in S1's PR. A mismatch updates S2 (this document's D2–D5 and
+     S2's constants and scenarios) FIRST; S2 does not merge with a constant or a decision the release does not say.
 - **Commands.** The four node checks above; `node .claude/rules/shared/tools/low-priority.mjs cargo test --release --locked -j 8 -- --test-threads=8`.
-- **DoD.** Pin equals the release tip; every required check green; this document's status line still says
-  *plan only* (S1 alone ships no leftover change).
+- **DoD.** Pin equals the release tip; every required check green; the constants table of scenario 5 in the PR;
+  this document's status line still says *plan only* (S1 alone ships no leftover change).
 
 ## S2 — `TestScratch`: name, claim, `Drop`, liveness, start-of-run sweep
 
@@ -295,7 +324,8 @@ pub(crate) fn remove_with_retries(path: &Path, remover: impl FnMut(&Path) -> io:
                                   on_failed_attempt: impl FnMut(u32)) -> io::Result<()>;
 pub(crate) fn teardown(dir: &Path, out: &mut dyn Write) -> bool;  // D4; true when folder and claim are gone
 pub(crate) fn sweep(root: &Path, now: SystemTime, min_age: Duration,
-                    probe: impl Fn(u32) -> Probe) -> SweepReport;  // D5; SweepReport { removed, kept: Vec<(PathBuf, String)>, errors }
+                    probe: impl Fn(u32) -> Probe) -> SweepReport;  // D5; SweepReport { removed, kept: Vec<(PathBuf, String)>, errors: Vec<String> }
+pub(crate) fn print_report(report: &SweepReport, out: &mut dyn Write);  // D5; nothing for an empty report
 ```
 
 - `parse_owner` matches `^([^@:\s]+@(linux|macos|windows)):(\d+)(?::(\d+))?$` (the `regex` dev-dependency); anything
@@ -364,10 +394,18 @@ does so in a PRIVATE parent made with `new_in`, because 8 test threads create sc
     unreported; a prefixed folder holding a `.git` FILE → kept; `testsToDelete-mcp-x-abc123` and
     `bge-log-1-first` → untouched and unreported; `teststodelete_sidecar_x_abc123` and
     `TESTSTODELETE-SIDECAR-x-abc123` → considered (rule §1's match); an old orphan `testsToDelete-sidecar-y-abc123.owner`
-    whose folder is absent → removed.
-15. `the_sweep_never_fails_the_run` — a root that does not exist → empty report, no panic; a probe that panics →
-    caught by the `Once` wrapper's `catch_unwind`, one line, and a following `TestScratch::new` still works (the
-    `Once` is not poisoned).
+    whose folder is absent → removed; a folder claimed by THIS process with an mtime set 10 days back → kept (`live`,
+    age never authorises). **A removal that teardown gives up on is in `kept`:** a probe-`Gone` claimed folder that
+    cannot be removed — Windows: a file inside held with `share_mode(0)`; POSIX: its private root `chmod 0o555`, the
+    premise asserted (root removes it anyway — the test then fails saying so) — appears in `SweepReport.kept` with a
+    reason starting `could not remove:`, is absent from `removed`, and still exists with its `.owner`; released or
+    restored, a second sweep removes it.
+15. `the_sweep_never_fails_the_run` — **every I/O error is reported, none stops the sweep**: a root that does not
+    exist, and a root that is a FILE (the injected `read_dir` failure) → no panic, `removed` and `kept` empty, and
+    `errors` holds exactly one entry naming that root and the `read_dir` error; `print_report` (D5) given that report
+    and a buffer writes exactly that entry as one line. A probe that panics → caught by the `Once` wrapper's
+    `catch_unwind`, one line, and a following `TestScratch::new` still works (the `Once` is not poisoned). RED first:
+    written before `errors` is filled, the file-root case is observed with an empty `errors`.
 
 - **Commands.** `node .claude/rules/shared/tools/low-priority.mjs cargo test --release --locked -j 8 -- test_scratch --test-threads=8`;
   the whole suite on Windows (dml) and inside WSL (`nice -n 19 cargo test --release --locked -j 8 --no-default-features --target-dir target-wsl -- --test-threads=8`);
@@ -437,13 +475,23 @@ test" route only in that the shape changes, never the assertion):
 
 **The guard.** Pure functions over `(relative path, text)` plus one `#[test]` over the real tree.
 
-- **Discovery** (std `read_dir`, no git spawn): `src/**/*.rs`, `tests/**/*.rs`, `.github/workflows/*.yml`,
-  `.github/scripts/**/*.mjs`, `http/*.js`, `http/*.mjs` (never `http/node_modules`), `**/*.sh`, `**/*.ps1` outside
-  `target*/`, `node_modules/`, `vendor-fastembed/` and `.claude/`. Excluded by name, a frozen list a test pins
-  exactly: `tests/test_leftovers.rs` (it carries the violations as fixture strings). `vendor-fastembed/` is out of
-  scope by construction (not built as tests here; upstream's bytes). **Scan of nothing:** fewer than one `.rs` under
-  `src/`, one under `tests/`, or one workflow ⇒ red with `test_leftovers: scanned nothing under <root> — discovery
-  broke; the repository is not clean`.
+- **Discovery — an inventory from git, not hand-listed folders.** The test runs `git ls-files -z --cached --others
+  --exclude-standard` once in `CARGO_MANIFEST_DIR` (the shape E2's guard and `public-hygiene.mjs` use; a test may
+  spawn — the no-spawn rule of D3 binds the helper's writer and probe, not the guard) and keeps every listed file
+  whose extension is a language the guard reads, WHEREVER it sits: `*.rs`; `*.yml`/`*.yaml` under
+  `.github/workflows/`; `*.mjs`, `*.js`, `*.cjs`, `*.ts`; `*.sh`; `*.ps1`; `*.py`. So every script root is covered
+  without naming it — today `.github/scripts/` (`branch-protection.mjs`) and `http/` (`httpyac.config.js`), and
+  `tools/**/*.mjs` or any new root the day one is added. Then four path exclusions, by prefix of the RELATIVE path:
+  any directory whose name starts with `target` (`target/`, `target-wsl/`, `target-<anything>/` — matched as
+  `^target[^/]*/` on any path segment, so every Cargo target directory is skipped even where it is not git-ignored),
+  `node_modules/` (any depth), `vendor-fastembed/` (upstream's bytes, not built as tests here) and `.claude/`
+  (another repository). Excluded by name, a frozen list a test pins exactly: `tests/test_leftovers.rs` (it carries the
+  violations as fixture strings). `git` missing or exiting non-zero ⇒ red naming the command, never an empty scan.
+  **Scan of nothing:** fewer than one `.rs` under `src/`, one under `tests/`, or one workflow ⇒ red with
+  `test_leftovers: scanned nothing under <root> — discovery broke; the repository is not clean`.
+- **The inventory is verified against the repository**: on the S4 branch, the PR records the list the guard scanned
+  and the output of `git ls-files` filtered by the same extensions, and they are equal; a file in one and not the
+  other is a discovery defect fixed before merge.
 - **Classes** (rule §7, their Rust/YAML/JS/shell spelling). Whole-line `//` and `#` comments are skipped for matching
   and read for exemptions.
   - `raw-temp`: `\btemp_dir\s*\(`, `\benv::var(_os)?\(\s*"(TEMP|TMP|TMPDIR)"`, `\btempfile::`, `\btempdir\s*\(`,
@@ -490,15 +538,21 @@ test" route only in that the shape changes, never the assertion):
 4. `the_token_is_a_registered_row` — the real mounted rule: `sidecar` ⇒ no finding; fixture rule texts: no `## Tokens`
    ⇒ 1; a two-column table ⇒ 1; the token only in the `repository` column ⇒ 1; a token listed twice ⇒ 1; `Sidecar`
    and `x` ⇒ 1; two `REPO_TOKEN` constants ⇒ 1.
-5. `the_exclusion_list_is_exactly_one_file` — pinned.
+5. `the_exclusion_list_is_exactly_one_file` — pinned. And `discovery_keeps_every_script_root_and_skips_every_target`
+   — the pure filter over an in-memory listing: `.github/scripts/a.mjs`, `http/x.js`, `tools/lib/y.mjs`,
+   `scripts/z.sh`, `deep/new/root/w.ps1` ⇒ kept; `target/debug/a.rs`, `target-wsl/x.rs`, `target-ci/y.sh`,
+   `sub/target-x/z.rs`, `http/node_modules/p/i.js`, `vendor-fastembed/src/a.rs`, `.claude/rules/shared/tools/t.mjs` ⇒
+   dropped; `targets.rs` at the root (a FILE whose name starts with `target`) ⇒ kept. RED first: written against the
+   old hand-listed discovery, `tools/lib/y.mjs` and `deep/new/root/w.ps1` are observed dropped.
 6. **Break-it on the real tree** (by hand, recorded in the PR): one `std::env::temp_dir()` added to a test module ⇒
    the guard red naming `file:line`; reverted ⇒ green. The same with `.claude/rules/shared` de-initialised ⇒ red with
    the submodule sentence.
 
 - **Commands.** `node .claude/rules/shared/tools/low-priority.mjs cargo test --release --locked -j 8 --test test_leftovers -- --test-threads=8`;
   the whole suite on both legs; `actionlint` passes on the changed `ci.yml` (the `workflows` job).
-- **DoD.** Scenario 1 observed red with exactly the nine sites, then green; every break-it observed red; both CI legs
-  green WITH the submodule step; `module_inference.md` updated.
+- **DoD.** Scenario 1 observed red with exactly the nine sites, then green; every break-it observed red; the scanned
+  inventory recorded and equal to the filtered `git ls-files`; both CI legs green WITH the submodule step;
+  `module_inference.md` updated (it names the `target*` exclusion).
 
 ## Test plan
 
@@ -524,6 +578,35 @@ test" route only in that the shape changes, never the assertion):
       never *implemented* while it sits in `todo/` — and the parent's E4 entry gets the same sentence. Parent and
       stories documents promote together, after E7.
 
+## Plan-gate round 1 (2026-10-17)
+
+The coai plan gate's first round over this document; judged by Opus. Accepted (applied above):
+
+1. The guard's discovery is an inventory from `git ls-files` covering every script root by extension (today
+   `.github/scripts/`, `http/`; `tools/**/*.mjs` when it exists), not hand-listed folders; the scanned list is
+   verified against the repository — S4 *Discovery*, sc. 5, DoD.
+2. The scratch peak is recomputed from the fixtures that can run at once: the three compile-cache tests write
+   0 + 2 + 7 MB (verified), ≈ 9 MB at `--test-threads=8`, 21 MB as the all-largest bound; not serialised, and said so
+   — *Growth surface*.
+3. S1 re-checks S2's constants (`PREFIX`, `REPO_TOKEN`, `START_TOLERANCE_S`, `SWEEP_MIN_AGE`) and the sweep's
+   decisions against the released contract before S2 merges — S1 sc. 5, DoD.
+4. A removal the sweep attempts and teardown gives up on is recorded in `SweepReport.kept` with its reason — D5,
+   S2 sc. 14.
+5. `sweep()` reports every I/O error, the root's `read_dir` included, in `SweepReport.errors` and on stderr; a
+   scenario injects a `read_dir` failure — D5, S2 sc. 15.
+6. The creation order is stated: create → register → claim, as the contract and `owned.mjs` do for a folder ("claim
+   first" is the contract's form for store-held claims only); an unmarked new-form folder is removed only after the
+   10-minute minimum age — the contract's accepted window; a live claim is never removed whatever the mtime — D4,
+   D5, S2 sc. 14.
+7. The discovery exclusion matches any `target*` directory (`target`, `target-wsl`, …) — S4 *Discovery*, sc. 5.
+
+Rejected:
+
+- CI automation of the leftover count and the break-it — runners are ephemeral, so a count there proves nothing
+  about a developer machine, and a planted violation in CI is a permanent defect the family forbids.
+- Using a known-exited child's pid as the dead owner — the unmatchable-pid method is measured; pid reuse is the
+  defect the contract bans.
+
 ## Notes for the parent (`dew_flow_conventions · todo/PLAN_test_leftovers_rollout.md`, E4 entry)
 
 1. *"Plus the model cache the audit named"* double-counts: it is `src/testing.rs:195`, one of the nine; no tenth or
@@ -545,4 +628,6 @@ test" route only in that the shape changes, never the assertion):
    (`%COMPUTERNAME%`, and C#'s `Environment.MachineName`: upper-case, cut at 15 characters). A C# helper written to
    E3's shape with `Environment.MachineName` would write markers the janitor and Node read as a foreign host on any
    machine whose name is longer than 15 characters. One sentence naming the DNS host name would close it before E3
-   writes the first C# helper.
+   writes the first C# helper. **Settled, 2026-10-17:** the E1 contract names the DNS host name (`os.hostname()`,
+   `Dns.GetHostName()`, `hostname`), compared case-insensitively, never `Environment.MachineName` — D3 already
+   follows it.
