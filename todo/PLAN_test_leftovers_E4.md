@@ -175,7 +175,9 @@ constructor", which rule §4 names: the first `TestScratch` constructor in a tes
   creating, D4, so ten unclaimed minutes mean nobody is creating it);
 - a removal the sweep attempts and `teardown` gives up on → the folder stays (prefixed and claimed) and is recorded
   in `SweepReport.kept` with the reason `could not remove: <error>` — never silently dropped from the report;
-- a `.owner` file whose folder is absent and which is old enough → removed;
+- an **orphan claim** — a `.owner` file whose folder is absent — old enough → judged by its OWNER, never by its age
+  alone (rule §2, "its owner judges it"): `gone` → the claim is removed; `live` and `unknown` (foreign host,
+  unreadable text included) → kept, one line naming it and the reason. Age only selects it, as for a folder;
 - anything else in the temp root — another token, the old `mxr-*`/`bge-*` names — is not looked at.
 - **Every I/O error is reported**: the `read_dir` of the root itself, an entry's metadata, a claim that cannot be
   read for a reason other than "absent", a marker removal — each is one entry of `SweepReport.errors` naming the path
@@ -264,7 +266,8 @@ parent as a note, not into the mounted copy.
      the release, compare with the mounted `common/test-leftovers.md`: `PREFIX` and `REPO_TOKEN` (rule §1 and the
      `## Tokens` row), `START_TOLERANCE_S` (rule §3, 2 s), `SWEEP_MIN_AGE` (rule §4, 10 minutes), and D5's sweep
      decisions one by one (own token only, anchored and case-insensitive; age selects, `gone` alone removes, `live`
-     and `unknown` keep; an unmarked new-form folder removed once old; orphan markers; a `.git` file never removed;
+     and `unknown` keep; an unmarked new-form folder removed once old; orphan markers judged by their owner, never by
+     age alone; a `.git` file never removed;
      never fails the run). The comparison is a table in S1's PR. A mismatch updates S2 (this document's D2–D5 and
      S2's constants and scenarios) FIRST; S2 does not merge with a constant or a decision the release does not say.
 - **Commands.** The four node checks above; `node .claude/rules/shared/tools/low-priority.mjs cargo test --release --locked -j 8 -- --test-threads=8`.
@@ -393,8 +396,10 @@ does so in a PRIVATE parent made with `new_in`, because 8 test threads create sc
     claim → folder and marker removed; unmarked and old → removed; unmarked at real `now` (young) → untouched and
     unreported; a prefixed folder holding a `.git` FILE → kept; `testsToDelete-mcp-x-abc123` and
     `bge-log-1-first` → untouched and unreported; `teststodelete_sidecar_x_abc123` and
-    `TESTSTODELETE-SIDECAR-x-abc123` → considered (rule §1's match); an old orphan `testsToDelete-sidecar-y-abc123.owner`
-    whose folder is absent → removed; a folder claimed by THIS process with an mtime set 10 days back → kept (`live`,
+    `TESTSTODELETE-SIDECAR-x-abc123` → considered (rule §1's match); **orphan claims are judged by owner** — four
+    equally old orphan `.owner` files whose folders are absent, `testsToDelete-sidecar-o1-abc123.owner` …`-o4-…`,
+    claimed by THIS process (`live`), by a probe-`Gone` pid, by a foreign host (`unknown`), and holding unreadable
+    text → only the `gone` one disappears; the other three stay, each in `kept` with its reason; a folder claimed by THIS process with an mtime set 10 days back → kept (`live`,
     age never authorises). **A removal that teardown gives up on is in `kept`:** a probe-`Gone` claimed folder that
     cannot be removed — Windows: a file inside held with `share_mode(0)`; POSIX: its private root `chmod 0o555`, the
     premise asserted (root removes it anyway — the test then fails saying so) — appears in `SweepReport.kept` with a
