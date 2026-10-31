@@ -174,8 +174,14 @@ pub(crate) fn check_what(what: &str) -> Result<(), String> {
     let owner = owner_token();
     let room = what_room(owner);
     if what.len() > room {
+        let characters = what.chars().count();
+        let note = if characters == what.len() {
+            String::new()
+        } else {
+            format!(" (`what` is {characters} characters; multi-byte characters count by bytes)")
+        };
         return Err(format!(
-            "the whole name would pass {MAX_NAME} bytes — `what` is {} bytes, the most is {room} under the owner `{owner}`: {what:?}",
+            "the whole name would pass {MAX_NAME} bytes — `what` is {} bytes, the most is {room} under the owner `{owner}`{note}: {what:?}",
             what.len()
         ));
     }

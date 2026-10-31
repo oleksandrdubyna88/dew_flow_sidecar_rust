@@ -175,6 +175,23 @@ fn an_invalid_what_creates_nothing_and_the_room_is_derived() {
         );
     }
 
+    // Review round 1: the characters of a `what` fit the room and its bytes do not — the message says that bytes count.
+    let reason = check_what(&two_bytes_each).expect_err("too many bytes");
+    assert!(
+        reason.contains("multi-byte characters count by bytes"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains(&format!("{} characters", room - 1))
+            && reason.contains(&format!("{} bytes", room + 1)),
+        "{reason}"
+    );
+    let reason = check_what(&too_long).expect_err("too many bytes");
+    assert!(
+        !reason.contains("multi-byte"),
+        "an ASCII `what` has nothing to explain: {reason}"
+    );
+
     let exact = "a".repeat(room);
     let scratch = TestScratch::new_in(private.path(), &exact);
     let leaf = scratch
