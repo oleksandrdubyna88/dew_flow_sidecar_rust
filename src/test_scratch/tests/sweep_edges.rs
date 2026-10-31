@@ -256,6 +256,56 @@ fn the_passes_share_one_listing_of_the_root() {
     assert_eq!(report.removed, vec![late.clone()], "{report:?}");
 }
 
+/// Review round 1: the quarantine pass asked the probe about ANY number in the name. A pid that cannot be a process
+/// (0, a leading zero, past 2^53, one that overflows) is never asked and never `gone` — `owner_state`'s checks, the
+/// reference's `processProbe`, applied before the probe: the quarantine of such a name stays where it is.
+#[test]
+fn the_quarantine_pass_never_asks_about_a_pid_that_cannot_be_a_process() {
+    let scratch = TestScratch::new("quarantine-pids");
+    let root = scratch.path();
+    let name = name_with("pids", "abc123");
+    let original = root.join(&name);
+    let beyond = (1u64 << 53).to_string();
+    let mut quarantines = Vec::new();
+    for pid in ["0", "007", &beyond, "99999999999999999999999"] {
+        let quarantine = root.join(quarantine_name(&name, 0).replace("-0-", &format!("-{pid}-")));
+        std::fs::create_dir(&quarantine).unwrap();
+        quarantines.push(quarantine);
+    }
+    let asked = std::cell::RefCell::new(Vec::new());
+    let everything_is_gone = |pid: u64| {
+        asked.borrow_mut().push(pid);
+        Probe::Gone
+    };
+    let report = sweep(
+        root,
+        later(),
+        SWEEP_MIN_AGE,
+        everything_is_gone,
+        |_| true,
+        &mut Hooks::default(),
+    );
+    assert!(
+        asked.borrow().is_empty(),
+        "the probe was asked about {:?}",
+        asked.borrow()
+    );
+    assert!(!original.exists(), "{report:?}");
+    for quarantine in &quarantines {
+        assert!(quarantine.is_dir(), "{quarantine:?} stays: {report:?}");
+    }
+    assert!(
+        report.listed.is_empty() && report.kept.is_empty(),
+        "{report:?}"
+    );
+
+    // The same table, for the reader's operating system: pid 1 is no process on Windows, nothing past u32::MAX is.
+    assert!(!pid_is_askable(0, false) && !pid_is_askable(1 << 53, false));
+    assert!(pid_is_askable(1, false) && pid_is_askable(1 << 40, false));
+    assert!(!pid_is_askable(1, true) && !pid_is_askable(u64::from(u32::MAX) + 1, true));
+    assert!(pid_is_askable(2, true) && pid_is_askable(u64::from(u32::MAX), true));
+}
+
 /// Review round 1: the rename INTO quarantine must not replace anything. POSIX `rename(2)` of a directory onto an EMPTY
 /// directory replaces it (and so does Windows' `MoveFileEx` with replace semantics): an empty directory somebody made
 /// at the drawn quarantine name would be gone with no trace. The name is drawn again instead.

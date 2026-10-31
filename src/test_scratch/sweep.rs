@@ -15,7 +15,9 @@
 
 use super::claim::{claim_path, snapshot_claim, ClaimSnapshot, RawClaim};
 use super::identity::{changed_at, file_id, same_id, FileId};
-use super::owner::{owner_state, parse_owner, Claim, Facts, Owner, OwnerState, Probe};
+use super::owner::{
+    owner_state, parse_owner, pid_is_askable, Claim, Facts, Owner, OwnerState, Probe,
+};
 use super::scratch::remove_with_retries;
 use super::{
     classify_name, is_mine, move_without_replace, probe, temp_root, this_owner, write_line,
@@ -109,6 +111,16 @@ pub(crate) fn quarantine_path(dir: &Path) -> PathBuf {
         PREFIX.to_ascii_lowercase(),
         std::process::id()
     ))
+}
+
+/// The pid in a quarantine's name, only when a probe may be asked about it.
+fn quarantine_pid(text: &str) -> Option<u64> {
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse::<u64>()
+        .ok()
+        .filter(|pid| pid_is_askable(*pid, cfg!(windows)))
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -271,9 +283,10 @@ impl Sweeper<'_, '_> {
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            let renamer_is_gone = found[2]
-                .parse::<u64>()
-                .is_ok_and(|pid| probe(pid) == Probe::Gone);
+            // `owner_state`'s checks come first: a pid that cannot be a process (0, a leading zero, past 2^53 or
+            // u32::MAX where that is the limit, Windows' 1) is never asked and never `gone`.
+            let renamer_is_gone =
+                quarantine_pid(&found[2]).is_some_and(|pid| probe(pid) == Probe::Gone);
             // Another uid's, or its renamer may still be working, or too young by either stamp (a renamer in another
             // pid namespace has a pid this process cannot see: it is "gone" here and may be mid-delete).
             if !is_real_dir(&meta)

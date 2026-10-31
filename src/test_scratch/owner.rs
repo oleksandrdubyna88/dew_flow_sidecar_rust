@@ -518,10 +518,7 @@ pub(crate) fn owner_state(
     if my_host.ends_with("@linux") && !record.ns.is_some_and(|ns| me.ns == Some(ns)) {
         return OwnerState::Unknown;
     }
-    if record.pid == 0 || record.pid > MAX_SAFE_PID {
-        return OwnerState::Unknown;
-    }
-    if record.pid == 1 && my_host.ends_with("@windows") {
+    if !pid_is_askable(record.pid, my_host.ends_with("@windows")) {
         return OwnerState::Unknown;
     }
     match probe(record.pid) {
@@ -535,4 +532,14 @@ pub(crate) fn owner_state(
             _ => OwnerState::Live,
         },
     }
+}
+
+/// Can `pid` name a process the probe may be asked about? Not 0, not past 2^53 (inexact in some reader of the family),
+/// and for a reader on Windows not 1 (there is no pid 1: a `gone` answer would be a lie) and not past `u32::MAX` (a
+/// Windows pid is 32 bits, never truncated). The caller checks the leading zero in the TEXT (`007` is never 7).
+pub(crate) fn pid_is_askable(pid: u64, windows: bool) -> bool {
+    if pid == 0 || pid > MAX_SAFE_PID {
+        return false;
+    }
+    !(windows && (pid == 1 || pid > u64::from(u32::MAX)))
 }
