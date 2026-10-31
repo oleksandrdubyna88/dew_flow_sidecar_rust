@@ -872,7 +872,7 @@ mod tests {
     fn a_loaded_tokenizer_is_visible_even_while_its_engine_is_cold() {
         let cache = model_cache_with_a_tokenizer("cold-engine");
         let mut config = config("");
-        config.cache_dir = cache.clone();
+        config.cache_dir = cache.path().to_path_buf();
         let state = app_state_with(config);
 
         let models = models_now(&state);
@@ -889,8 +889,6 @@ mod tests {
             None,
             "a row that names no tokenizer reports null, not false"
         );
-
-        std::fs::remove_dir_all(&cache).ok();
     }
 
     /// A registered name whose file is missing is still a ROW, marked unavailable. Hiding it would make a

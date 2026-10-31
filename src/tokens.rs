@@ -245,7 +245,8 @@ mod tests {
     // tokenizer that cannot be found turns the guard off without anyone noticing.
     #[test]
     fn the_tokenizer_is_found_by_scanning_the_snapshot_folder() {
-        let root = std::env::temp_dir().join(format!("bge-tok-{}", std::process::id()));
+        let scratch = TestScratch::new("tok");
+        let root = scratch.path().to_path_buf();
         let snapshot = root
             .join("models--BAAI--bge-m3")
             .join("snapshots")
@@ -256,13 +257,12 @@ mod tests {
         let found = find_tokenizer_file(&root).expect("the snapshot holds a tokenizer.json");
 
         assert_eq!(found, snapshot.join("tokenizer.json"));
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn a_cache_without_the_model_yields_no_tokenizer() {
-        let empty = std::env::temp_dir().join(format!("bge-tok-empty-{}", std::process::id()));
-        std::fs::create_dir_all(&empty).unwrap();
+        let scratch = TestScratch::new("tok-empty");
+        let empty = scratch.path().to_path_buf();
 
         assert!(find_tokenizer_file(&empty).is_none());
         // ...and the registry degrades to "off" rather than failing the sidecar: a missing tokenizer must
@@ -276,7 +276,25 @@ mod tests {
             .expect("the row is declared even with no file behind it");
         assert!(bge.tokenizer.is_none(), "nothing loaded");
         assert!(bge.source.is_none(), "and there was no file to name");
-        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// The fixture cache is the test's own even when the test panics: the root must be gone afterwards.
+    #[test]
+    fn a_model_cache_is_gone_even_when_its_test_panics() {
+        let root = std::sync::Mutex::new(None);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cache = model_cache_with_a_tokenizer("panics");
+            *root.lock().unwrap() = Some(cache.path().to_path_buf());
+            panic!("a failed assertion before any removal");
+        }));
+
+        assert!(outcome.is_err(), "the closure was meant to panic");
+        let root = root.lock().unwrap().clone().expect("the root was recorded");
+        assert!(
+            !root.exists(),
+            "the model cache outlived its panicking test: {}",
+            root.display()
+        );
     }
 
     /// The whole point of token accounting is a TRUSTWORTHY truncation signal, so an encode failure
@@ -330,11 +348,13 @@ mod tests {
     fn a_tokenizer_present_at_startup_still_counts_after_its_file_is_gone() {
         let cache = model_cache_with_a_tokenizer("startup");
         let mut config = config("");
-        config.cache_dir = cache.clone();
+        config.cache_dir = cache.path().to_path_buf();
 
         let state = app_state_with(config);
         // The file is what a lazy loader would need at request time. It is gone before the first ask.
-        std::fs::remove_dir_all(&cache).expect("take the file away");
+        // The removal IS this test's subject, not its cleanup; the scratch's `Drop` then finds the folder gone,
+        // which is success.
+        std::fs::remove_dir_all(cache.path()).expect("take the file away");
 
         assert!(
             state.token_counter().is_some(),

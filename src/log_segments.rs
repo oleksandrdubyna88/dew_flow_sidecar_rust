@@ -195,20 +195,42 @@ impl Write for DaySegments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TestScratch;
 
     /// 2026-08-16T15:00:00Z, and the midnight after it.
     const AFTERNOON: u64 = 1_786_892_400;
     const NEXT_MIDNIGHT: u64 = 1_786_924_800;
 
-    fn scratch(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("bge-log-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir.to_string_lossy().replace('\\', "/")
+    /// A claimed, `Drop`-owned folder for one test; the caller holds it in a named binding and takes `slash_path()`.
+    fn scratch(name: &str) -> TestScratch {
+        TestScratch::new(&format!("log-{name}"))
+    }
+
+    /// A log scratch is the test's own: after the block the root does not exist. (Before the move to
+    /// `TestScratch` the helper pre-cleaned and never cleaned after, so every passing run left a folder behind.)
+    #[test]
+    fn a_log_scratch_is_gone_once_its_test_ends() {
+        let root = {
+            let scratch = scratch("gone");
+            let root = scratch.slash_path();
+            let (segments, _) = DaySegments::open(&root, "bge-sidecar-device0", AFTERNOON);
+            assert!(
+                segments.is_some(),
+                "a writable directory must yield a writer"
+            );
+            root
+        };
+
+        assert!(
+            !std::path::Path::new(&root).exists(),
+            "the log scratch outlived its test: {root}"
+        );
     }
 
     #[test]
     fn the_first_segment_is_named_for_the_moment_the_run_started() {
-        let root = scratch("first");
+        let scratch = scratch("first");
+        let root = scratch.slash_path();
 
         let (segments, path) = DaySegments::open(&root, "bge-sidecar-device0", AFTERNOON);
 
@@ -227,7 +249,8 @@ mod tests {
 
     #[test]
     fn a_run_that_outlives_the_day_continues_in_a_midnight_segment() {
-        let root = scratch("roll");
+        let scratch = scratch("roll");
+        let root = scratch.slash_path();
         let (segments, first) = DaySegments::open(&root, "bge-sidecar-device0", AFTERNOON);
         let mut segments = segments.expect("writer");
 
@@ -256,7 +279,8 @@ mod tests {
 
     #[test]
     fn a_line_before_the_boundary_does_not_roll() {
-        let root = scratch("stay");
+        let scratch = scratch("stay");
+        let root = scratch.slash_path();
         let (segments, first) = DaySegments::open(&root, "bge-sidecar-device0", AFTERNOON);
         let mut segments = segments.expect("writer");
 
@@ -273,7 +297,8 @@ mod tests {
 
     #[test]
     fn every_segment_of_one_run_carries_the_same_pid() {
-        let root = scratch("pid");
+        let scratch = scratch("pid");
+        let root = scratch.slash_path();
         let (segments, _) = DaySegments::open(&root, "bge-sidecar-device0", AFTERNOON);
         let mut segments = segments.expect("writer");
 
@@ -296,7 +321,8 @@ mod tests {
 
     #[test]
     fn a_day_folder_older_than_the_window_is_retired() {
-        let root = with_days("old", &["2026-06-01", "2026-08-15"]);
+        let scratch = with_days("old", &["2026-06-01", "2026-08-15"]);
+        let root = scratch.slash_path();
 
         let retired = retire_day_folders(&root, 30, NOON);
 
@@ -306,7 +332,8 @@ mod tests {
 
     #[test]
     fn the_boundary_day_stays_and_so_does_everything_inside_the_window() {
-        let root = with_days("boundary", &["2026-07-16", "2026-07-17", "2026-08-16"]);
+        let scratch = with_days("boundary", &["2026-07-16", "2026-07-17", "2026-08-16"]);
+        let root = scratch.slash_path();
 
         retire_day_folders(&root, 30, NOON);
 
@@ -320,7 +347,8 @@ mod tests {
     fn the_family_default_keeps_a_fortnight() {
         // Pinned rather than implied: this number is shared with three .NET repositories, and a mirror that
         // drifts is the whole reason the rule exists.
-        let root = with_days("default", &["2026-08-01", "2026-08-02"]);
+        let scratch = with_days("default", &["2026-08-01", "2026-08-02"]);
+        let root = scratch.slash_path();
 
         let retired = retire_day_folders(&root, DEFAULT_RETENTION_DAYS, NOON);
 
@@ -329,7 +357,8 @@ mod tests {
 
     #[test]
     fn a_retention_of_zero_keeps_everything() {
-        let root = with_days("off", &["2020-01-01"]);
+        let scratch = with_days("off", &["2020-01-01"]);
+        let root = scratch.slash_path();
 
         let retired = retire_day_folders(&root, 0, NOON);
 
@@ -341,10 +370,11 @@ mod tests {
     fn a_folder_whose_name_is_not_a_date_is_never_touched() {
         // 2020-02-30 is the sharp case: old, date-SHAPED, and not a date. An implementation comparing the
         // names as strings — which is otherwise sound, since the format sorts chronologically — deletes it.
-        let root = with_days(
+        let scratch = with_days(
             "bogus",
             &["2020-01-01", "2020-02-30", "2026-13-45", "keep-this"],
         );
+        let root = scratch.slash_path();
 
         retire_day_folders(&root, 30, NOON);
 
@@ -361,7 +391,9 @@ mod tests {
 
     #[test]
     fn a_logs_directory_that_does_not_exist_yet_is_not_an_error() {
-        let root = scratch("absent");
+        let scratch = scratch("absent");
+        // The scratch exists and is empty; the test is about a root that does NOT, so it names one below it.
+        let root = format!("{}/logs", scratch.slash_path());
 
         let retired = retire_day_folders(&root, 30, NOON);
 
@@ -374,7 +406,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn a_folder_that_cannot_be_removed_is_skipped_rather_than_fatal() {
-        let root = with_days("held", &["2020-01-01"]);
+        let scratch = with_days("held", &["2020-01-01"]);
+        let root = scratch.slash_path();
 
         // A log viewer holding yesterday's file open is the ordinary case, and it must never stop the
         // sidecar from starting — the one thing a retention sweep must not cost.
@@ -399,14 +432,15 @@ mod tests {
         drop(held);
     }
 
-    fn with_days(name: &str, days: &[&str]) -> String {
-        let root = scratch(name);
+    fn with_days(name: &str, days: &[&str]) -> TestScratch {
+        let scratch = scratch(name);
+        let root = scratch.slash_path();
         for day in days {
             std::fs::create_dir_all(format!("{root}/{day}")).expect("day folder");
             std::fs::write(format!("{root}/{day}/line.log"), "a line").expect("line");
         }
 
-        root
+        scratch
     }
 
     fn walk_days(root: &str) -> Vec<String> {

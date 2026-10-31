@@ -375,8 +375,8 @@ mod tests {
     async fn a_missing_tokenizer_file_degrades_one_name_and_leaves_the_others_answering() {
         let cache = model_cache_with_a_tokenizer("degrade");
         let mut config = config("");
-        config.cache_dir = cache.clone();
-        config.qwen_tokenizer_path = cache.join("there-is-no-qwen-here.json");
+        config.cache_dir = cache.path().to_path_buf();
+        config.qwen_tokenizer_path = cache.path().join("there-is-no-qwen-here.json");
         let state = app_state_with(config);
 
         let missing = tokenize(
@@ -408,8 +408,6 @@ mod tests {
             "one absent file must not take the whole registry down"
         );
         assert_eq!(present.token_count, vec![2], "and it really counted");
-
-        std::fs::remove_dir_all(&cache).ok();
     }
 
     /// The batch cap: /tokenize used to accept any number of texts and encode them all inline on the
