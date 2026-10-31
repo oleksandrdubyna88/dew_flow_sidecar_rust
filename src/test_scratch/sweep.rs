@@ -128,8 +128,9 @@ fn same_claim(now: &ClaimSnapshot, captured: &ClaimSnapshot) -> bool {
 /// Put `quarantined` back under `original` ONLY if that name is free — never over an existing entry (rule §4). POSIX:
 /// a placeholder of our own is created exclusively and the quarantine is renamed over that EMPTY directory (a plain
 /// `rename(2)` of a directory onto an empty directory REPLACES it, so it is never tried against a name that may be
-/// taken); when the rename fails the placeholder goes with `remove_dir`, which refuses anything non-empty. Windows: a
-/// plain `rename`, which refuses an existing directory.
+/// taken); when the rename fails the placeholder goes with `remove_dir`, which refuses anything non-empty. Windows:
+/// `MoveFileExW` with no flags, which refuses any existing entry — NOT `std::fs::rename`, which replaces an existing
+/// EMPTY directory there (measured on the windows-latest runner: the plan's "a plain rename refuses" was wrong).
 fn exclusive_restore(quarantined: &Path, original: &Path, mine: &dyn Fn(&Path) -> bool) -> bool {
     #[cfg(unix)]
     {
@@ -150,10 +151,10 @@ fn exclusive_restore(quarantined: &Path, original: &Path, mine: &dyn Fn(&Path) -
         }
         false
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = mine;
-        std::fs::rename(quarantined, original).is_ok()
+        super::win::move_without_replace(quarantined, original)
     }
 }
 

@@ -13,7 +13,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path};
 use std::sync::OnceLock;
-use windows::core::{HRESULT, PWSTR};
+use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_INVALID_PARAMETER, ERROR_NO_TOKEN, FILETIME, HANDLE, HLOCAL,
     STILL_ACTIVE,
@@ -27,15 +27,35 @@ use windows::Win32::Security::{
     TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MoveFileExW,
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, MOVE_FILE_FLAGS,
 };
 use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, GetExitCodeProcess, GetProcessTimes, OpenProcess,
     OpenProcessToken, OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+
+/// Move `from` to `to` ONLY if `to` does not exist: `MoveFileExW` with no flags, which — unlike `std::fs::rename`,
+/// whose Windows implementation replaces an existing EMPTY directory (it asks for replace-if-exists semantics) —
+/// fails with `ERROR_ALREADY_EXISTS` on any existing entry. A restore that replaced an empty directory would put a
+/// quarantined folder over a name somebody else made, which rule §4 forbids.
+pub(super) fn move_without_replace(from: &Path, to: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let wide =
+        |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: both buffers are NUL-terminated UTF-16 that outlive the call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(from.as_ptr()),
+            PCWSTR(to.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .is_ok()
+}
 
 const READ_CONTROL: u32 = 0x0002_0000;
 const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;

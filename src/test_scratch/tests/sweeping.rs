@@ -187,6 +187,7 @@ fn the_sweep_removes_only_what_a_gone_owner_left_and_lists_the_rest() {
 
     let foreign = format!("{PREFIX}{}-{REPO_TOKEN}-x-abc123", other_owner());
     let foreign_dir = folder(root, &foreign, Some(&gone_claim()));
+    // testsToDelete-exempt: legacy-name — a legacy name the sweep must only list, built at run time
     let legacy = format!("{PREFIX}{REPO_TOKEN}-x-abc123");
     let legacy_dir = folder(root, &legacy, Some("devbox@linux:1\n"));
     let other_token = folder(

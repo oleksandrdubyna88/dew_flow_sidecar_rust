@@ -78,9 +78,24 @@ fn a_scratch_is_claimed_first_beside_itself_and_never_inside() {
         std::fs::read(&claim).expect("the claim"),
         format!("{}\n", format_owner(run_record())).into_bytes()
     );
+    // The record is read through the `mine` seam: whose file it is, is the kernel owner's answer, not this
+    // scenario's subject. On POSIX the real answer is "mine" and is asserted; on Windows an ELEVATED run's new files
+    // belong to BUILTIN\Administrators (measured on windows-latest), so the real check says "not mine" and the claim
+    // reads `Unreadable` — the correct, fail-closed answer, which must agree with `is_mine` itself.
+    assert_eq!(
+        read_claim(scratch.path(), &|_| true),
+        Claim::Owner(run_record().clone())
+    );
+    #[cfg(unix)]
     assert_eq!(
         read_claim(scratch.path(), &is_mine),
         Claim::Owner(run_record().clone())
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        matches!(read_claim(scratch.path(), &is_mine), Claim::Owner(_)),
+        is_mine(&claim),
+        "the real read agrees with the real kernel-owner answer"
     );
     assert_eq!(read_claim(scratch.path(), &|_| false), Claim::Unreadable);
     assert!(
@@ -98,7 +113,7 @@ fn a_scratch_is_claimed_first_beside_itself_and_never_inside() {
     let mut seams = Seams::real();
     seams.create_dir = &mut deny;
     let text = panic_text(|| {
-        TestScratch::new_with(private.path(), "denied", &mut seams);
+        let _never_made = TestScratch::new_with(private.path(), "denied", &mut seams);
     });
     assert!(text.contains("could not create"), "{text}");
     assert_eq!(
@@ -123,7 +138,7 @@ fn a_scratch_is_claimed_first_beside_itself_and_never_inside() {
     seams.write_claim = &mut fail;
     seams.create_dir = &mut create;
     let text = panic_text(|| {
-        TestScratch::new_with(private.path(), "unclaimed", &mut seams);
+        let _never_made = TestScratch::new_with(private.path(), "unclaimed", &mut seams);
     });
     assert!(text.contains("could not claim"), "{text}");
     assert!(!made, "no folder without a claim");
@@ -258,7 +273,7 @@ fn a_taken_claim_draws_again_and_a_squatted_folder_is_never_adopted() {
     seams.ids = &mut ids;
     seams.out = &mut quiet;
     let text = panic_text(|| {
-        TestScratch::new_with(parent, "full", &mut seams);
+        let _never_made = TestScratch::new_with(parent, "full", &mut seams);
     });
     assert!(
         text.contains("full") && text.contains(&parent.display().to_string()),
