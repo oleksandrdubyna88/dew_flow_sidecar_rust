@@ -121,7 +121,7 @@ windows = { version = "0.62.2", features = [
 
 # The POSIX half of the same helper: the real uid (`getuid`, the owner token and the kernel-owner key), the kernel's
 # clock-tick rate from the auxiliary vector (`getauxval(AT_CLKTCK)` — never a guessed 100) and `mkfifo`/`O_NOFOLLOW`
-# for the one safe claim read. Already in the lock at 0.2.186 through tokio and std's own dependencies.
+# for the one safe claim read. Already in the lock (0.2.186) as a dependency of the dependency tree.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 

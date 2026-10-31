@@ -139,8 +139,8 @@ fn sid_bytes(sid: PSID) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), GetLengthSid(sid) as usize) }.to_vec()
 }
 
-fn read_caller_sid() -> Option<Vec<u8>> {
-    let token = caller_token()?;
+/// The user SID of `token` (`TokenUser`), copied out; the token is closed.
+fn user_sid_of(token: HANDLE) -> Option<Vec<u8>> {
     let mut needed = 0u32;
     // SAFETY: the first call reports the size; the buffer is u64-aligned for the TOKEN_USER (it holds a pointer) and
     // lives past the copy of the SID out of it; the token is closed once.
@@ -161,6 +161,18 @@ fn read_caller_sid() -> Option<Vec<u8>> {
         sid
     };
     sid.filter(|bytes| !bytes.is_empty())
+}
+
+fn read_caller_sid() -> Option<Vec<u8>> {
+    user_sid_of(caller_token()?)
+}
+
+/// The PROCESS token's user SID, whatever a thread impersonates: what scenario 20 compares `caller_sid` against.
+pub(crate) fn process_user_sid() -> Option<Vec<u8>> {
+    let mut token = HANDLE::default();
+    // SAFETY: valid out-pointer; the pseudo-handle needs no closing.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
+    user_sid_of(token)
 }
 
 /// The caller's user SID, read once. Empty when it could not be read — which makes every `is_mine` answer `false`.

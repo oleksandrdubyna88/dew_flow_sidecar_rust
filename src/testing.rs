@@ -9,6 +9,10 @@
 use crate::config::Config;
 use crate::engine_cache::RungCache;
 use crate::state::{AppState, Engines};
+// The fixtures below (and the tests that use them) reach the scratch-folder helper through this module. S3 moves the
+// crate's `temp_dir()` sites onto it; until they are moved nothing here uses it.
+#[allow(unused_imports)]
+pub(crate) use crate::test_scratch::TestScratch;
 use crate::tokens::{TokenizerRegistry, TokenizerSource};
 use crate::wedge::{InFlight, Phase, WedgePolicy};
 use crate::wire::ModelEntry;

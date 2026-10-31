@@ -29,7 +29,8 @@ everywhere. The customer's machine builds the flavour it needs.
   `compile_cache` (the MIGraphX cache paths, `CompileWatch` and `CachePathLease`), `bookkeeping`, `canary`,
   `recipes` (test-only: it keeps `build-recipes.json` honest against the manifest),
   `provider`, `vram` (what a build cost on the card, and when that may be attributed to one engine),
-  `logging`, and `testing` (shared test fixtures). Plus `src/adapters.rs` (DXGI device
+  `logging`, `testing` (shared test fixtures) and `test_scratch` (test-only: the named, claimed, `Drop`-removed and
+  swept scratch folder every test-created folder comes from). Plus `src/adapters.rs` (DXGI device
   resolution and the per-process memory sample, Windows-only) and `vendor-fastembed/` (a full vendored
   copy carrying one marked patch).
   Visibility is `pub(crate)` throughout: a binary crate has no external API to narrow.
@@ -306,7 +307,9 @@ A third job checks the plan lifecycle from the shared rules submodule.
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
   `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
 - **No integration test suite** — testing is inline `#[cfg(test)]` beside what each module tests
-  (135 tests), with shared fixtures in `src/testing.rs`.
+  (177 test attributes: 148 beside what each of the other modules tests and 29 in `src/test_scratch/` — 4 of them
+  Windows-only and one an `#[ignore]`d child process the others start), with shared fixtures in `src/testing.rs` and
+  scratch folders from `src/test_scratch.rs`.
 - **No published release artefact yet.** `.github/workflows/release.yml` builds, tests and packages the
   CPU flavour for Windows and Linux on a `v*` tag — with LICENSE, NOTICE, THIRD-PARTY-NOTICES.md and
   build-recipes.json inside every archive — and no tag has been cut, so nothing has been published. Only
