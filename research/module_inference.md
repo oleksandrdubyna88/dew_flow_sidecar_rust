@@ -136,6 +136,44 @@ builds. The scan must find at least one of each. This is the shared rule `common
 here was a 20-test probe at 20 concurrent by default and 8 capped. CI runs the bare commands, because CI is exempt
 and a `.cargo/config.toml` cap would raise its 4 vCPUs to 8.
 
+`tests/test_leftovers.rs` (2026-10-31, `common/test-leftovers.md` section 7) is the structural guard that keeps
+every test-created folder a `TestScratch` (`src/test_scratch.rs`: named `<prefix><owner>-sidecar-<what>-<id>`,
+claimed first by a sibling `.owner`, removed by `Drop` on every unwinding path, swept after a kill on two keys). It
+scans whole files, its own included, from an inventory taken with `git ls-files --cached --others
+--exclude-standard`: Rust, workflows under `.github/workflows/` and the JavaScript family wherever they sit; every
+`target*` directory, `node_modules/`, `vendor-fastembed/` and `.claude/` are skipped FIRST, and no file is excluded by
+name (the list is empty and a test pins it, so the detectors and fixtures are written in pieces and the file holds
+no prefix word, temp API or exemption marker whole). A `.sh`, `.ps1`, `.py` (also `.bash`, `.cmd`, `.bat`) is red
+until the guard reads that language, and so is a scan that finds no `.rs` under `src/`, none under `tests/` or no
+workflow. It refuses the rule's eight classes: `raw-temp` (and the helper's own temp-root accessor used outside the
+helper), `raw-worktree`, `docker-run` (ANY container start: there is none here, and the first one extends the guard
+to the carve-out of section 5), `docker-name`, `legacy-name`, `owner-blind`, `shared-store` and `ryuk-off`, plus
+`exemption` (a malformed `<prefix>exempt:` comment; `ryuk-off` and `owner-blind` take none) and this repository's
+own `dropped-scratch` (`let _ = TestScratch::new(..)`, the destructurings that leave a scratch unbound and
+`drop(TestScratch::new(..))` drop the folder at the end of the statement; a `let`-bound scratch whose block ends with a
+tail expression made from its path drops it at the closing brace while the path escapes). `owner-blind` differs by language: in Rust it takes no binding tracer (owner
+decision 3 of the E4 plan, a documented deviation from section 7's "a bare name in script code"): any spelling of the
+prefix outside the helper's files (`src/test_scratch.rs` and `src/test_scratch/`, EXCEPT its tests,
+`src/test_scratch/tests.rs` and `src/test_scratch/tests/`, which are the helper's callers and get no allowance) that is
+not followed by an owner segment is a finding, the helper's prefix constant included, because a Rust constant is the
+shape a tracer misses. A Rust line is READ, not only matched (`tests/test_leftovers/rustviews.rs`, review round 1):
+`\x..` and `\u{..}` escapes are decoded, a one-character regex class (`[T]`) is the character, and the literals of a
+line are joined (`concat!`, the positional arguments of `format!`, `+`), so the word is found behind them; a literal that
+IS five or more characters of the word, or holds seven, is a fragment and a finding; `/tmp` and `/var/tmp` as literals
+and an environment name built by `concat!` inside `env::var` are `raw-temp`. One file besides the helper is judged
+without the word and temp-in-pieces checks, by exact path and pinned by a test: the guard's own piece-builder,
+`tests/test_leftovers/words.rs`. **The limit, stated plainly: this is still a SPELLING check.** Pieces on different
+lines, a macro that builds the word, an `include_str!` of a file the guard does not scan, a constant from another crate
+can all hide it; the guard narrows the ways to write a raw temp path or a bare prefix by habit or by accident, it does not
+prove a tree clean (`the_limit_of_a_spelling_check_is_pinned` keeps that sentence true). In scripts and
+workflows it is the SHIPPED classifier's verdict (`classifyLines` of the mounted `tools/lib/sweeper-scan.mjs`, run
+through `node` with its path in `argv` and the text on stdin), whose answer is validated against what was sent and
+whose absence or malformation is one unjudged finding, never a clean scan. The token is checked against the mounted
+`## Tokens` table AND against an identity from outside the helper (the crate's package name in `Cargo.toml`), so a
+helper copied verbatim into another repository is red there. The mounted rules are required: `build-test` runs
+`git submodule update --init --depth 1 .claude/rules/shared` on both legs, and a missing mount is a failure naming that
+command.
+
 The wedge guards are tested with a held mutex and an `Instant` moved into the past — no GPU, no clock
 abstraction: a wedged holder is refused within milliseconds and the message names it; a **healthy** cold
 compile is still waited out (the counter-guarantee, and the reason the ceilings are minutes); an

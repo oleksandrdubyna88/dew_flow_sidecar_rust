@@ -273,24 +273,39 @@ mod tests {
             "{denied}"
         );
 
-        let ok = cache_dir_verdict("/var/tmp/mgx", |_| Ok(())).expect("a writable path passes");
-        assert!(ok.contains("/var/tmp/mgx"), "{ok}");
+        let ok = cache_dir_verdict("/srv/cache/mgx", |_| Ok(())).expect("a writable path passes");
+        assert!(ok.contains("/srv/cache/mgx"), "{ok}");
+    }
+
+    /// A scratch tree is the test's own: once the test ends nothing of it remains on disk. (Before the move to
+    /// `TestScratch` the helper pre-cleaned and never cleaned after, so every passing run left a folder behind.)
+    #[test]
+    fn a_seed_scratch_is_gone_once_its_test_ends() {
+        let seed = seed_scratch("gone");
+        let base = seed.scratch.path().to_path_buf();
+        drop(seed);
+
+        assert!(
+            !base.exists(),
+            "the seed scratch outlived its test: {}",
+            base.display()
+        );
     }
 
     /// The whole point: a machine with no ext4 copy gets one automatically, nested layout included —
     /// the HF cache is `models--…/snapshots/<sha>/onnx/…`.
     #[test]
     fn seeding_copies_the_full_tree_to_an_empty_target() {
-        let (from, to) = seed_scratch("full");
-        std::fs::create_dir_all(from.join("m/onnx")).unwrap();
-        std::fs::write(from.join("m/onnx/model.onnx_data"), b"weights").unwrap();
-        std::fs::write(from.join("tokenizer.json"), b"tok").unwrap();
+        let seed = seed_scratch("full");
+        std::fs::create_dir_all(seed.from.join("m/onnx")).unwrap();
+        std::fs::write(seed.from.join("m/onnx/model.onnx_data"), b"weights").unwrap();
+        std::fs::write(seed.from.join("tokenizer.json"), b"tok").unwrap();
 
-        let seeded = copy_missing_files(&from, &to);
+        let seeded = copy_missing_files(&seed.from, &seed.to);
 
         assert_eq!((seeded.files, seeded.bytes), (2, 10));
         assert_eq!(
-            std::fs::read(to.join("m/onnx/model.onnx_data")).unwrap(),
+            std::fs::read(seed.to.join("m/onnx/model.onnx_data")).unwrap(),
             b"weights"
         );
     }
@@ -299,16 +314,16 @@ mod tests {
     /// for a copy tax. The models are immutable HF blobs, so same size = same file.
     #[test]
     fn seeding_skips_files_the_target_already_has() {
-        let (from, to) = seed_scratch("skip");
-        std::fs::write(from.join("model.bin"), b"12345").unwrap();
-        std::fs::create_dir_all(&to).unwrap();
-        std::fs::write(to.join("model.bin"), b"abcde").unwrap(); // same size, already seeded
+        let seed = seed_scratch("skip");
+        std::fs::write(seed.from.join("model.bin"), b"12345").unwrap();
+        std::fs::create_dir_all(&seed.to).unwrap();
+        std::fs::write(seed.to.join("model.bin"), b"abcde").unwrap(); // same size, already seeded
 
-        let seeded = copy_missing_files(&from, &to);
+        let seeded = copy_missing_files(&seed.from, &seed.to);
 
         assert_eq!(seeded.files, 0);
         assert_eq!(
-            std::fs::read(to.join("model.bin")).unwrap(),
+            std::fs::read(seed.to.join("model.bin")).unwrap(),
             b"abcde",
             "a same-size file is never rewritten"
         );
@@ -317,16 +332,16 @@ mod tests {
     /// A size MISMATCH is an interrupted earlier copy and must be repaired, not trusted.
     #[test]
     fn seeding_repairs_a_truncated_earlier_copy() {
-        let (from, to) = seed_scratch("repair");
-        std::fs::write(from.join("model.bin"), b"full-content").unwrap();
-        std::fs::create_dir_all(&to).unwrap();
-        std::fs::write(to.join("model.bin"), b"half").unwrap();
+        let seed = seed_scratch("repair");
+        std::fs::write(seed.from.join("model.bin"), b"full-content").unwrap();
+        std::fs::create_dir_all(&seed.to).unwrap();
+        std::fs::write(seed.to.join("model.bin"), b"half").unwrap();
 
-        let seeded = copy_missing_files(&from, &to);
+        let seeded = copy_missing_files(&seed.from, &seed.to);
 
         assert_eq!(seeded.files, 1);
         assert_eq!(
-            std::fs::read(to.join("model.bin")).unwrap(),
+            std::fs::read(seed.to.join("model.bin")).unwrap(),
             b"full-content"
         );
     }
@@ -334,12 +349,12 @@ mod tests {
     /// A missing seed dir is a quiet no-op — a fresh distro simply downloads from HF as before.
     #[test]
     fn seeding_from_a_missing_dir_copies_nothing() {
-        let (from, to) = seed_scratch("missing");
-        let seeded = copy_missing_files(&from.join("does-not-exist"), &to);
+        let seed = seed_scratch("missing");
+        let seeded = copy_missing_files(&seed.from.join("does-not-exist"), &seed.to);
 
         assert_eq!((seeded.files, seeded.bytes), (0, 0));
         assert!(
-            !to.exists(),
+            !seed.to.exists(),
             "a no-op seed must not create the target either"
         );
     }

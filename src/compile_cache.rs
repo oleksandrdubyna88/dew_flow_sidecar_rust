@@ -369,8 +369,8 @@ mod tests {
     /// stale-cache incident, reopened through a timing gap.
     #[test]
     fn a_concurrent_build_cannot_change_the_cache_path_before_the_first_launch() {
-        let base = std::env::temp_dir().join(format!("mxr-race-{}", std::process::id()));
-        let base = base.to_string_lossy().to_string();
+        let scratch = TestScratch::new("mxr-race");
+        let base = scratch.path().to_string_lossy().to_string();
         let building = Arc::new(Barrier::new(2));
 
         let embed = {
@@ -417,8 +417,6 @@ mod tests {
             engine_cache_dir(&base, RERANK_CACHE_ENGINE, SHAPE),
             "which is what an embed engine used to read at its first launch"
         );
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// The heal path wipes a corrupt compiled program and lets exactly one clean recompile take its
@@ -426,7 +424,8 @@ mod tests {
     /// whichever engine grabbed the variable next.
     #[test]
     fn wiping_a_slice_leaves_it_present_and_empty_and_never_touches_the_other_engine() {
-        let base = std::env::temp_dir().join(format!("mxr-wipe-{}", std::process::id()));
+        let scratch = TestScratch::new("mxr-wipe");
+        let base = scratch.path().to_path_buf();
         write_mb(&slice(&base, EMBED_CACHE_ENGINE).join("corrupt.mxr"), 1);
         write_mb(&slice(&base, RERANK_CACHE_ENGINE).join("healthy.mxr"), 1);
         let base = base.to_string_lossy().to_string();
@@ -450,7 +449,6 @@ mod tests {
         );
 
         drop(cache);
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// MIGraphX compiles and saves LAZILY — on the first pass, not at session build — so the
@@ -495,7 +493,8 @@ mod tests {
     /// megabytes as its own, on the one field that exists to say "a compile happened here".
     #[test]
     fn a_compile_by_one_engine_is_not_reported_as_growth_by_the_other() {
-        let base = std::env::temp_dir().join(format!("mxr-scope-{}", std::process::id()));
+        let scratch = TestScratch::new("mxr-scope");
+        let base = scratch.path().to_path_buf();
         write_mb(&slice(&base, EMBED_CACHE_ENGINE).join("warm.mxr"), 1);
         write_mb(&slice(&base, RERANK_CACHE_ENGINE).join("warm.mxr"), 1);
         let base = base.to_string_lossy().to_string();
@@ -531,8 +530,6 @@ mod tests {
             7,
             "which is what the pass used to measure"
         );
-
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Every non-MIGraphX flavour configures no cache, and must not pay a filesystem walk to learn that.

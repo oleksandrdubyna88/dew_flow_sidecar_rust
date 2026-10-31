@@ -29,7 +29,8 @@ everywhere. The customer's machine builds the flavour it needs.
   `compile_cache` (the MIGraphX cache paths, `CompileWatch` and `CachePathLease`), `bookkeeping`, `canary`,
   `recipes` (test-only: it keeps `build-recipes.json` honest against the manifest),
   `provider`, `vram` (what a build cost on the card, and when that may be attributed to one engine),
-  `logging`, and `testing` (shared test fixtures). Plus `src/adapters.rs` (DXGI device
+  `logging`, `testing` (shared test fixtures) and `test_scratch` (test-only: the named, claimed, `Drop`-removed and
+  swept scratch folder every test-created folder comes from). Plus `src/adapters.rs` (DXGI device
   resolution and the per-process memory sample, Windows-only) and `vendor-fastembed/` (a full vendored
   copy carrying one marked patch).
   Visibility is `pub(crate)` throughout: a binary crate has no external API to narrow.
@@ -306,7 +307,11 @@ A third job checks the plan lifecycle from the shared rules submodule.
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
   `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
 - **No integration test suite** — testing is inline `#[cfg(test)]` beside what each module tests
-  (135 tests), with shared fixtures in `src/testing.rs`.
+  (247 test attributes: 149 inline in the other modules, 47 in `src/test_scratch/` — 9 of them Windows-only and one an
+  `#[ignore]`d child process the others start — and 51 in `tests/`: 2 in `local_cpu_budget.rs` and 49 in the
+  leftovers guard), with shared fixtures in `src/testing.rs`. Every folder a test creates is a `TestScratch` from
+  `src/test_scratch.rs`; `tests/test_leftovers.rs` is the repository-text test that keeps it so (no `std::env::temp_dir()`
+  and no hand-built temp path outside the helper), and reads the mounted shared rules, so `build-test` fetches them.
 - **No published release artefact yet.** `.github/workflows/release.yml` builds, tests and packages the
   CPU flavour for Windows and Linux on a `v*` tag — with LICENSE, NOTICE, THIRD-PARTY-NOTICES.md and
   build-recipes.json inside every archive — and no tag has been cut, so nothing has been published. Only

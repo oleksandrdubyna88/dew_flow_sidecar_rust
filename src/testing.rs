@@ -9,6 +9,9 @@
 use crate::config::Config;
 use crate::engine_cache::RungCache;
 use crate::state::{AppState, Engines};
+// The fixtures below (and the tests that use them) reach the scratch-folder helper through this module: every folder
+// a test of this crate creates is a `TestScratch`, held by a named binding so that it drops LAST.
+pub(crate) use crate::test_scratch::TestScratch;
 use crate::tokens::{TokenizerRegistry, TokenizerSource};
 use crate::wedge::{InFlight, Phase, WedgePolicy};
 use crate::wire::ModelEntry;
@@ -162,14 +165,20 @@ pub(crate) fn cache_of(capacity: usize, rungs: &[(usize, u8)]) -> RungCache<u8> 
     cache
 }
 
-/// A scratch tree for the seeding tests, unique per test so parallel runs never collide.
-pub(crate) fn seed_scratch(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    let base = std::env::temp_dir().join(format!("bge-seed-{name}-{}", std::process::id()));
-    std::fs::remove_dir_all(&base).ok();
-    let from = base.join("from");
-    let to = base.join("to");
+/// A scratch tree for the seeding tests: `from` exists, `to` does not. The VALUE is the tree — dropping it removes
+/// everything — so a caller holds it in a named binding (`let seed = seed_scratch("full");`) for the whole test.
+pub(crate) struct SeedScratch {
+    pub(crate) scratch: TestScratch,
+    pub(crate) from: std::path::PathBuf,
+    pub(crate) to: std::path::PathBuf,
+}
+
+pub(crate) fn seed_scratch(name: &str) -> SeedScratch {
+    let scratch = TestScratch::new(&format!("seed-{name}"));
+    let from = scratch.path().join("from");
+    let to = scratch.path().join("to");
     std::fs::create_dir_all(&from).unwrap();
-    (from, to)
+    SeedScratch { scratch, from, to }
 }
 
 // ---------- the tokenizer registry ----------
@@ -190,16 +199,18 @@ pub(crate) const FIXTURE_TOKENIZER: &[u8] = br#"{
 }"#;
 
 /// A model cache holding that fixture in BGE-M3's HuggingFace snapshot layout — the shape
-/// `find_tokenizer_file` discovers.
-pub(crate) fn model_cache_with_a_tokenizer(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("bge-reg-{tag}-{}", std::process::id()));
-    let snapshot = root
+/// `find_tokenizer_file` discovers. The VALUE is the cache: dropping it removes the folder, so a caller holds it in a
+/// named binding (`let cache = …;`) and reads the path with `cache.path()`.
+pub(crate) fn model_cache_with_a_tokenizer(tag: &str) -> TestScratch {
+    let scratch = TestScratch::new(&format!("reg-{tag}"));
+    let snapshot = scratch
+        .path()
         .join("models--BAAI--bge-m3")
         .join("snapshots")
         .join("deadbeef");
     std::fs::create_dir_all(&snapshot).expect("the fixture cache");
     std::fs::write(snapshot.join("tokenizer.json"), FIXTURE_TOKENIZER).expect("the fixture file");
-    root
+    scratch
 }
 
 // ---------- compile growth is measured per engine ----------

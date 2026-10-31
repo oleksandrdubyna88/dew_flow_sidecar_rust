@@ -37,6 +37,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The tests read the mounted shared rules: the scratch helper's conformance vectors
+      # (`tools/fixtures/owner-vectors.json`) and the leftovers guard (`tests/test_leftovers.rs`: the `## Tokens`
+      # table and the shipped owner-blind classifier). On BOTH legs; a checkout without them fails the tests, it
+      # never skips them. Only that one submodule, the way `contract` and `plans` fetch it.
+      - name: Fetch the shared rules
+        run: git submodule update --init --depth 1 .claude/rules/shared
+
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -51,6 +58,18 @@ jobs:
 
       - name: Test
         run: cargo test --release --locked ${{ matrix.features }}
+
+      # Step 0 of the E4 plan: who owns a file this process just created in the temp root, who is the caller, is
+      # the token elevated. libtest captures a test's output, so the measurement is run ALONE with --nocapture to
+      # land in this log (the test never fails). Git Bash, not pwsh: Actions appends `exit $LASTEXITCODE` to a pwsh
+      # step, and this step's own check — that the measurement printed — must be what decides it.
+      - name: Windows owner of a new temp file (measurement)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --locked ${{ matrix.features }} --bin bge-sidecar -- --nocapture --exact test_scratch::tests::windows_only::the_windows_owner_of_a_new_temp_file_is_printed 2>&1 | tee "$RUNNER_TEMP/step0.log"
+          grep -q "step0: token is elevated" "$RUNNER_TEMP/step0.log"
 
       # ON since 2026-08-19. It was deferred for a reason that had quietly expired: the argument was that
       # reformatting destroys the diff against the sources this crate was carried from — true while the

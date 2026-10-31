@@ -789,10 +789,9 @@ mod tests {
         if !cfg!(feature = "cuda") {
             return; // only the CUDA EP ships separate provider DLLs
         }
-        let empty = std::env::temp_dir().join(format!("bge-preflight-{}", std::process::id()));
-        std::fs::create_dir_all(&empty).expect("temp dir");
+        let scratch = TestScratch::new("preflight");
 
-        let error = preflight_provider("cuda", &empty)
+        let error = preflight_provider("cuda", scratch.path())
             .expect_err("CUDA without its provider DLLs beside the exe cannot serve anything");
         let text = format!("{error:#}");
         assert!(text.contains("onnxruntime_providers_shared.dll"), "{text}");
@@ -800,8 +799,6 @@ mod tests {
             text.contains("EXECUTABLE'S directory"),
             "PATH is not where ORT looks: {text}"
         );
-
-        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]

@@ -1,6 +1,9 @@
 # PLAN — Test leftovers, E4: a `Drop`-owned, claimed, swept scratch folder for this crate's tests
 
-> Status: **plan only, nothing implemented yet; re-split against release `115bbf8`, 2026-10-31; plan-gate round 2 applied the same day.**
+> Status: **IMPLEMENTED, 2026-10-31** (S2, S3 and S4 built on branch `feat/test-leftovers-e4` as the one producer PR, #64;
+> the PR merges only under the merge condition of § *Order*, which this promotion does not change). Re-split against release
+> `115bbf8`, 2026-10-31; plan-gate round 2 applied the same day. What differs from the text below is recorded in
+> § *Deviations*, at the end.
 > Stories of epic E4 of `dew_flow_conventions · todo/PLAN_test_leftovers_rollout.md` (§ *Epics*, E4), rewritten against
 > the released contract (`dew_flow_conventions` branch `release` at `115bbf8`, the merged core) so a coder builds from
 > this document and the mounted rule alone, never from the E1 text. Scope: a new test-only module `src/test_scratch.rs`,
@@ -10,7 +13,7 @@
 > Split by Opus, 2026-10-16; re-split by Fable, 2026-10-31. Not a cornerstone. Models per story below.
 
 **Committed together with this document** (one commit, the shared `common/planning-docs.md` § *A plan split into
-epics and stories*): its row in `todo/README.md` under *Currently open* —
+epics and stories*): its row in `todo/README.md` under *Currently open* (moved to `research/README.md` on promotion) —
 
 ```
 | [PLAN_test_leftovers_E4.md](PLAN_test_leftovers_E4.md) | plan only, re-split against release 115bbf8; the producer PR waits for R6 | test scratch folders: `TestScratch` (owner, claim first, `Drop`, start-of-run sweep), the nine `temp_dir()` sites, the guard |
@@ -963,3 +966,174 @@ The E4 entry is stale against the release; each line below is a correction to ca
     owner is profile AND owner SID (decision 2; `owned.mjs` checks the profile only — F16 in the conventions
     follow-ups), so an elevated run's folders fail closed; and `owner-blind` in Rust source takes no binding tracer
     (decision 3), a deviation from rule §7's "a bare name in script code".
+
+## Deviations
+
+Recorded when the plan was promoted, 2026-10-31. Where the contract and this document differ the contract won; each
+line says what the plan said, what was built and the evidence.
+
+**S2 — the helper (the S2 coder's, commits `d91ba05…7214662`)**
+
+1. *Layout.* The plan said one `src/test_scratch.rs`; the helper is `src/test_scratch.rs` plus `src/test_scratch/{claim,
+   identity,owner,scratch,sweep,win}.rs` and the scenarios in `src/test_scratch/tests/*.rs`, so no file passes 800
+   lines (Rust doctrine §7). The guard's helper allowance is therefore the file AND the folder.
+2. *The host class of the claim grammar.* The plan wrote `[^@:(?-u:\s)]+`, which is not valid regex syntax; the host is
+   an explicit character class anchored `\A…\z`, and vector r-i30 (a host with a Unicode space, read by Node's `\s`)
+   forced the explicit class.
+3. *Sc. 4 uses two `п`*, not one: the byte room under `u1000` and the character count have to differ by enough to
+   cross the 28-byte limit.
+4. *Reasons follow `leftovers-sweep.mjs`.* A stranger's claim on a folder of this owner's name is `foreign-uid`
+   with a `foreign:` line; "foreign host" is the reason text for a claim of another host.
+5. *Quarantine restore for any owner of the token*, as in S (`leftovers-sweep.mjs`), not only this owner's.
+6. *The post-rename identity check does not compare the change time*: a rename updates it (measured on tmpfs). The check
+   before the rename already compared it; the later check is the device, inode and the claim.
+7. *API additions the plan's block did not list:* `Hooks::after_remove`, a third argument of `remove_claim_if_still`,
+   and `TestScratch::claim_id`.
+8. *(Withdrawn in review round 1; the number stays so the others keep theirs.)* The shared vectors file's `verdicts`
+   section was not exercised at first; `the_shared_verdict_vectors_agree` now runs v01-v26 through `owner_state` with a
+   seam probe (item 35 below).
+
+**S2 — corrections found by the first CI run of the draft PR (this commit set)**
+
+9. *Windows restore.* The plan said "a plain `rename`, which refuses an existing directory (sc. 18 asserts it)". It does
+   not: Rust's `std::fs::rename` on Windows replaces an existing EMPTY directory (replace-if-exists semantics, unlike
+   .NET's `Directory.Move`). Sc. 18 failed on `windows-latest` (the folder was restored over somebody's empty directory
+   and then judged `unmarked`) — a safety bug against rule §4 `:185-187`. The Windows restore is now `MoveFileExW` with
+   no flags (`win::move_without_replace`), which refuses any existing entry. Proven by the next `windows-latest` run
+   (not runnable on Linux; type-checked for `x86_64-pc-windows-msvc`).
+10. *Sc. 3 reads the claim through the `mine` seam.* The `windows-latest` runner is elevated and its new files belong to
+    `BUILTIN\Administrators`, so the REAL kernel-owner check says "not mine" and `read_claim` answers `Unreadable` — the
+    measured, correct, fail-closed answer. The scenario asserts the record through the seam, the real read on POSIX, and
+    on Windows that the real read agrees with `is_mine`. No other scenario reads a claim with the real `mine`.
+11. *CI.* `build-test` fetches `.claude/rules/shared` on BOTH legs (the vectors file and the guard read it; the first
+    run failed without it), and the `windows-latest` leg runs Step 0 alone with `--nocapture` in a Git Bash step so its
+    SID and elevation lines reach the log (libtest captured them; a pwsh step would have `exit $LASTEXITCODE`
+    appended, so the step's own check — that the measurement printed — decides it).
+
+**S3**
+
+12. *Sc. 1–3 were written against the old shapes and watched failing* before the move: `bge-seed-gone-<pid>`,
+    `bge-log-<pid>-gone` and `bge-reg-panics-<pid>` still existed. After the move: green, and the 15 tests that
+    leaked on every run leave nothing (no `bge-*` or `mxr-*` folder newer than the run; no `testsToDelete-*-sidecar-*`
+    in the temp root).
+13. *The log "absent" test* (`a_logs_directory_that_does_not_exist_yet_is_not_an_error`) names a root BELOW the empty
+    scratch (`<scratch>/logs`): the scratch folder now exists, and the test is about a root that does not.
+14. *`SeedScratch`* is a struct with `scratch`, `from` and `to` as the plan said; `model_cache_with_a_tokenizer`
+    returns the `TestScratch` itself.
+15. *Not run here:* the `--features cuda` test (`provider.rs`, compile-checked on the CPU leg only; an NVIDIA machine
+    was not available), every `#[cfg(windows)]` scenario (type-checked for the msvc target, run by the next
+    `windows-latest` job), the pre-existing old-form leftovers in the temp root (counted, not removed — D6; the owner's
+    word is needed).
+
+**S4**
+
+16. *Layout.* `tests/test_leftovers.rs` is the target (the name the plan gives) and its parts sit in
+    `tests/test_leftovers/*.rs` through `#[path]` (a test target's root file looks for children beside itself). The
+    guard scans every one of them like any other file.
+17. *`owner-blind` in scripts and workflows is the SHIPPED classifier, not a port.* The plan asked for its semantics;
+    the guard runs `classifyLines` of the mounted `tools/lib/sweeper-scan.mjs` through `node` (the module path in
+    `argv`, the files' text on stdin, a constant driver source — nothing interpolated). The answer is validated: it must
+    parse and every finding must name a file that was sent and a line in `1..=count`; node missing, a crash, an
+    out-of-range or malformed reply or a missing mount is ONE unjudged `owner-blind` finding (fail closed). A file whose
+    text holds no prefix word is not sent (the classifier answers nothing for it by its first line), and with none
+    that does node is not started. Both CI legs have node. Lessons carried over from the C# port of the same guard.
+18. *`owner-blind` in Rust is wider than "a bare-prefix literal":* ANY spelling of the prefix word outside the helper's
+    files not followed by an owner segment (globs, `^…[-_]` regexes, `"word" + "-"`, `format!` interpolation, a bare
+    word), AND the helper's prefix constant, AND — as `raw-temp` — the helper's temp-root accessor used outside the
+    helper (`create_dir(<accessor>().join("x"))` is a raw-temp bypass). `{PREFIX}{REPO_TOKEN}`-style builds are
+    `legacy-name`. Allowed: the owner form, the `exempt`/`quarantine` words, the `.owner` label key and an
+    upper-case `TESTSTODELETE_*` environment name. *Corrected in review round 1:* (a) "the helper's files" are
+    `src/test_scratch.rs` and `src/test_scratch/` WITHOUT `src/test_scratch/tests.rs` and `src/test_scratch/tests/` —
+    the helper's tests are its callers, and a first version let one of them make an unprefixed file in the raw temp
+    root; (b) a line is READ, not only matched (item 26): escapes, one-character classes and joined pieces are decoded
+    first, and a literal fragment of the word is a finding; (c) the second allowance is one pinned file,
+    `tests/test_leftovers/words.rs`; (d) the guard is still a SPELLING check — pieces on different lines, a macro, an
+    `include_str!` of a file it does not scan can hide the word.
+19. *`dropped-scratch` is wider than the two shapes in the plan and takes no exemption:* also a bare
+    `TestScratch::new(..);` statement, `TestScratch::new(..).path()` (a temporary), and a `SeedScratch { .. }` destructuring that does
+    not bind `scratch`. Three S2 scenarios that call a constructor expected to panic inside `catch_unwind` now bind the
+    value (`let _never_made = …`), and the one legacy name the sweep scenario builds at run time carries a
+    `legacy-name` exemption.
+20. *The token's identity comes from outside the helper.* The plan compared the helper's `REPO_TOKEN`/`REPO_ROW` with
+    the table; a helper copied verbatim into another repository carries both, so that check passes there. The guard also
+    maps the crate's package name in `Cargo.toml` (`bge-sidecar`) to the one token and row it may hold (`KNOWN`);
+    another package is red.
+21. *Smaller extensions of the detectors:* `raw-temp` also reads `var("TMPDIR")` without `env::`, a bare `temp_dir`, `env::temp_dir` as a path and
+    `tempfile::`, `["']mktemp` in Rust/JS; `docker-run` also a quoted
+    `"docker"` literal and `docker-compose`; `shared-store` also `deleteMany({})` and passes a `DROP`/`TRUNCATE` against a
+    name of the owner form; unread languages also `.bash`, `.cmd`, `.bat`; the JavaScript family also `.mts`, `.cts`,
+    `.tsx`, `.jsx`.
+22. *Sc. 2 is several tests* (one per concern) rather than one; the fixtures are the mutation oracle. Sc. 6 (the
+    break-its on the real tree) was done by hand and is recorded below, not a test (a planted violation in CI is a
+    permanent defect the family forbids).
+23. *Evidence.* Sc. 1 over the unmigrated tree: exactly nine `raw-temp` findings (`compile_cache.rs:372/429/498`,
+    `log_segments.rs:204`, `provider.rs:792`, `testing.rs:171/199`, `tokens.rs:248/264`), nothing in the guard's own
+    files and no `legacy-name`/`owner-blind` in the helper; after S3: zero. Every detector (48) replaced in turn by a
+    never-matching pattern is killed by a fixture, and 9 wiring/logic mutants likewise. Break-its on the real tree: a
+    raw temp call added to a test module and written whole in the guard's own file → red naming `file:line`; a legacy
+    literal in `src/tokens.rs` → `legacy-name` and `owner-blind`, an exemption above clears only the first; an empty
+    `scripts/x.sh` → the unread-language sentence; the mount moved aside → the submodule sentence; each reverted →
+    green. The scanned inventory (54 files) equals `git ls-files --cached --others --exclude-standard` filtered by the
+    same extensions.
+24. *Promotion.* The Definition of Done said the plan becomes `E4 shipped, <date>; promotes with its parent` and is
+    never *implemented* while in `todo/`. It was promoted to `research/` with the producer PR on the lead's
+    instruction, with the parent's E4 entry to carry the same sentence when the PR merges.
+
+**Review round 1 (E4), 2026-10-31 — what the first review of the producer PR changed**
+
+One line per fix; the contract (`common/test-leftovers.md`, `tools/lib/owned.mjs`, `leftovers-sweep.mjs`,
+`tools/janitor.sh`, `tools/fixtures/owner-vectors.json` at the pinned mount) won every disagreement. Every fix was
+watched failing first, except where its line says otherwise; the Windows lines are compiled for
+`x86_64-pc-windows-msvc` and run by the next `windows-latest` job only.
+
+25. *Quarantine suffix is hex.* `quarantine_path` drew `[a-z0-9]` (2 of 1000 names matched the `[0-9a-f]+` of its own
+    pattern, rule §4, `leftovers-sweep.mjs` and `janitor.sh`); it draws 4 random bytes as 8 lower-case hex characters
+    (`random_hex`). Sc. 18 gains the producer's real name over 5000 draws and a sweep killed after its rename.
+26. *The guard reads literals.* Three of twelve planted spellings were caught. `rustviews.rs` decodes escapes, spells a
+    one-character class as the character and joins the pieces of `concat!`/`format!`/`+`; `bypass.rs` judges the
+    decoded line, the joined pieces, literal fragments of the word (a whole literal of 5+ characters of it, or any
+    literal holding 7), `/tmp` and `/var/tmp` literals, `concat!` inside `env::var`/`var_os`, `drop(<constructor>(..))`
+    and a block whose tail is made from the path of the scratch it just bound. `bypass_fixtures.rs` plants every shape,
+    built from the pieces of `words.rs`; with the reading switched off five of its six tests are red. Limit: a spelling
+    check (item 18d). Three tests used `/tmp` or `/var/tmp` as text and one dropped a scratch at a block's end on
+    purpose; they changed text and an explicit `drop`.
+27. *The rename into quarantine never replaces.* `std::fs::rename` replaces an existing EMPTY directory on POSIX and on
+    Windows. New `rename.rs::move_without_replace`: `renameat2(RENAME_NOREPLACE)` by the raw system call on Linux; on
+    `EINVAL`/`ENOSYS` (a file system that does not know the flag) the name is RESERVED with an exclusive `mkdir` and the
+    folder renamed over that placeholder of our own, which is removed again only while it is still the directory
+    that call made (this is the choice for the no-flag case: a reservation, not a link); `MoveFileExW` with no flags on
+    Windows. A collision draws a new name (five draws). The restore uses the same move. `Hooks::quarantine_name` is the
+    seam; the test pre-creates an empty directory at the drawn name and finds it, the same one, afterwards.
+28. *`win::caller_sid` is read per call* (it was a process-wide `OnceLock`, so the first thread decided for all):
+    thread token first, process token on `ERROR_NO_TOKEN`. Windows test: a thread impersonating the anonymous logon
+    answers `S-1-5-7` while its neighbours stay the process user.
+29. *`ClaimPending`.* The squatter path set `Released` even when taking the claim back failed. It leaves
+    `ClaimPending`, whose `Drop` retries; every claim removal (the `Claimed` state's too) is the five tries 100 ms apart.
+30. *The quarantine pass applies `owner_state`'s pid checks* (0, a leading zero, past 2^53, Windows' pid 1, a Windows pid
+    past `u32::MAX`) before it probes: `pid_is_askable`, shared with `owner_state`.
+31. *Windows: one handle.* `is_mine` resolves the profile test with `GetFinalPathNameByHandleW` on the handle that was
+    judged (no second open by `canonicalize`); identity is `FILE_ID_INFO` (128 bits: ReFS, Dev Drive), not `nFileIndex`;
+    `read_limited` compares the opened handle's identity with the expected one (it ignored it) and requires
+    `GetFileType == FILE_TYPE_DISK` and neither a directory nor a reparse point before any read.
+32. *POSIX `read_limited`.* The `fstat` of the opened handle (`S_ISREG`, the expected device and inode) was already
+    there and untested; it is tested now (a swapped file, a FIFO that must not block) and the test fails without it.
+33. *`remove_claim_if_still` compares the whole identity* (device, inode, change time) between its read and its unlink.
+34. *The helper's tests are not the helper* (item 18a): Step 0 makes its probe file inside `TestScratch::new("step0")`.
+35. *The `verdicts` section runs* (replaces item 8): v01-v26 through `owner_state`, for a Linux and a Windows reader;
+    three mutants (pid 0 askable, Windows pid 1 askable, the 2 s tolerance widened) each turn it red. It passed at once.
+36. *Windows tests.* Scenario 20 asserts the helper against `measure_owner` (Step 0's own token, handle and
+    `GetSecurityInfo`, SIDs compared as strings), not `owner_sid_of`/`sid_equal` again; the POSITIVE real-SID case (the
+    owner of a folder and its claim set to the caller's user SID, then the real `is_mine` is true and the sweep removes
+    a dead owner's folder); a `share_mode(0)` file inside a folder refuses the rename (kept `could not remove`, nothing
+    moved) and the next sweep removes it; a 128-bit identity and final-path test; a junction is never mine; the
+    dead-pid pick repeats once with fresh ToolHelp snapshots.
+37. *The orphan-claim pass skips a claim whose folder sits in a quarantine* (a sibling quarantine in the listing, or a
+    `quarantine-conflict` of this sweep): kept `quarantined`. A killed sweep's claim was removed as an orphan's.
+38. *One listing.* The root is listed once and the three passes share the snapshot (a restore updates it; every
+    candidate is still re-checked with its own `symlink_metadata`); an entry this sweep removed is skipped, not an
+    `errors` entry.
+39. *`check_what`'s message* says "multi-byte characters count by bytes" (with the character count) when the two differ.
+
+**Review round 2 (E4), 2026-10-31**
+
+40. *Review round 2: 3 small fixes; 5 findings rejected with reasons in the gate record.* The sweep's passes hold the one snapshot by handle instead of cloning it; the claim-removal stderr line says it is not fatal and that the next run's sweep collects it; the quarantine suffix and `random_id` share one random-bytes helper.

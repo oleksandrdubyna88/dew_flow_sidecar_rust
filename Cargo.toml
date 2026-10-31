@@ -99,6 +99,31 @@ migraphx = ["ort/migraphx", "ort/load-dynamic", "dep:libloading"]
 # body limit is a LAYER, so nothing below the router can prove it is applied.
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# The owner-record grammar of `src/test_scratch.rs` is ONE anchored pattern (`\A..\z`, digits `[0-9]`, the host class
+# of the family's whitespace) and the guard test reads source text with the same crate. Already in the lock at 1.13.1
+# through the dependency tree: this adds an edge, not a package.
+regex = "1"
+
+# `src/test_scratch.rs` (the test-only scratch-folder helper, `common/test-leftovers.md`) asks Windows who owns a
+# file, which process lives, and what the caller's SID is — read through the same `windows` crate the product links for
+# DXGI, so the lock gains only features, never a package. A `[target.'cfg(windows)'.dev-dependencies]` entry keeps
+# these features out of a release build (resolver 2 does not unify dev-dependency features into it).
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
+# The POSIX half of the same helper: the real uid (`getuid`, the owner token and the kernel-owner key), the kernel's
+# clock-tick rate from the auxiliary vector (`getauxval(AT_CLKTCK)` — never a guessed 100) and `mkfifo`/`O_NOFOLLOW`
+# for the one safe claim read. Already in the lock (0.2.186) as a dependency of the dependency tree.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = true
