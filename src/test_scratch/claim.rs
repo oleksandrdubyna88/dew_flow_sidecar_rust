@@ -123,7 +123,12 @@ pub(crate) fn write_claim_exclusive(claim: &Path, bytes: &[u8]) -> io::Result<()
 /// One attempt to remove the claim: only while it still holds exactly `written` and, when `captured` is the identity
 /// the claim had right after this run wrote it, only while the file at the path is STILL that file. A claim that is
 /// not ours any more (another text, another file, gone) is `Ok`: there is nothing of ours to remove.
-fn remove_claim_once(claim: &Path, written: &[u8], captured: Option<FileId>) -> io::Result<()> {
+fn remove_claim_once(
+    claim: &Path,
+    written: &[u8],
+    captured: Option<FileId>,
+    between: &mut dyn FnMut(),
+) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(claim)?;
     if !meta.is_file() {
         return Ok(());
@@ -132,10 +137,11 @@ fn remove_claim_once(claim: &Path, written: &[u8], captured: Option<FileId>) -> 
     if read_limited(claim, &meta)? != written {
         return Ok(());
     }
-    // The same file we read (and, when known, the file this run wrote), not a claim swapped in since.
+    between(); // a seam: what happens between the read and the unlink
+               // The same file we read (and, when known, the file this run wrote), not a claim swapped in since.
     let now = file_id(claim);
     let ours = match (before, now) {
-        (Some(before), Some(now)) => before.same_inode(&now) && captured.is_none_or(|id| id == now),
+        (Some(before), Some(now)) => before == now && captured.is_none_or(|id| id == now),
         _ => false,
     };
     if ours {
@@ -152,10 +158,20 @@ fn remove_claim_once(claim: &Path, written: &[u8], captured: Option<FileId>) -> 
 /// remove, `false` after ONE stderr line when it gave up — the claim stays for the sweep, and the caller decides
 /// whether to try again.
 pub(crate) fn remove_claim_if_still(dir: &Path, written: &[u8], captured: Option<FileId>) -> bool {
+    remove_claim_with_hook(dir, written, captured, &mut || {})
+}
+
+/// `remove_claim_if_still` with a seam that runs between the read of the claim and the comparison of its identity.
+pub(crate) fn remove_claim_with_hook(
+    dir: &Path,
+    written: &[u8],
+    captured: Option<FileId>,
+    between: &mut dyn FnMut(),
+) -> bool {
     let claim = claim_path(dir);
     match remove_with_retries(
         &claim,
-        |claim| remove_claim_once(claim, written, captured),
+        |claim| remove_claim_once(claim, written, captured, between),
         |_| {},
     ) {
         Ok(()) => true,

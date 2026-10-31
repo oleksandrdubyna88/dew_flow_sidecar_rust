@@ -455,6 +455,39 @@ fn a_claim_with_the_same_text_but_another_identity_is_not_ours_to_remove() {
     assert!(swapped.is_file());
 }
 
+/// Review round 1: between the read of the claim and its unlink the file is compared by its WHOLE identity (device,
+/// inode, change time), not by the inode alone — a file re-written or re-moded in that instant has the same inode
+/// number and the same bytes, and is no longer the file that was read.
+#[cfg(unix)]
+#[test]
+fn a_claim_changed_between_the_read_and_the_unlink_is_not_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    let private = TestScratch::new("ctime-parent");
+    let dir = private.path().join(name_with("ctime", "a"));
+    let claim = claim_path(&dir);
+    let text = b"the bytes this run wrote\n";
+    write_claim_exclusive(&claim, text).unwrap();
+    // The change-time moves, the inode and the bytes do not.
+    let mut touch = || {
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::set_permissions(&claim, std::fs::Permissions::from_mode(0o640)).unwrap();
+    };
+    assert!(remove_claim_with_hook(&dir, text, None, &mut touch));
+    assert!(
+        claim.is_file(),
+        "a claim touched between the read and the unlink stays"
+    );
+
+    // Untouched, the same call removes it.
+    assert!(remove_claim_with_hook(
+        &dir,
+        text,
+        file_id(&claim),
+        &mut || {}
+    ));
+    assert!(!claim.exists());
+}
+
 #[test]
 fn siblings_sharing_one_run_record_never_remove_each_others_folders() {
     let private = TestScratch::new("shared-run");
