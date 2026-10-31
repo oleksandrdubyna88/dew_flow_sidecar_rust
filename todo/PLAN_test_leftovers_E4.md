@@ -1,6 +1,6 @@
 # PLAN — Test leftovers, E4: a `Drop`-owned, claimed, swept scratch folder for this crate's tests
 
-> Status: **plan only, nothing implemented yet; re-split against release `115bbf8`, 2026-10-31.**
+> Status: **plan only, nothing implemented yet; re-split against release `115bbf8`, 2026-10-31; plan-gate round 2 applied the same day.**
 > Stories of epic E4 of `dew_flow_conventions · todo/PLAN_test_leftovers_rollout.md` (§ *Epics*, E4), rewritten against
 > the released contract (`dew_flow_conventions` branch `release` at `115bbf8`, the merged core) so a coder builds from
 > this document and the mounted rule alone, never from the E1 text. Scope: a new test-only module `src/test_scratch.rs`,
@@ -98,7 +98,8 @@ bound by:
 - **`testing.rs` is `#![cfg(test)]` (`:7`)** and is pulled into 11 test modules by `use crate::testing::*` (or
   `::app_state`); `main.rs:40-59` declares every module, `mod testing;` at `:55`. This is a binary crate — a test in
   `tests/` cannot reach `crate::testing`.
-- **Tests and CI.** 147 `#[test]`/`#[tokio::test]` attributes in `src/` and `tests/`, none `#[ignore]`. CI
+- **Tests and CI.** 148 test attributes in `src/` and `tests/` (135 `#[test]`, 13 `#[tokio::test]`, one of them
+  `flavor = "multi_thread"`), none `#[ignore]`. CI
   (`ci.yml`): `build-test` runs `cargo test --release --locked` with `--no-default-features` on ubuntu (cpu) and the
   default `dml` feature on windows; neither leg fetches `.claude/rules/shared` — only `contract` and `plans` do.
   Required checks (`.github/branch-protection.json`): `ubuntu-latest (cpu)`, `windows-latest (dml)`, `contract`,
@@ -139,7 +140,9 @@ grows one. Recorded as a deviation from the parent.
 - `<what>`: non-empty, no `/`, `\`, NUL or control character, not starting with `-`, spaces and non-ASCII allowed. The
   room is DERIVED, never a constant: `63 − len("testsToDelete-") − len(owner) − 1 − len("sidecar") − 1 − 1 − 6` =
   `33 − len(owner)` — 28 under `u1000`, 22 under `w` + ten digits (O:132); a longer `what` panics before anything
-  exists. The longest `what` S3 uses is `reg-cold-engine` (15).
+  exists. The unit is BYTES (`str::len`), stricter than the rule's "characters" for non-ASCII (`unicode пробел` is 14
+  characters, 20 bytes) and never laxer than any reader — a deviation, recorded here. The longest `what` S3 uses is
+  `reg-cold-engine` (15).
 - `<id>`: 6 characters of `[A-Za-z0-9]` from a `std::collections::hash_map::RandomState` hasher fed a per-process
   counter and the clock (std seeds `RandomState` from the OS); a taken claim or a squatted folder draws again, at most
   **3** draws (O:53), then panics naming `what` and the parent. *Loses:* `tempfile` (its `TempDir` removes once,
@@ -158,55 +161,68 @@ grows one. Recorded as a deviation from the parent.
 | `<os>` | `linux` | `windows` | — |
 | start (integer Unix seconds UTC) | `floor(btime + field22 / CLK_TCK)` — field 22 of `/proc/self/stat` after the LAST `)`, `btime` from `/proc/stat`, `CLK_TCK` = `libc::getauxval(libc::AT_CLKTCK)` read once (0 or any read failure → NO start and NO ns; never a guessed 100; O:274-299) | `GetProcessTimes` creation `FILETIME` → `(ft − 116444736000000000) / 10⁷` (rule §3 `:117`, "a native process API") | — |
 | ns | the decimal inode of `/proc/self/ns/pid` (`pid:[N]`), written ONLY together with a start (O:310-319, 377-382) | none | — |
-| liveness probe | `/proc/<pid>` exists → alive (+ its start); absent → **gone** — unless `/proc/1` is absent (`hidepid`, O:345-347) → unknown; a read refused (`EACCES`) → unknown | `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`: `ERROR_INVALID_PARAMETER` → **gone**; any other failure → unknown; opened → `GetExitCodeProcess` ≠ `STILL_ACTIVE` → **gone**, else alive (+ start); the handle is always closed | — |
-| kernel owner, `is_mine(path)` | `symlink_metadata(path).uid() == getuid()` (the entry itself, a link never followed) | decision 2: `canonicalize(path)` inside `canonicalize(%USERPROFILE%)` compared case-insensitively by component, AND the entry's owner SID (`GetNamedSecurityInfoW(path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION)`, freed with `LocalFree`) `EqualSid` the caller's (`OpenProcessToken` → `GetTokenInformation(TokenUser)`, once); any failure → `false` | — |
+| liveness probe | `/proc/<pid>/stat` read → alive (+ its start); `NotFound` → **gone** — unless `/proc/1` is absent (`hidepid`, O:345-347) → unknown; ANY other error (`EACCES`, `EINVAL`, a text that does not parse) → unknown | a pid above `u32::MAX` → unknown, never truncated; `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`: `ERROR_INVALID_PARAMETER` → **gone**; any other failure → unknown; opened → `GetExitCodeProcess` ≠ `STILL_ACTIVE` → **gone**, else alive (+ start); the handle is always closed | — |
+| kernel owner, `is_mine(path)` | `symlink_metadata(path)`: a directory or a regular file — never a link — whose `uid()` is `getuid()` | decision 2, on ONE handle: the entry opened with `OpenOptions::custom_flags(FILE_FLAG_OPEN_REPARSE_POINT \| FILE_FLAG_BACKUP_SEMANTICS)` (a junction or symlink is opened ITSELF, never followed); `GetFileInformationByHandle` carrying `FILE_ATTRIBUTE_REPARSE_POINT` → `false`; the resolved path (`canonicalize`) inside the resolved `%USERPROFILE%`, compared case-insensitively by component, AND the owner SID from `GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION)` (freed with `LocalFree`) `EqualSid` the caller's SID — read once, from the THREAD token first (`OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true)`, an impersonating thread is the caller) and from `OpenProcessToken` only on `ERROR_NO_TOKEN`, then `GetTokenInformation(TokenUser)`; any failure → `false` | — |
 
 - **`TESTSTODELETE_RUN`** (rule §3 `:112-114`; O:426-435): set and non-empty, it is the record every claim carries —
   but only when it parses, its owner is this process's token and `owner_state` with the REAL probe says `live`;
   anything else writes one warning line and uses this process's own record (a stale value would make every claim
-  dead at birth).
-- **Reading a claim** (O:470-491): `symlink_metadata` → a regular file only (a FIFO would block for ever); not
-  `is_mine` → `Unreadable` (a stranger's claim is no evidence); at most 513 bytes read; more than 512 → `Unreadable`;
-  one trailing `\r?\n` stripped; then the grammar
-  `^([uw][0-9]{1,10}):([^@:\s]+@(linux|macos|windows)):(\d+)(?::(\d+)(?::(\d+))?)?$` (O:57) — a second line, a lone
-  `\r`, `added with --lock`, `devbox@linux:4711:1792053744` (no owner segment) are `Unreadable`. A number written with
-  a leading zero is read and marked non-canonical (O:389-405); a number that does not fit `u64` is read as "no process
-  can have it".
-- **`owner_state`, rule §3's order exactly** (`:142-153`; O:531-552), given the claim, the name's owner segment and
-  `is_mine`: `Unmarked`/`Unreadable` → unknown; non-canonical → unknown; record owner ≠ caller's token → unknown; name
-  owner ≠ record owner → unknown; not `is_mine` → unknown; `<host>@<os>` ≠ this machine's (case-insensitive) →
-  unknown; on a Linux reader, no `ns` or another `ns` → unknown; pid 0 or past 2⁵³ → unknown; `@windows` with pid 1 →
-  unknown; probe `Gone` → **gone** (the only gone) — unless `hidepid` → unknown; probe `Unknown` → unknown; alive with
-  a start missing on either side → live; |Δstart| ≤ **2 s** → live; else → unknown, never gone.
-- The Windows calls need six features of the `windows` crate already in the lock, in a
+  dead at birth). `run_record_from(given, probe)` is the pure form; `run_record()` calls it once with the
+  environment and the real probe.
+- **Reading a claim** (O:470-491), `read_claim(dir, mine)` with the kernel-owner question as a seam (O:470 takes it the
+  same way): `symlink_metadata` → a regular file only (a FIFO would block for ever); not `mine` → `Unreadable` (a
+  stranger's claim is no evidence); at most 513 bytes read; more than 512 → `Unreadable`; one trailing `\r?\n`
+  stripped; then the grammar
+  `^([uw][0-9]{1,10}):([^@:(?-u:\s)]+@(linux|macos|windows)):([0-9]+)(?::([0-9]+)(?::([0-9]+))?)?$` (O:57) — written
+  with `[0-9]` and `(?-u:\s)` because Rust's `\d` and `\s` are Unicode classes: `u1000:h@linux:١٢` (vector r-i25) must
+  be `Unreadable`. A second line, a lone `\r`, `added with --lock`, `devbox@linux:4711:1792053744` (no owner segment)
+  are `Unreadable`. A number written with a leading zero is read and marked non-canonical (O:389-405); a number that
+  does not fit `u64` is read as "no process can have it".
+- **`owner_state`, rule §3's order exactly** (`:142-153`; O:531-552), given the claim, the name's owner segment,
+  `mine` and `Facts { hidepid }`: `Unmarked`/`Unreadable` → unknown; non-canonical → unknown; record owner ≠ caller's
+  token → unknown; name owner ≠ record owner → unknown; not `mine` → unknown; `<host>@<os>` ≠ this machine's
+  (case-insensitive) → unknown; on a Linux reader, the record without `ns`, with another `ns`, or the READER's own
+  `ns` unreadable → unknown; pid 0 or past 2⁵³ → unknown; `@windows` with pid 1 → unknown; probe `Gone` → **gone**
+  (the only gone) — unless `hidepid` → unknown; probe `Unknown` → unknown; alive with a start missing on either side →
+  live; |Δstart| ≤ **2 s** → live; else → unknown, never gone.
+- The Windows calls need seven features of the `windows` crate already in the lock, in a
   `[target.'cfg(windows)'.dev-dependencies]` block — `windows = { version = "0.62.2", features = ["Win32_Foundation",
   "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading",
-  "Win32_System_SystemInformation"] }` — with a comment saying why (doctrine §8); resolver 2 keeps dev-dependency
-  features out of a release build. Linux needs `[target.'cfg(unix)'.dev-dependencies] libc = "0.2"` (`getuid`,
-  `getauxval`; in the lock at 0.2.186). The Win32 names above were confirmed in the `windows-rs` 0.62 sources on
-  2026-10-31 (a feature is its module path); the coder re-confirms each name, and `libc::AT_CLKTCK`, against the
-  locked crates before writing and records them in the PR. *Loses:* `sysconf(_SC_CLK_TCK)` (on musl a constant 100 — the guess the rule
-  forbids; glibc answers it from `AT_CLKTCK` anyway); a profile-only `is_mine` on Windows (decision 2); `sysinfo`.
+  "Win32_System_SystemInformation", "Win32_System_Diagnostics_ToolHelp"] }` — with a comment saying why (doctrine §8);
+  resolver 2 keeps dev-dependency features out of a release build. Linux needs
+  `[target.'cfg(unix)'.dev-dependencies] libc = "0.2"` (`getuid`, `getauxval`; in the lock at 0.2.186). The Win32
+  names were confirmed in the `windows-rs` 0.62 sources on 2026-10-31 (a feature is its module path); the coder
+  re-confirms each name, and `libc::AT_CLKTCK`, against the locked crates before writing and records them in the PR.
+  *Loses:* `sysconf(_SC_CLK_TCK)` (on musl a constant 100 — the guess the rule forbids; glibc answers it from
+  `AT_CLKTCK` anyway); a profile-only `is_mine` on Windows (decision 2); `sysinfo`.
 - A pid that is a THREAD id on Linux or a zombie reads alive → `live` or `unknown`: the safe direction. A Windows
-  process that exited with code 259 reads alive: preserved.
+  process that exited with code 259 reads alive: preserved. An elevated Windows shell's new files are expected to be
+  owned by `BUILTIN\Administrators` (`S-1-5-32-544`), not the account — UNVERIFIED (the conventions record
+  `research/security/test-leftovers-merged-core.md` § *Not verified*), so S2 measures it before any helper code and
+  one scenario asserts whatever was measured.
 
-**D4 — Creation and teardown: claim → register → create** (rule §2; O:612-646). `TestScratch::new_in(parent, what)`:
-validate `what` (a panic before anything exists) → draw an id → write `<folder>.owner` with `create_new(true)`
-holding `format_owner(run_record()) + "\n"` — `AlreadyExists` is somebody else's name, draw again; any other error
-panics (`could not claim`) → construct the `TestScratch` value at once (its `Drop` is "the cleanup registered as the
-very next statement"; `made_folder = false`) → `create_dir(folder)`, never `create_dir_all` (a create that succeeds on
-an existing folder) — `AlreadyExists` is a SQUATTER: one warning line naming it, the claim is removed ONLY while it
-still holds exactly the bytes this run wrote (`remove_claim_if_still`, O:444-451), the folder is never adopted and
-never removed, draw again; any other error panics and the unwinding `Drop` removes the claim. So nothing the helper
-made ever exists unclaimed, and an **unmarked** folder of the owner form is nobody's the helper knows (D5 lists it).
-`Drop` calls `teardown(&path, &mut std::io::stderr())` when the folder was made, else removes only the claim:
+**D4 — Creation and teardown: claim → register → create** (rule §2; O:612-646). `TestScratch { path, written: Vec<u8>,
+state: Claimed | Made | Released }`. `TestScratch::new_in(parent, what)`: validate `what` (a panic before anything
+exists) → draw an id → write `<folder>.owner` with `create_new(true)` holding `format_owner(run_record()) + "\n"`,
+kept as `written` — `AlreadyExists` is somebody else's name, draw again; any other error panics (`could not claim`)
+→ construct the value at once in state `Claimed` (its `Drop` is "the cleanup registered as the very next statement")
+→ `create_dir(folder)`, never `create_dir_all` (a create that succeeds on an existing folder) — success → `Made`;
+`AlreadyExists` is a SQUATTER: one warning line naming it, `remove_claim_if_still(&path, &written)` removes the claim
+ONLY while it still holds exactly our bytes (O:444-451; O:638 sets `made.claimed = false` for the same reason), the
+value goes to `Released` and its `Drop` then touches nothing, the folder is never adopted and never removed, draw
+again; any other error panics and the unwinding `Drop` of a `Claimed` value removes the claim — again only while it
+still holds `written`. So nothing the helper made ever exists unclaimed, and an **unmarked** folder of the owner form
+is nobody's the helper knows (D5 lists it). `Drop`: `Made` → `teardown(&path, &mut std::io::stderr())`; `Claimed` →
+`remove_claim_if_still`; `Released` → nothing. Teardown is by the exact path the helper itself made and needs no
+`is_mine`: the kernel-owner key is a sweep's and a claim reader's question, never a remover's of its own folder.
 
 1. `remove_dir_all` the folder, up to **5 tries, 100 ms apart**; `NotFound` is success (`tokens.rs:337` removes its
    folder on purpose);
 2. only when the folder is gone, remove `<folder>.owner` (same retries, `NotFound` success);
 3. on giving up: return, after writing ONE line `test_scratch: could not remove <path> (<error>) — left for the
-   start-of-run sweep` — through `std::io::stderr()` directly, because libtest captures `eprintln!` and shows it only
-   for a FAILED test, while a teardown that gives up usually does so in a passing one;
+   start-of-run sweep` — through `std::io::stderr().lock()` as ONE `write_all`, so eight test threads never
+   interleave half-lines, and directly, because libtest captures `eprintln!` and shows it only for a FAILED test,
+   while a teardown that gives up usually does so in a passing one;
 4. never panic, never `unwrap` — a panic in `Drop` during unwinding aborts the process (rule §2).
 
 The folder goes first and its claim last, so a leftover is always prefixed AND claimed. `TestScratch` is the FIRST
@@ -216,13 +232,25 @@ an open file) — locals drop in reverse order of declaration.
 **D5 — The start-of-run sweep: scope selects, liveness authorises, uncertainty preserves** (rule §4; S). There is no
 `globalSetup` in libtest, so the sweep runs from "a fixture's constructor": the first `TestScratch` constructor in a
 test process calls it through a `std::sync::Once`, before claiming its own name. `sweep(root, now, min_age, probe,
-mine) -> SweepReport` is pure apart from the file system it is handed; it lists `temp_root()` ONCE per pass and runs
-three passes, each failure one `errors` entry and the next pass still runs (S:421-453):
+mine, hooks) -> SweepReport` is pure apart from the file system it is handed; it lists `temp_root()` ONCE per pass
+and runs three passes, each failure one `errors` entry and the next pass still runs (S:421-453). **A candidate is a
+real directory:** an entry whose `symlink_metadata` says directory and NOT symlink (Rust reports a junction as a
+symlink; S:345, `janitor.sh:538`) — a link under one of this owner's names is kept `not a directory`, never opened,
+its target never touched. **An identity that cannot be read never compares equal** (S:135): a capture that fails is
+a verdict of `kept`, never a match.
 
-1. **Quarantine restores** (S:406-419). An entry `.<name>.teststodelete-quarantine-<pid>-<hex>` that is a directory
-   of this token's names, `is_mine`, whose `<pid>` the probe calls `Gone`, and older than the window by ctime AND
-   mtime → renamed back under `<name>` when that is free (`notice: restored …` in `listed`), kept as
-   `quarantine-conflict` when it is taken — never over an existing entry.
+1. **Quarantine restores** (S:406-419). A directory `.<name>.teststodelete-quarantine-<pid>-<hex>` of this token's
+   names, `mine`, whose `<pid>` the probe calls `Gone`, and older than the window by ctime AND mtime (Linux
+   `MetadataExt::ctime()`; Windows `GetFileInformationByHandleEx(FileBasicInfo).ChangeTime`) → put back under
+   `<name>` **exclusively, never over an existing entry** (rule §4 `:185-187`): on Linux S's placeholder method
+   (S:169-191) — `create_dir(<name>)` exclusive, then `rename` over that EMPTY placeholder of our own (a plain
+   `rename(2)` of a directory onto an empty directory REPLACES it, so it is never tried against a name that may be
+   taken), the placeholder removed with `remove_dir` (refuses anything non-empty) when the rename fails; on Windows a
+   plain `rename`, which refuses an existing directory (sc. 18 asserts that it does, so a std change would be seen).
+   Restored → `notice: restored <name> …` in `listed`; the name taken → kept `quarantine-conflict` AND
+   `quarantine: <q> — restore with: mv -- '<q>' '<name>'` (`Move-Item` on Windows) in `listed`; every later run
+   retries it. *Loses:* `renameat2(RENAME_NOREPLACE)` — `EINVAL` on a file system without it, and a fallback is a
+   second path.
 2. **Folders.** Per directory entry, by the second segment of its name: not prefixed, or another token → not looked
    at; owner form with ANOTHER owner → `foreign: folder <name> — owner <o>` in `listed`, untouched; **legacy** (token
    `sidecar` straight after the prefix) → `legacy: folder <name> — remove with: rm -rf -- '<path>' '<path>.owner'`
@@ -230,26 +258,31 @@ three passes, each failure one `errors` entry and the next pass still runs (S:42
    old-grammar record is `gone` on a non-Linux reader; this crate never wrote a legacy name (D6), so it preserves MORE
    and carries no second grammar. Own names, in this order: younger than **10 minutes** by mtime → not considered,
    silently (age SELECTS, never authorises); a `.git` FILE inside → kept `other clone` (this crate makes no
-   worktrees); **capture** the identity — Linux `(dev, ino)` of the entry itself; Windows the volume serial and file
-   index from `GetFileInformationByHandle` on a handle `File::open` gives (std opens a directory with backup
-   semantics) — and the claim's bytes; not `is_mine` → kept `foreign-uid` and a `foreign:` line; no claim → kept
-   `unmarked` and an `unmarked:` line (**never collected, however old** — changed from E1, which removed an old
-   unmarked folder); `Unreadable` → kept `unreadable`; `owner_state` `live`/`unknown` → kept with that reason (a
-   `live` claim is kept whatever the mtime); **`gone` → removed by identity** (S:199-218): re-check identity and
-   claim; atomic `rename` to the sibling quarantine name (same parent, a leading `.` so no prefix match reaches it);
+   worktrees); **capture** the identity — Linux `(dev, ino, ctime)` of the entry itself; Windows, from the handle D3
+   opens, the volume serial and file index (`GetFileInformationByHandle`) and `ChangeTime` — and the claim's bytes;
+   not `mine` → kept `foreign-uid` and a `foreign:` line; no claim → kept `unmarked` and an `unmarked:` line (**never
+   collected, however old** — changed from E1, which removed an old unmarked folder); `Unreadable` → kept
+   `unreadable`; `owner_state` `live`/`unknown` → kept with that reason (a `live` claim is kept whatever the mtime);
+   **`gone` → removed by identity** (S:199-218): re-check identity and claim; atomic `rename` to the sibling
+   quarantine name (same parent; a leading `.` so no prefix match reaches it) — **a rename that is refused** (a
+   read-only parent on POSIX, a handle held inside on Windows) → kept `could not remove: <error>`, nothing moved;
    check again there; `remove_dir_all` with the retries; then the claim. What changed in between is renamed back
-   (`replaced`) or, when its name is taken, left as `quarantine-conflict`; a removal `teardown` gives up on is in
-   `kept` with `could not remove: <error>` — never silently dropped.
+   (`replaced`) or, when its name is taken, left as `quarantine-conflict`; **a removal that gives up in quarantine is
+   renamed BACK under its own name** and kept `could not remove: <error>` — a recorded deviation from S, which leaves
+   it in quarantine with an `errors` entry: under its own name it stays prefixed, claimed, judged by the next run like
+   any leftover and visible to the janitor — never silently dropped.
 3. **Orphan claims** (S:376-404). A `<name>.owner` whose folder is absent, of this token, older than the window by the
    claim's mtime: another owner → `foreign:`; legacy → `legacy:` with `rm -f -- '<claim>'`; own → judged by its OWNER
-   like any claim (rule §2 `:77-78`): `gone` removes it; `live`, `unknown`, unreadable, not `is_mine` keep it with the
+   like any claim (rule §2 `:77-78`): `gone` removes it; `live`, `unknown`, unreadable, not `mine` keep it with the
    reason.
 
 `SweepReport { removed: Vec<PathBuf>, kept: Vec<(PathBuf, String)>, listed: Vec<String>, errors: Vec<String> }`. The
-`Once` body wraps the sweep in `std::panic::catch_unwind` (a panic inside `call_once` would poison the `Once` and fail
-every later test) and calls `print_report(&report, &mut std::io::stderr())` — one line per `kept`, `listed` and
-`errors` entry, nothing for an empty report; a sweep never fails the run (rule §4 `:193`). The `read_dir` of the root
-itself failing is one `errors` entry per pass.
+`Once` body is `guarded(run, out)`: it wraps `run` in `std::panic::catch_unwind` — `guarded` never panics, so the
+`Once` can never be poisoned (a poisoned `Once` would fail every later test) — and calls `print_report(&report, out)`
+with `std::io::stderr()`. `print_report` takes `stderr().lock()` and writes each line with ONE `write_all`, so eight
+test threads never interleave half-lines; one line per `kept`, `listed` and `errors` entry, nothing for an empty
+report; a sweep never fails the run (rule §4 `:193`). The `read_dir` of the root itself failing is one `errors`
+entry per pass.
 
 **D6 — The old names are not the sweep's business; a legacy name is listed.** None of `mxr-race-`, `mxr-wipe-`,
 `mxr-scope-`, `bge-log-`, `bge-preflight-`, `bge-seed-`, `bge-reg-`, `bge-tok-`, `bge-tok-empty-` ever carried the
@@ -261,24 +294,32 @@ name (legacy, D2) can only be another producer's: listed with its command (D5), 
 `tests/local_cpu_budget.rs`: it reads files through `CARGO_MANIFEST_DIR`, so it runs on both CI legs with no new
 job. It uses `regex` as a dev-dependency (in the lock at 1.13.1; `Cargo.lock` gains only the edge). It scans whole
 files, not "only under `#[cfg(test)]`" — the product has zero temp, container or store sites today, and a textual
-`cfg(test)` boundary is a parser nobody needs; a future product site takes an inline exemption. Classes with no site
-in this repository (`docker-run`, `docker-name`, `shared-store`, `ryuk-off`) refuse ANY occurrence — stricter than the
-rule; the first container or store here extends the guard to rule §5/§6's full shape in the same change, and the cure
-sentence says so. **`owner-blind` is decision 3:** in `.rs` any bare-prefix literal outside `src/test_scratch.rs` is
-a finding with no tracer and no exemption; in scripts and workflow `run:` blocks the finding is a literal bare-prefix
-pattern, or a use (`$P`, `${P…}`, `$env:P`, a bare bound name) of a variable the SAME file assigns a value holding the
-prefix — the semantics of `tools/lib/prefix-bindings.mjs`'s header, not its implementation (a name from another file,
-the environment or an argument is not traced; a prefix split over two literals binds nothing). Deviation from rule §7
-`:255`, recorded: Rust source gets the stricter rule because a Rust `const` is the shape a tracer would miss.
+`cfg(test)` boundary is a parser nobody needs; a future product site takes an inline exemption. **It scans its own
+file too:** no file is excluded by name — its detectors and fixture strings are built from pieces (`concat!`,
+`format!`) so the file holds no prefix word, no temp API name and no exemption marker whole; the frozen exclusion
+list is EMPTY and a test pins it so. Workflows are read whole, line by line, with no YAML parser — stricter than the
+reference guard, which isolates `run:` blocks: a `mktemp` anywhere in a workflow file is a finding. Whole-line `#`
+comments are skipped in workflows and `//` lines in Rust and JS; a `#` line is NEVER skipped in `.rs` (an attribute
+starts with `#`). `docker-run` refuses ANY occurrence (D7 has no site and no carve-out check: the first container here
+extends the guard to rule §5's full shape in the same change, and the cure sentence says so); `docker-name` accepts
+the owner form and `shared-store` the `lock:` exemption, as rule §7 and S4 say. **`owner-blind` is decision 3:** in
+`.rs` any bare-prefix literal outside `src/test_scratch.rs` is a finding with no tracer and no exemption; in the
+script languages this repository has (`.mjs`, `.js`, `.cjs`, `.ts`, workflow files) the finding is a literal
+bare-prefix pattern, or a use (`$P`, `${P…}`, a bare bound name) of a variable the SAME file assigns a value holding
+the prefix — the semantics of `tools/lib/prefix-bindings.mjs`'s header, not its implementation (a name from another
+file, the environment or an argument is not traced; a prefix split over two literals binds nothing). A `.sh`, `.ps1`
+or `.py` file does not exist here and is not read: the first one makes discovery red until the guard reads its
+language. Deviation from rule §7 `:255`, recorded: Rust source gets the stricter rule because a Rust `const` is the
+shape a tracer would miss.
 
 **Growth surface** (the shared planning rule § *A plan that creates something that GROWS*). Scratch folders: 24
-tests use one after S3 (11 log, 4 seed, 3 model cache, 3 compile cache, 2 tokens, 1 cuda-only) plus S2's own ~17;
+tests use one after S3 (11 log, 4 seed, 3 model cache, 3 compile cache, 2 tokens, 1 cuda-only) plus S2's own ~20;
 a claim is ~60 bytes. **The peak, recomputed from the fixtures that can run at once** (verified on 1c1282e): only
 the three compile-cache tests write megabytes (`write_mb`, `src/testing.rs:206`) — `mxr-scope` 7 MB
 (`compile_cache.rs:499`, `:500` 1 + 1, `:505` 3, `:517` 2), `mxr-wipe` 2 MB (`:430`, `:431`), `mxr-race` none (lease
 folders only) — and nothing serialises them (`CACHE_PATH_LOCK`, `compile_cache.rs:162`, serialises the lease, not
 the writes). At `--test-threads=8` all three can run at once beside five other scratches of a few KB each: **≈ 9 MB**,
-plus S2's sc. 5–6 child of a few KB. The upper bound if every concurrent compile-cache test were the largest
+plus S2's sc. 7–8 child of a few KB. The upper bound if every concurrent compile-cache test were the largest
 (3 × 7 MB) is ≈ 21 MB; the tests are NOT serialised for this, because 21 MB is not a budget worth a lock. Retired by
 `Drop` on every path that unwinds; by the next run's sweep after a kill (10 minutes, owner `gone`, same OS user); by
 the janitor — `bash .claude/rules/shared/tools/janitor.sh --token sidecar [--dry-run]`, from Git for Windows' bash on
@@ -359,6 +400,17 @@ S2's constants and sweep decisions against the released contract before S2 merge
   `research/architecture.md:32` (the module list gains `test_scratch`) and `:308-309` (the fixtures sentence names
   both files; the test count is re-counted, not guessed).
 
+**Step 0 — measure the Windows owner, BEFORE any helper code.** The first commit of the branch is one
+`#[cfg(windows)]` test, `the_windows_owner_of_a_new_temp_file_is_printed` (kept in the module afterwards): it makes
+a `create_new` file in `std::env::temp_dir()` (under the raw-temp exemption of `temp_root()` once that exists; removed
+in the same test), prints the file's owner SID (`GetSecurityInfo`, converted with `ConvertSidToStringSidW`) and the
+caller's SID (the thread token first, then the process token, D3) as `S-1-5-…` text, whether they are `EqualSid`, and
+whether the token is elevated (`GetTokenInformation(TokenElevation)`); it never fails. Run with `--nocapture` once on
+the dml leg and once on the developer's shell; both outputs are recorded in the PR and in § *Notes for the parent*.
+The expectation — a hosted runner is elevated and its new files are owned by `BUILTIN\Administrators`
+(`S-1-5-32-544`) — is UNVERIFIED (D3): sc. 20 asserts whatever was measured, and the consequence of an elevated
+runner is that its sweep collects nothing there (the runner is discarded with its job; `Drop` still removes, D4).
+
 **The change.** `src/test_scratch.rs`, opening with a block comment in this crate's voice: what it owns, why the
 claim goes FIRST and sits beside the folder (the `log_segments.rs` listing assertions), why the kernel owner and not
 the name authorises, why `Drop` never panics, why its lines bypass libtest's capture, why the sweep runs from the
@@ -368,7 +420,7 @@ first constructor.
 pub(crate) const PREFIX: &str = "testsToDelete-";        // rule §1 — the ONLY literal of the prefix in src/ (D7)
 pub(crate) const REPO_TOKEN: &str = "sidecar";           // rule §1 — the ONLY place the token is written
 pub(crate) const REPO_ROW: &str = "the embedding sidecar"; // rule §1 — the token's row, `repository` column
-pub(crate) const MAX_NAME: usize = 63;                   // rule §1
+pub(crate) const MAX_NAME: usize = 63;                   // rule §1, in bytes (D2)
 pub(crate) const ID_LENGTH: usize = 6;
 pub(crate) const MAX_DRAWS: u32 = 3;                     // rule §2 — a taken claim or a squatted name draws again
 pub(crate) const START_TOLERANCE_S: u64 = 2;             // rule §3
@@ -377,20 +429,32 @@ pub(crate) const REMOVE_TRIES: u32 = 5;                  // rule §2, the family
 pub(crate) const REMOVE_BACKOFF: Duration = Duration::from_millis(100);
 pub(crate) const SWEEP_MIN_AGE: Duration = Duration::from_secs(600); // rule §4
 
-pub(crate) struct TestScratch { path: PathBuf, made_folder: bool }
+pub(crate) enum ScratchState { Claimed, Made, Released }           // D4
+pub(crate) struct TestScratch { path: PathBuf, written: Vec<u8>, state: ScratchState }
 impl TestScratch {
     pub(crate) fn new(what: &str) -> Self;                  // in temp_root(); the sweep runs once per process first
     pub(crate) fn new_in(parent: &Path, what: &str) -> Self; // a private parent: the tests below, never a checkout
+    pub(crate) fn new_with(parent: &Path, what: &str, seams: &mut Seams<'_>) -> Self; // the scenarios' constructor
     pub(crate) fn path(&self) -> &Path;
     pub(crate) fn slash_path(&self) -> String;              // `\` → `/`, the form log_segments' tests compose with
 }
-impl Drop for TestScratch { /* teardown(..) when made_folder, else remove_claim(..) — nothing else */ }
+impl Drop for TestScratch { /* Made → teardown(&path, stderr); Claimed → remove_claim_if_still; Released → nothing */ }
+
+/// The constructor's seams; `Seams::real()` is what `new`/`new_in` use.
+pub(crate) struct Seams<'a> {
+    pub ids: &'a mut dyn FnMut() -> String,                          // the id draw
+    pub write_claim: &'a mut dyn FnMut(&Path, &[u8]) -> io::Result<()>, // `create_new(true)` by default
+    pub after_claim: &'a mut dyn FnMut(&Path),                       // runs between the claim and the create
+    pub create_dir: &'a mut dyn FnMut(&Path) -> io::Result<()>,      // `fs::create_dir` by default
+    pub out: &'a mut dyn Write,                                      // the squatter warning; stderr by default
+}
 
 pub(crate) fn temp_root() -> PathBuf;   // the one `std::env::temp_dir()` call, under an inline
                                         // `// testsToDelete-exempt: raw-temp — the helper's own temp root; every scratch is made here`
-pub(crate) fn owner_token() -> &'static str;             // D2: u<uid> | w<digits> | TESTSTODELETE_OWNER (validated)
+pub(crate) fn owner_token() -> &'static str;             // D2: owner_token_from(env TESTSTODELETE_OWNER), once
+pub(crate) fn owner_token_from(override_: Option<&str>) -> String; // panics on an invalid override
 pub(crate) fn windows_owner_token(username: &str) -> String;
-pub(crate) fn what_room(owner: &str) -> usize;            // D2: 33 − owner.len()
+pub(crate) fn what_room(owner: &str) -> usize;            // D2: 33 − owner.len(), bytes
 pub(crate) fn check_what(what: &str) -> Result<(), String>;
 pub(crate) fn owned_name(what: &str) -> String;
 pub(crate) enum NameForm { Owner { owner: String, token: Option<String> }, Legacy { token: String }, None }
@@ -400,31 +464,38 @@ pub(crate) fn host_id(raw: &str, distro: &str) -> String; // WSL: `<host>~<distr
 pub(crate) struct Owner { pub owner: String, pub host: String, pub pid: u64, pub start: Option<u64>, pub ns: Option<u64>, pub canonical: bool }
 pub(crate) enum Claim { Unmarked, Unreadable, Owner(Owner) }
 pub(crate) fn this_owner() -> &'static Owner;             // OnceLock; panics only on an OS with no owner shape (D3)
-pub(crate) fn run_record() -> &'static Owner;             // TESTSTODELETE_RUN when live and the caller's, else this_owner()
+pub(crate) fn run_record() -> &'static Owner;             // run_record_from(env TESTSTODELETE_RUN, probe), once
+pub(crate) fn run_record_from(given: Option<&str>, probe: impl Fn(u64) -> Probe, out: &mut dyn Write) -> Owner;
 pub(crate) fn format_owner(owner: &Owner) -> String;      // `<owner>:<host>@<os>:<pid>[:<start>[:<ns>]]`
-pub(crate) fn parse_owner(text: &str) -> Claim;           // D3; > 512 bytes → Unreadable
+pub(crate) fn parse_owner(text: &[u8]) -> Claim;          // D3; > 512 bytes → Unreadable
 pub(crate) fn is_mine(path: &Path) -> bool;               // D3: the kernel owner (decision 2 on Windows); false on any failure
-pub(crate) fn read_claim(dir: &Path) -> Claim;            // the sibling `<dir>.owner` through the ONE safe read; absent → Unmarked
+#[cfg(windows)] pub(crate) fn caller_sid() -> &'static [u8]; // D3: the thread token first, then the process token; once
+pub(crate) fn read_claim(dir: &Path, mine: &dyn Fn(&Path) -> bool) -> Claim; // the sibling `<dir>.owner`; absent → Unmarked
 pub(crate) fn remove_claim_if_still(dir: &Path, written: &[u8]);  // D4; never panics
 pub(crate) enum Probe { Gone, Unknown, Alive { start: Option<u64> } }
 pub(crate) fn probe(pid: u64) -> Probe;                   // D3; never spawns a process; hidepid-aware
+pub(crate) struct Facts { pub hidepid: bool }             // `Facts::real()` reads /proc/1
 pub(crate) enum OwnerState { Live, Gone, Unknown }
-pub(crate) fn owner_state(claim: &Claim, name_owner: Option<&str>, mine: bool, me: &Owner, probe: impl Fn(u64) -> Probe) -> OwnerState;
+pub(crate) fn owner_state(claim: &Claim, name_owner: Option<&str>, mine: bool, me: &Owner, facts: &Facts,
+                          probe: impl Fn(u64) -> Probe) -> OwnerState;
 pub(crate) fn remove_with_retries(path: &Path, remover: impl FnMut(&Path) -> io::Result<()>,
                                   on_failed_attempt: impl FnMut(u32)) -> io::Result<()>;
 pub(crate) fn teardown(dir: &Path, out: &mut dyn Write) -> bool;  // D4; true when folder and claim are gone
-pub(crate) fn sweep(root: &Path, now: SystemTime, min_age: Duration,
-                    probe: impl Fn(u64) -> Probe, mine: impl Fn(&Path) -> bool) -> SweepReport;  // D5
-pub(crate) fn print_report(report: &SweepReport, out: &mut dyn Write);  // D5; nothing for an empty report
+pub(crate) struct Hooks<'a> { pub after_capture: Option<&'a mut dyn FnMut(&Path)>, pub after_rename: Option<&'a mut dyn FnMut(&Path, &Path)> }
+pub(crate) fn sweep(root: &Path, now: SystemTime, min_age: Duration, probe: impl Fn(u64) -> Probe,
+                    mine: impl Fn(&Path) -> bool, hooks: &mut Hooks<'_>) -> SweepReport;  // D5
+pub(crate) fn guarded(run: impl FnOnce() -> SweepReport, out: &mut dyn Write);  // D5: catch_unwind, then print_report; never panics
+pub(crate) fn print_report(report: &SweepReport, out: &mut dyn Write);  // D5; one write per line; nothing for an empty report
 ```
 
 - `remove_with_retries` calls `remover` at most `REMOVE_TRIES` times, sleeps `REMOVE_BACKOFF` between tries (never
   after the last), treats `ErrorKind::NotFound` as success, calls `on_failed_attempt(n)` after each failure (the test
   seam that makes the open-handle scenarios deterministic), and returns the last error.
 - No `std::process::Command` in `test_scratch.rs` outside its own `#[cfg(test)] mod tests` (the child harness of
-  scenarios 5–6 and the one `hostname` of scenario 13): the writer and the probe never spawn (rule §3).
+  scenarios 7–8, the one `hostname` of scenario 15, the one `mklink /J` of scenario 17): the writer and the probe
+  never spawn (rule §3).
 - Both constructors pass through the sweep's `Once`; `new_in` with a private parent still sweeps the temp root, never
-  the parent. The sweep's `probe` and `mine` seams are the real ones there; the scenarios inject both.
+  the parent. The sweep's `probe`, `mine`, `Facts` and `Hooks` are the real ones there; the scenarios inject them.
 - Only `PREFIX`, the owner-aware pattern and the quarantine sibling (`quarantine` is not a name, G:109) spell the
   prefix in this file: the machine-wide scan and S4's guard read it too.
 
@@ -434,6 +505,7 @@ does so in a PRIVATE parent made with `new_in`, because 8 test threads create sc
 legacy or foreign name a scenario needs is built at run time from `PREFIX` and pieces, never spelled whole — S4's
 `legacy-name` class reads this file):
 
+0. `the_windows_owner_of_a_new_temp_file_is_printed` — step 0 above; the first commit, before any other name exists.
 1. `a_scratch_is_named_with_the_owner_the_token_and_a_random_id` — `owned_name("seed")` matches
    `^testsToDelete-[uw][0-9]{1,10}-sidecar-seed-[A-Za-z0-9]{6}$` and its second segment equals `owner_token()`;
    1 000 calls are all distinct; `TestScratch::new("unicode пробел")` exists and its name starts
@@ -443,24 +515,28 @@ legacy or foreign name a scenario needs is built at run time from `PREFIX` and p
 2. `the_owner_token_is_the_users_and_an_invalid_override_refuses` — on Linux `owner_token()` is `u` + `getuid()`;
    on Windows `w` + digits; `windows_owner_token` reproduces every row of the vectors file's `windows-owner` section
    (read through `CARGO_MANIFEST_DIR/.claude/rules/shared/tools/fixtures/owner-vectors.json` with `serde_json`; the
-   file missing fails naming `git submodule update --init .claude/rules/shared`); `TESTSTODELETE_OWNER=u42` → `u42`;
-   `=bob`, `=u`, `=u12345678901` → a panic (`catch_unwind`), nothing created. (The override is read through a seam
-   taking an `Option<&str>`, never by setting the process environment under 8 threads.)
+   file missing fails naming `git submodule update --init .claude/rules/shared`); `owner_token_from(Some("u42"))` →
+   `u42`; `Some("bob")`, `Some("u")`, `Some("u12345678901")` → a panic (`catch_unwind`), nothing created; `Some("")`
+   and `None` → the process's own.
 3. `a_scratch_is_claimed_first_beside_itself_and_never_inside` — `<dir>.owner` exists in the same parent, holds
-   `format_owner(run_record()) + "\n"`, `read_claim` equals `this_owner()`; `read_dir(dir)` is empty. **Claim
-   first, observed:** a seam that fails `create_dir` with `PermissionDenied` → the constructor panics and the private
-   parent is EMPTY afterwards (the claim was written, then removed by the unwinding `Drop`); a seam that fails the
-   claim write → the constructor panics and no folder was ever made.
+   `format_owner(run_record()) + "\n"`, `read_claim(dir, &is_mine)` equals `this_owner()` and `read_claim(dir, &|_|
+   false)` is `Unreadable`; `read_dir(dir)` is empty. **Claim first, observed** through `new_with`: a `create_dir`
+   seam that answers `PermissionDenied` → the constructor panics and the private parent is EMPTY afterwards (the
+   claim was written, then removed by the unwinding `Drop` of a `Claimed` value); a `write_claim` seam that fails →
+   the constructor panics and no folder was ever made.
 4. `an_invalid_what_creates_nothing_and_the_room_is_derived` — `""`, `"a/b"`, `"a\\b"`, `"-x"`, `"a\u{1}b"`, and a
-   `what` of `what_room(owner_token()) + 1` characters each panic (`catch_unwind`), and the private parent stays
-   empty; a `what` of exactly `what_room(..)` characters succeeds and the name is 63 long; `what_room("u1000")` is 28,
-   `what_room("w4294967295")` is 22.
-5. `a_taken_claim_draws_again_and_a_squatted_folder_is_never_adopted` — in a private parent, an injected id sequence
-   `a, b, c`: a file `…-a.owner` written by the test → the scratch is `…-b`, the stranger's claim untouched; a FOLDER
-   `…-a` without a claim → the scratch is `…-b`, `…-a` still exists with NO `.owner` beside it (our claim was removed
-   again), one warning line captured through the `out` seam names `…-a`; a `…-a.owner` the test overwrites between
-   our claim and our `create_dir` (the `after_claim` seam) → that claim is NOT removed (it no longer holds our bytes);
-   three squatted draws → a panic naming `what` and the parent, the parent holding nothing of ours.
+   `what` of `what_room(owner_token()) + 1` bytes each panic (`catch_unwind`), and the private parent stays empty; a
+   `what` of exactly `what_room(..)` bytes succeeds and the name is 63 bytes long; `what_room("u1000")` is 28,
+   `what_room("w4294967295")` is 22; a `what` of `what_room(..) − 1` characters that is `what_room(..) + 1` bytes
+   (one `п`) panics — bytes, not characters (D2).
+5. `a_taken_claim_draws_again_and_a_squatted_folder_is_never_adopted` — in a private parent through `new_with`, an
+   `ids` seam answering `a, b, c`: a file `…-a.owner` written by the test → the scratch is `…-b`, the stranger's
+   claim untouched; a FOLDER `…-a` without a claim → the scratch is `…-b`, `…-a` still exists with NO `.owner` beside
+   it (our claim was removed again), one warning line through the `out` seam names `…-a`; a `…-a.owner` the test
+   overwrites in the `after_claim` seam, before our `create_dir` finds `…-a` squatted → that claim is NOT removed (it
+   no longer holds our bytes), the value is `Released` and dropping it touches nothing — RED without D4's state: a
+   `Drop` that removes "the claim" takes the stranger's; three squatted draws → a panic naming `what` and the parent,
+   the parent holding nothing of ours.
 6. `a_scratch_is_removed_when_its_test_panics` — inside `catch_unwind`: create, record the path, `panic!`; after: the
    folder and its `.owner` are gone.
 7. `a_failed_assertion_in_a_real_test_still_removes_its_scratch` — the child harness: `current_exe()` run with
@@ -470,10 +546,11 @@ legacy or foreign name a scenario needs is built at run time from `PREFIX` and p
    child exits non-zero; its stdout names a path that, with its `.owner`, no longer exists.
 8. `a_killed_test_leaves_its_scratch_claimed_and_the_next_sweep_collects_it` — the same harness with
    `TEST_SCRATCH_CHILD=abort`: the child creates, prints, and `std::process::abort()`s (no unwind, no `Drop` — the
-   SIGKILL case). The folder and `.owner` remain; the claim names this owner token, the child's pid, this host (and
-   on Linux a start and an ns). `sweep(parent, now + 11 min, .., probe, mine)` with a probe answering `Alive` for
-   that pid keeps both with reason `live`; with `Gone` removes both, `removed` names the folder, no quarantine is
-   left. (Never the REAL probe on a dead child's pid: Windows hands exited pids to the next process.)
+   SIGKILL case). The folder and `.owner` remain; `read_claim(dir, &|_| true)` names this owner token, the child's
+   pid, this host (and on Linux a start and an ns). `sweep(parent, now + 11 min, .., probe, |_| true, ..)` with a
+   probe answering `Alive` for that pid keeps both with reason `live`; with `Gone` removes both, `removed` names the
+   folder, no quarantine is left. (Never the REAL probe on a dead child's pid: Windows hands exited pids to the next
+   process.)
 9. `removal_retries_then_gives_up_without_panicking` — an injected remover failing twice then succeeding → 3 calls,
    `Ok`; failing always → exactly 5 calls, ≥ 400 ms elapsed, `Err`, no panic; `NotFound` on the first call → 1 call,
    `Ok`.
@@ -490,62 +567,85 @@ legacy or foreign name a scenario needs is built at run time from `PREFIX` and p
     round-trips; on Linux `this_owner()` has a start AND an ns, on Windows a start and no ns; `format_owner` of an
     owner with `ns` and no `start` writes neither; every row of the vectors file's `record` section parses to
     `valid` or `Unreadable` as it says (`u1000:h@linux:1`, `u1000:h@linux:1\r\n` valid; `h@linux:1`, `u1000:h@linux:1\r`,
-    `u1000:h@linux:1:2:3:4`, the 513-byte text unreadable; `u1000:h@linux:007` valid and non-canonical); every row of
-    `hostnames` through `host_name`, of `names` through `classify_name`, of `scope` through `owner_state` with its
-    facts, answers as the row says.
-13. `owner_state_follows_rule_three_in_order` — injected probe and facts, each step alone: `Unmarked`/`Unreadable` →
-    unknown; non-canonical → unknown; the record's owner `u7` under caller `u1000` → unknown; name owner ≠ record
+    `u1000:h@linux:1:2:3:4`, `u1000:h@linux:١٢` (r-i25, Unicode digits), the 513-byte text unreadable;
+    `u1000:h@linux:007` valid and non-canonical); every row of `hostnames` through `host_name`, of `names` through
+    `classify_name`, of `scope` through `owner_state` with its facts, answers as the row says.
+13. `owner_state_follows_rule_three_in_order` — injected probe and `Facts`, each step alone: `Unmarked`/`Unreadable`
+    → unknown; non-canonical → unknown; the record's owner `u7` under caller `u1000` → unknown; name owner ≠ record
     owner → unknown; `mine = false` → unknown; `other@<os>` → unknown; this host with the other OS tag → unknown; this
-    host in other case → evaluated; on Linux a record without `ns`, or with `ns + 1` → unknown; pid 0 → unknown;
-    `@windows` pid 1 → unknown; `Gone` → gone; `Gone` under `hidepid` (a seam) → unknown; `Unknown` → unknown; alive
-    with either start absent → live; Δ = 2 s → live; Δ = 3 s either way and Δ ≫ 3 s → unknown, never gone.
+    host in other case → evaluated; on Linux a record without `ns`, with `ns + 1`, or a `me` whose own `ns` is `None`
+    → unknown; pid 0 → unknown; `@windows` pid 1 → unknown; `Gone` → gone; `Gone` with `Facts { hidepid: true }` →
+    unknown; `Unknown` → unknown; alive with either start absent → live; Δ = 2 s → live; Δ = 3 s either way and
+    Δ ≫ 3 s → unknown, never gone.
 14. `the_real_probe_sees_this_process_and_not_an_impossible_pid` — `probe(std::process::id())` is `Alive` with a
-    start within 2 s of `this_owner().start`; a pid no process can have (Windows: ≡ 2 mod 4; Linux:
-    `/proc/sys/kernel/pid_max` + 1 — the premise asserted before and after) → `Gone` (on Linux only while `/proc/1`
-    is visible — asserted, else the test says `hidepid`).
+    start within 2 s of `this_owner().start`; `probe(u64::from(u32::MAX) + 1)` on Windows → `Unknown`; on Linux a
+    pid of `/proc/sys/kernel/pid_max + 1` (the premise asserted before and after, and `/proc/1` visible — else the
+    test says `hidepid`) → `Gone`; on Windows **measured first**: `probe(own pid + 2)` is recorded in the PR — pids
+    are handle-table indices and NT ignores the two tag bits, so `4n + 2` may open `4n` (the E1 premise); the dead
+    pid is then a `4n` whose four aliases `4n..4n+3` are all absent from a ToolHelp snapshot
+    (`CreateToolhelp32Snapshot` / `Process32FirstW`) taken before AND after → `Gone`.
 15. `the_owner_names_this_machine_as_the_janitor_does` — one spawn of `hostname` (this test only), normalised with
     `host_name`, compared case-insensitively with `this_owner().host` up to `@` — up to `~` when `WSL_DISTRO_NAME` is
     set, in which case the part after `~` equals `host_name(WSL_DISTRO_NAME)`.
 16. `a_claim_is_read_through_the_one_safe_read` — a `.owner` that is a directory → `Unreadable`; a symlink to a
     valid claim → `Unreadable` (`symlink_metadata`, never followed); 512 bytes of a valid record → read; 513 →
-    `Unreadable`; `is_mine` injected `false` → `Unreadable`; `#[cfg(unix)]` a FIFO (`libc::mkfifo`) → `Unreadable`
-    within a second, nothing blocks. `TESTSTODELETE_RUN` through its seam: a record of this owner and a probe-`Alive`
-    pid → used; a record of `u7`, of a probe-`Gone` pid, or `bob` → one warning line and `this_owner()`.
+    `Unreadable`; `mine` injected `false` → `Unreadable`, `true` → read; `#[cfg(unix)]` a FIFO (`libc::mkfifo`) →
+    `Unreadable` within a second, nothing blocks. `run_record_from(Some(..), probe, &mut buf)`: a record of this owner
+    and a probe-`Alive` pid → used, `buf` empty; a record of `u7`, of a probe-`Gone` pid, or `bob` → one line in `buf`
+    and `this_owner()`; `None` → `this_owner()`, `buf` empty.
 17. `the_sweep_removes_only_what_a_gone_owner_left_and_lists_the_rest` — on a private root, `now` = real now +
     11 min unless stated, names built from `PREFIX` and pieces: claimed by this process → kept (`live`); this owner's
     name with a claim of another owner `u7` → kept (`unknown`); foreign host → kept (`unknown`); unreadable claim →
     kept; `mine` injected `false` for one entry → kept (`foreign-uid`) AND a `foreign:` line; probe-`Gone` claim →
-    folder and claim removed, by identity (the `after_capture` seam replaces the folder by a fresh one of the same
-    name → kept `replaced`, the fresh one and its claim untouched); **unmarked and old → kept (`unmarked`) and an
-    `unmarked:` line, never removed**; unmarked at real `now` (young) → untouched and unreported; a prefixed folder
-    holding a `.git` FILE → kept (`other clone`); another owner's name `PREFIX + "u7-sidecar-x-abc123"` → a `foreign:`
-    line, untouched; a legacy name `PREFIX + "sidecar-x-abc123"` with a probe-`Gone` old-grammar claim → a `legacy:`
-    line with the exact command, untouched; `PREFIX + "u7-mcp-x-abc123"` and `bge-log-1-first` → untouched and
-    unreported; the `_` and upper-case spellings of this owner's name → considered; **orphan claims are judged by
-    owner** — four equally old orphan `.owner` files of this owner's names, claimed by THIS process (`live`), by a
-    probe-`Gone` pid, by a foreign host (`unknown`), and holding unreadable text → only the `gone` one disappears;
-    the other three stay, each in `kept` with its reason; a folder claimed by THIS process with an mtime set 10 days
-    back → kept (`live`, age never authorises). **A removal that teardown gives up on is in `kept`:** a probe-`Gone`
-    claimed folder that cannot be removed — Windows: a file inside held with `share_mode(0)`; POSIX: its private root
-    `chmod 0o555`, the premise asserted — appears in `SweepReport.kept` with a reason starting `could not remove:`,
-    is absent from `removed`, and still exists with its `.owner` under its OWN name (renamed back from the
-    quarantine); released or restored, a second sweep removes it.
+    folder and claim removed, by identity (the `after_capture` hook replaces the folder by a fresh one of the same
+    name → kept `replaced`, the fresh one and its claim untouched; the `after_rename` hook that drops a file into the
+    quarantine → removed anyway, the identity is the directory's); **a link is never a candidate:** a symlink
+    (Linux, `symlink`) or a junction (Windows, `cmd /C mklink /J` — a test may spawn) under one of this owner's names,
+    beside a claim of a probe-`Gone` pid, pointing at a folder holding a file → kept `not a directory`, the link still
+    there, the target and its file intact; **unmarked and old → kept (`unmarked`) and an `unmarked:` line, never
+    removed**; unmarked at real `now` (young) → untouched and unreported; a prefixed folder holding a `.git` FILE →
+    kept (`other clone`); another owner's name `PREFIX + "u7-sidecar-x-abc123"` → a `foreign:` line, untouched; a
+    legacy name `PREFIX + "sidecar-x-abc123"` with a probe-`Gone` old-grammar claim → a `legacy:` line with the exact
+    command, untouched; `PREFIX + "u7-mcp-x-abc123"` and `bge-log-1-first` → untouched and unreported; the `_` and
+    upper-case spellings of this owner's name → considered; **orphan claims are judged by owner** — four equally old
+    orphan `.owner` files of this owner's names, claimed by THIS process (`live`), by a probe-`Gone` pid, by a foreign
+    host (`unknown`), and holding unreadable text → only the `gone` one disappears; the other three stay, each in
+    `kept` with its reason; a folder claimed by THIS process with `now` injected 10 days ahead → kept (`live`, age
+    never authorises). **A removal that teardown gives up on is in `kept`, nothing is lost** — three cases, the
+    premise asserted each time (root removes anything): POSIX, the private root `chmod 0o555` → the quarantine
+    rename is REFUSED, kept `could not remove: <error>`, folder and claim exactly where they were; POSIX, a
+    sub-folder `chmod 0o555` holding a file inside the candidate → the rename succeeds, `remove_dir_all` fails, the
+    folder is renamed BACK under its own name (D5's deviation), kept `could not remove:`, absent from `removed`, its
+    `.owner` still beside it, no quarantine left; Windows, a file inside held with `share_mode(0)` → the rename is
+    refused (asserted: that is all Windows is asked to prove), kept `could not remove:`, nothing moved. Released or
+    restored, a second sweep removes each.
 18. `a_quarantine_a_killed_sweep_left_is_restored_or_listed` — a directory `.<own name>.teststodelete-quarantine-
     <pid>-abcd` (the literal from pieces) of a probe-`Gone` pid, 11 minutes old by both stamps → renamed back to
-    `<own name>`, a `notice: restored …` line; the same with `<own name>` already present → untouched, kept
-    `quarantine-conflict`; of a probe-`Alive` pid, or young → untouched, unreported; `mine` `false` → untouched.
+    `<own name>`, a `notice: restored …` line; the same with `<own name>` taken by an EMPTY directory → untouched,
+    kept `quarantine-conflict`, a `quarantine: … restore with: …` line, the empty directory still there with nothing
+    in it (RED first on Linux with a plain `rename`: the empty directory is replaced); taken by a file → the same; a
+    second sweep with the name freed → restored (every run retries); of a probe-`Alive` pid, or young by either
+    stamp → untouched, unreported; `mine` `false` → untouched.
 19. `the_sweep_never_fails_the_run` — **every I/O error is reported, none stops the sweep**: a root that does not
     exist, and a root that is a FILE → no panic, `removed`, `kept` and `listed` empty, and `errors` holds one entry
-    per pass naming that root and the `read_dir` error; `print_report` given that report and a buffer writes exactly
-    those lines. A probe that panics → caught by the `Once` wrapper's `catch_unwind`, one line, and a following
-    `TestScratch::new` still works (the `Once` is not poisoned). RED first: written before `errors` is filled, the
-    file-root case is observed with an empty `errors`.
+    per pass naming that root and the `read_dir` error; `print_report` given that report and a `Write` that records
+    each call writes exactly those lines, ONE call per line; `guarded(|| panic!("probe"), &mut buf)` → returns, `buf`
+    holds one line naming the panic; `guarded` called again afterwards runs its closure. RED first: written before
+    `errors` is filled, the file-root case is observed with an empty `errors`. ("The `Once` is not poisoned" is not
+    observable in-process and is not asserted: `guarded` never panics, which is what keeps it clean.)
+20. `the_kernel_owner_answer_matches_what_was_measured` — `#[cfg(windows)]`, the assertion of step 0: a scratch in a
+    private root; the test computes `owner SID == caller SID` for it as step 0 does and asserts `is_mine(path)` equals
+    that; `caller_sid()` equals the process token's `TokenUser` (no impersonation is active in a test); then
+    `sweep(root, now + 11 min, .., probe = Gone, is_mine, ..)` with the REAL `is_mine`: SIDs equal → removed; not
+    equal (an elevated shell) → kept `foreign-uid`, a `foreign:` line, the folder untouched; in both cases the value
+    is re-created and its `Drop` removes it — teardown needs no `is_mine` (D4).
 
 - **Commands.** `node .claude/rules/shared/tools/low-priority.mjs cargo test --release --locked -j 8 -- test_scratch --test-threads=8`;
   the whole suite on Windows (dml) and inside WSL (`nice -n 19 cargo test --release --locked -j 8 --no-default-features --target-dir target-wsl -- --test-threads=8`);
   `cargo fmt --package bge-sidecar --check`.
-- **DoD.** Every scenario observed RED, then GREEN, on Windows and on the ubuntu CI leg (scenario 10 runs on Windows
-  only, 11 and the FIFO of 16 on Linux only); the 147 existing tests unchanged and green; the D3 Win32 and libc names
+- **DoD.** Step 0's two outputs recorded (the dml runner and the developer's shell, each with its elevation); every
+  scenario observed RED, then GREEN, on Windows and on the ubuntu CI leg (scenarios 0, 10 and 20 run on Windows only,
+  11 and the FIFO of 16 on Linux only); the 148 existing tests unchanged and green; the D3 Win32 and libc names
   recorded in the PR; `architecture.md` updated; no `Command` outside the test module (review); no literal of the
   prefix in the file but `PREFIX` and the owner-aware pattern (review, and S4).
 
@@ -584,7 +684,7 @@ test" route only in that the shape changes, never the assertion):
 3. `a_model_cache_is_gone_even_when_its_test_panics` (in `tokens.rs`'s tests) — `catch_unwind` around
    `model_cache_with_a_tokenizer("panics")` and a `panic!` before any removal; after: the root does not exist. RED on
    `main`: `bge-reg-panics-<pid>` still exists.
-4. **Nothing else moved:** the 147 existing tests pass on both legs, with the same names; in particular
+4. **Nothing else moved:** the 148 existing tests pass on both legs, with the same names; in particular
    `log_segments.rs`'s exact-listing tests (`:290`, `:304`, `:313`, `:335`, `:351`) and the Windows
    held-file test (`:376`) — the claim beside the root never shows up in them — and `tokens.rs:330` (the folder its
    test removes).
@@ -610,31 +710,38 @@ test" route only in that the shape changes, never the assertion):
   needs it too); `README.md` only if it documents test commands that need the submodule; `research/module_inference.md`
   (a paragraph beside the `tests/local_cpu_budget.rs` one at `:132-136`).
 
-**The guard.** Pure functions over `(relative path, text)` plus one `#[test]` over the real tree.
+**The guard.** Pure functions over `(relative path, text)` plus one `#[test]` over the real tree. Every detector and
+every fixture string in the file is built from pieces (`concat!("temp_", "dir(")`, `concat!("teststo", "delete")`,
+the exemption marker as `concat!("testsToDelete-", "exempt:")`), because the file scans ITSELF.
 
 - **Discovery — an inventory from git, not hand-listed folders.** The test runs `git ls-files -z --cached --others
   --exclude-standard` once in `CARGO_MANIFEST_DIR` (a test may spawn — the no-spawn rule of D3 binds the helper's
   writer and probe, not the guard) and keeps every listed file whose extension is a language the guard reads,
-  WHEREVER it sits: `*.rs`; `*.yml`/`*.yaml` under `.github/workflows/`; `*.mjs`, `*.js`, `*.cjs`, `*.ts`; `*.sh`;
-  `*.ps1`; `*.py`. So every script root is covered without naming it — today `.github/scripts/`
-  (`branch-protection.mjs`) and `http/` (`httpyac.config.js`), and any new root the day one is added. Then four path
-  exclusions, by prefix of the RELATIVE path: any directory whose name starts with `target` (matched as
-  `^target[^/]*/` on any path segment, so every Cargo target directory is skipped even where it is not git-ignored),
-  `node_modules/` (any depth), `vendor-fastembed/` (upstream's bytes, not built as tests here) and `.claude/`
-  (another repository). Excluded by name, a frozen list a test pins exactly: `tests/test_leftovers.rs` (it carries the
-  violations as fixture strings). `git` missing or exiting non-zero ⇒ red naming the command, never an empty scan.
-  **Scan of nothing:** fewer than one `.rs` under `src/`, one under `tests/`, or one workflow ⇒ red with
-  `test_leftovers: scanned nothing under <root> — discovery broke; the repository is not clean`.
+  WHEREVER it sits: `*.rs`; `*.yml`/`*.yaml` under `.github/workflows/`; `*.mjs`, `*.js`, `*.cjs`, `*.ts`. So every
+  script root is covered without naming it — today `.github/scripts/` (`branch-protection.mjs`) and `http/`
+  (`httpyac.config.js`), and any new root the day one is added. Four path exclusions come FIRST, by prefix of the
+  RELATIVE path: any directory whose name starts with `target` (matched as `^target[^/]*/` on any path segment, so
+  every Cargo target directory is skipped even where it is not git-ignored), `node_modules/` (any depth),
+  `vendor-fastembed/` (upstream's bytes, not built as tests here) and `.claude/` (another repository). Then **a
+  language the guard does not read is red**: a remaining `*.sh`, `*.ps1` or `*.py` ⇒
+  `test_leftovers: <file> is a language this guard does not read — extend the guard before adding it` (the trim of
+  plan-gate round 2: no tracer is written for a language the repository has no file in). **No file is excluded by
+  name**: the frozen exclusion list is EMPTY, pinned by a test, and `tests/test_leftovers.rs` is scanned like any
+  other `.rs`. `git` missing or exiting non-zero ⇒ red naming the command, never an empty scan. **Scan of nothing:**
+  fewer than one `.rs` under `src/`, one under `tests/`, or one workflow ⇒ red with `test_leftovers: scanned nothing
+  under <root> — discovery broke; the repository is not clean`.
 - **The inventory is verified against the repository**: on the branch, the PR records the list the guard scanned
   and the output of `git ls-files` filtered by the same extensions, and they are equal; a file in one and not the
   other is a discovery defect fixed before merge.
-- **Classes** (rule §7's eight, their Rust/YAML/JS/shell spelling, G:248-265 for the regexes). Whole-line `//` and `#`
-  comments are skipped for matching and read for exemptions. The prefix word in every detector below is spelled in
-  two pieces (`concat!("teststo", "delete")`): the machine-wide scan reads this file too.
+- **Parsing.** A workflow is read whole, line by line — no YAML parser, no `run:` isolation (stricter than the
+  reference guard: a `mktemp` in a workflow comment that is not a whole-line `#` comment is a finding, and the cure
+  is to delete it). Whole-line `#` comments are skipped in workflows only; whole-line `//` comments in `.rs` and JS;
+  a `#` line in `.rs` is an attribute and is read. Comments are read for exemptions.
+- **Classes** (rule §7's eight, their Rust/YAML/JS spelling, G:248-265 for the regexes).
   - `raw-temp`: `\btemp_dir\s*\(`, `\benv::var(_os)?\(\s*"(TEMP|TMP|TMPDIR)"`, `\btempfile::`, `\btempdir\s*\(`,
     `\bmkdtemp(Sync)?\s*\(`, `\btmpdir\s*\(`, `process\.env\.(TEMP|TMP|TMPDIR)\b`, `GetTempPath`,
-    `CreateTempSubdirectory`, `GetTempFileName`, in `.sh`/`run:` blocks `\bmktemp\b`, in `.ps1`
-    `New-TemporaryFile|\$env:TE?MP\b`. Not `RUNNER_TEMP` (rule §7 `:250`).
+    `CreateTempSubdirectory`, `GetTempFileName`, and in a workflow file `\bmktemp\b`. Not `RUNNER_TEMP` (rule §7
+    `:250`).
   - `raw-worktree`: `\bworktree\s+add\b`, `"worktree",\s*"add"`.
   - `docker-run`: ANY `\bdocker\s+(run|create|compose)\b` (D7: none exists here; the first one extends this class to
     rule §5's carve-out check).
@@ -646,9 +753,9 @@ test" route only in that the shape changes, never the assertion):
     (G:107-109) — in EVERY scanned file, `src/test_scratch.rs` included; and `teststodelete[-_]\$?\{?\s*REPO_TOKEN\b`
     (a constant-built legacy prefix, G:110).
   - `owner-blind` (decision 3): in `.rs` outside `src/test_scratch.rs`, ANY `teststodelete[-_]` case-insensitive not
-    followed by `[uw][0-9]{1,10}[-_]`, the three non-names above excepted — no tracer, no exemption; in scripts and
-    `run:` blocks, the same literal, OR a use (`$P`, `${P…}`, `$env:P`, a bare bound name in code) of a name the same
-    file assigns (`P=`, `$P =`, `const|let|var P =`, `P = `) a string value holding `teststodelete[-_]` without an
+    followed by `[uw][0-9]{1,10}[-_]`, the three non-names above excepted — no tracer, no exemption; in JS files and
+    workflow lines, the same literal, OR a use (`$P`, `${P…}`, a bare bound name in code) of a name the same file
+    assigns (`P=` in a workflow line, `const|let|var P =` in JS) a string value holding `teststodelete[-_]` without an
     owner segment right after it, judged on every line whatever the order or scope (a name bound in another file,
     the environment or an argument is not traced; a prefix split over two literal pieces binds nothing). The one
     exception is the shipped janitor's inventory line — not present in this repository, since the janitor is run from
@@ -656,7 +763,7 @@ test" route only in that the shape changes, never the assertion):
   - `shared-store`: `\b(DROP\s+(DATABASE|SCHEMA|TABLE)|TRUNCATE|FLUSHALL|FLUSHDB)\b`, case-sensitive (prose
     "truncated" never matches).
   - `ryuk-off`: `TESTCONTAINERS_RYUK_DISABLED\s*[:=]\s*["']?true` — never exemptible.
-  - `dropped-scratch` (this repository's own, S3's trap): `let\s+_\s*=\s*.*(TestScratch::new(_in)?|seed_scratch|model_cache_with_a_tokenizer)\s*\(`
+  - `dropped-scratch` (this repository's own, S3's trap): `let\s+_\s*=\s*.*(TestScratch::new(_in|_with)?|seed_scratch|model_cache_with_a_tokenizer)\s*\(`
     and `let\s*\(\s*_\s*,` before `seed_scratch(`.
 - **Exemptions — inline only** (rule §7 `:259-263`): `testsToDelete-exempt: <class> — <reason>` on the finding's line
   or the line above; the class is one of the eight except `ryuk-off` and `owner-blind` (`legacy-name` IS exemptible);
@@ -676,27 +783,28 @@ test" route only in that the shape changes, never the assertion):
 **Scenarios** (RED first: the real-tree test is written and run on the branch's commit BEFORE S3's):
 
 1. `this_repository_creates_nothing_outside_test_scratch` — RED before S3: exactly the nine `raw-temp` findings of the
-   facts table (at their then-current lines), nothing else — in particular no `legacy-name` or `owner-blind` finding
-   in `src/test_scratch.rs`'s tests (their names are built from pieces); the counts recorded in the PR. GREEN after
-   S3: zero.
+   facts table (at their then-current lines), nothing else — in particular no finding in `tests/test_leftovers.rs`
+   itself and no `legacy-name` or `owner-blind` finding in `src/test_scratch.rs`'s tests (every such name is built
+   from pieces); the counts recorded in the PR. GREEN after S3: zero.
 2. `every_class_is_refused_once_and_a_valid_exemption_passes` — fixture strings through the pure function (every
-   prefixed fixture built from pieces at run time): a raw `std::env::temp_dir()` in `src/x.rs` ⇒ 1 `raw-temp` naming
-   the line; `env::var("TMPDIR")` ⇒ 1; `mkdtempSync(` in `http/x.mjs` ⇒ 1; `mktemp -d` in a workflow `run:` ⇒ 1;
-   `RUNNER_TEMP` ⇒ 0; `git worktree add` ⇒ 1; `docker run --rm img` ⇒ 1 (`docker-run`, D7); `docker volume create v` ⇒
-   1 `docker-name`; `docker volume create <owner-form name>` ⇒ 0; `docker compose -p sidecar-x` ⇒ 1; `TRUNCATE TABLE
-   t` ⇒ 1, with a `shared-store` exemption carrying `lock:` above ⇒ 0, without `lock:` ⇒ 1 `exemption`; the word
-   `truncated` ⇒ 0; `TESTCONTAINERS_RYUK_DISABLED=true` with an exemption above ⇒ still 1; a literal
-   `<prefix>sidecar-x-abc123` in `src/x.rs` ⇒ `legacy-name` AND `owner-blind` (two lines, one each); the same with a
-   `legacy-name` exemption above ⇒ the `owner-blind` line remains; `<prefix>u1000-sidecar-x-abc123` ⇒ 0; the
-   quarantine sibling and `TESTSTODELETE_OWNER` in `src/x.rs` ⇒ 0; a regex `^<prefix lower>[-_]sidecar` in `src/x.rs` ⇒ 1
-   `owner-blind`, in `src/test_scratch.rs` ⇒ 0 `owner-blind`; in `scripts/x.sh` `P='<prefix>'` on line 1 and `rm -rf
-   "$P"*` on line 9 ⇒ 1 `owner-blind` naming line 9; `P="$OTHER"` + `rm -rf "$P"*` ⇒ 0; `P='teststo''delete-'` + `rm
-   -rf "$P"*` ⇒ 0; the same two lines in `tools/x.mjs` with `const P = "<prefix>"` and `.filter((n) => n.startsWith(P))`
-   ⇒ 1; a well-formed `raw-temp` exemption ⇒ 0; `testsToDelete-exempt: raw-temp — needed` ⇒ 1 `exemption`;
-   `testsToDelete-exempt: owner-blind — a perfectly fine reason here` ⇒ 1 `exemption`; `testsToDelete-exempt: nonsense
-   — a perfectly fine reason here` ⇒ 1 `exemption`; `let _ = TestScratch::new("x");` ⇒ 1 `dropped-scratch`; `let (_,
-   from, to) = seed_scratch("x");` ⇒ 1; `let _scratch = TestScratch::new("x");` ⇒ 0; a commented-out `//
-   std::env::temp_dir()` ⇒ 0.
+   fixture built from pieces at run time): a raw `std::env::temp_dir()` in `src/x.rs` ⇒ 1 `raw-temp` naming the line;
+   `env::var("TMPDIR")` ⇒ 1; `mkdtempSync(` in `http/x.mjs` ⇒ 1; `mktemp -d` in a workflow `run:` line ⇒ 1, and in a
+   workflow line that is not a whole-line comment ⇒ 1; `RUNNER_TEMP` ⇒ 0; `git worktree add` ⇒ 1; `docker run --rm img`
+   ⇒ 1 (`docker-run`, D7); `docker volume create v` ⇒ 1 `docker-name`; `docker volume create <owner-form name>` ⇒ 0;
+   `docker compose -p sidecar-x` ⇒ 1; `TRUNCATE TABLE t` ⇒ 1, with a `shared-store` exemption carrying `lock:` above ⇒
+   0, without `lock:` ⇒ 1 `exemption`; the word `truncated` ⇒ 0; `TESTCONTAINERS_RYUK_DISABLED=true` with an exemption
+   above ⇒ still 1; a literal `<prefix>sidecar-x-abc123` in `src/x.rs` ⇒ `legacy-name` AND `owner-blind` (two lines,
+   one each); the same with a `legacy-name` exemption above ⇒ the `owner-blind` line remains;
+   `<prefix>u1000-sidecar-x-abc123` ⇒ 0; the quarantine sibling and `TESTSTODELETE_OWNER` in `src/x.rs` ⇒ 0; a regex
+   `^<prefix lower>[-_]sidecar` in `src/x.rs` ⇒ 1 `owner-blind`, in `src/test_scratch.rs` ⇒ 0 `owner-blind`; a
+   `#[cfg(test)]` line followed by `temp_dir()` on the next line in `src/x.rs` ⇒ 1 (a `#` line in Rust is read); in
+   a workflow, `P=<prefix>` on one `run:` line and `rm -rf "$P"*` nine lines later ⇒ 1 `owner-blind` naming the later
+   line; `P="$OTHER"` + `rm -rf "$P"*` ⇒ 0; `P='teststo''delete-'` + `rm -rf "$P"*` ⇒ 0; in `tools/x.mjs` `const P =
+   "<prefix>"` and `.filter((n) => n.startsWith(P))` ⇒ 1; a well-formed `raw-temp` exemption ⇒ 0; `testsToDelete-exempt:
+   raw-temp — needed` ⇒ 1 `exemption`; `testsToDelete-exempt: owner-blind — a perfectly fine reason here` ⇒ 1
+   `exemption`; `testsToDelete-exempt: nonsense — a perfectly fine reason here` ⇒ 1 `exemption`; `let _ =
+   TestScratch::new("x");` ⇒ 1 `dropped-scratch`; `let (_, from, to) = seed_scratch("x");` ⇒ 1; `let _scratch =
+   TestScratch::new("x");` ⇒ 0; a commented-out `// std::env::temp_dir()` ⇒ 0.
 3. `a_scan_of_nothing_is_red` — the pure discovery-verdict function over in-memory listings: an empty listing, one
    with no `src/*.rs`, and one with no workflow ⇒ the "scanned nothing" failure each. No folder is made: this file is
    an integration test and cannot reach `crate::testing`'s `TestScratch`, and a second temp helper here would be the
@@ -706,22 +814,26 @@ test" route only in that the shape changes, never the assertion):
    `repository` column ⇒ 1; a token listed twice ⇒ 1; `Sidecar`, `x` and `u1000` ⇒ 1 each; the real table with
    `REPO_ROW = "the MCP server"` ⇒ 1 (`belongs to … not to this repository`); an empty `REPO_ROW` ⇒ 1 (fails closed);
    two `REPO_TOKEN` constants ⇒ 1.
-5. `the_exclusion_list_is_exactly_one_file` — pinned. And `discovery_keeps_every_script_root_and_skips_every_target`
-   — the pure filter over an in-memory listing: `.github/scripts/a.mjs`, `http/x.js`, `tools/lib/y.mjs`,
-   `scripts/z.sh`, `deep/new/root/w.ps1` ⇒ kept; `target/debug/a.rs`, `target-wsl/x.rs`, `target-ci/y.sh`,
-   `sub/target-x/z.rs`, `http/node_modules/p/i.js`, `vendor-fastembed/src/a.rs`, `.claude/rules/shared/tools/t.mjs` ⇒
-   dropped; `targets.rs` at the root (a FILE whose name starts with `target`) ⇒ kept. RED first: written against the
-   old hand-listed discovery, `tools/lib/y.mjs` and `deep/new/root/w.ps1` are observed dropped.
+5. `the_exclusion_list_is_empty_and_pinned` — pinned at zero entries. And
+   `discovery_keeps_every_script_root_and_skips_every_target` — the pure filter over an in-memory listing:
+   `.github/scripts/a.mjs`, `http/x.js`, `tools/lib/y.mjs`, `deep/new/root/w.ts`, `tests/test_leftovers.rs` ⇒ kept;
+   `target/debug/a.rs`, `target-wsl/x.rs`, `target-ci/y.sh`, `sub/target-x/z.rs`, `http/node_modules/p/i.js`,
+   `vendor-fastembed/src/a.rs`, `.claude/rules/shared/tools/t.mjs` ⇒ dropped (an excluded path is never red, whatever
+   its language); `scripts/z.sh`, `deep/new/root/w.ps1`, `tools/q.py` ⇒ the "language this guard does not read"
+   failure, naming the file; `targets.rs` at the root (a FILE whose name starts with `target`) ⇒ kept. RED first:
+   written against the old hand-listed discovery, `tools/lib/y.mjs` and `deep/new/root/w.ts` are observed dropped.
 6. **Break-it on the real tree** (by hand, recorded in the PR): one `std::env::temp_dir()` added to a test module ⇒
-   the guard red naming `file:line`; one `const OLD: &str = "<prefix>sidecar-";` in `src/tokens.rs`'s tests ⇒ red
-   with `legacy-name` and `owner-blind`, and an exemption above it clears only the first; reverted ⇒ green. The same
-   with `.claude/rules/shared` de-initialised ⇒ red with the submodule sentence.
+   the guard red naming `file:line`; the same literal written WHOLE inside `tests/test_leftovers.rs` ⇒ red naming the
+   guard's own file; one `const OLD: &str = "<prefix>sidecar-";` in `src/tokens.rs`'s tests ⇒ red with `legacy-name`
+   and `owner-blind`, and an exemption above it clears only the first; an empty `scripts/x.sh` ⇒ red with the
+   unread-language sentence; reverted ⇒ green. The same with `.claude/rules/shared` de-initialised ⇒ red with the
+   submodule sentence.
 
 - **Commands.** `node .claude/rules/shared/tools/low-priority.mjs cargo test --release --locked -j 8 --test test_leftovers -- --test-threads=8`;
   the whole suite on both legs; `actionlint` passes on the changed `ci.yml` (the `workflows` job).
 - **DoD.** Scenario 1 observed red with exactly the nine sites, then green; every break-it observed red; the scanned
   inventory recorded and equal to the filtered `git ls-files`; both CI legs green WITH the submodule step;
-  `module_inference.md` updated (it names the `target*` exclusion and decision 3).
+  `module_inference.md` updated (it names the `target*` exclusion, decision 3 and the unread-language red).
 
 ## Test plan
 
@@ -731,7 +843,7 @@ test" route only in that the shape changes, never the assertion):
 | RED-GREEN for the pre-clean-only class | S3 sc. 1, 2; the panic-skipped class S3 sc. 3; the inline sites through S2 sc. 6 and S4 sc. 1 |
 | The guard's break-it | S4 sc. 2, 6 |
 | An open handle on Windows: no panic, folder gone or a prefixed leftover remains | S2 sc. 10 (`share_mode(0)`), with the POSIX twin sc. 11; the leftover is also CLAIMED, which the parent did not require and the contract does |
-| (contract, not in the parent) claim first; two keys; a killed run's leftover is collected, a live owner's, a stranger's and an unmarked one survive; identity removal; the shared vectors | S2 sc. 3, 5, 8, 12, 13, 16, 17, 18, 19 |
+| (contract, not in the parent) claim first; two keys; a killed run's leftover is collected, a live owner's, a stranger's, a link's and an unmarked one survive; identity removal, exclusive restore; the shared vectors; the measured Windows owner | S2 sc. 0, 3, 5, 8, 12, 13, 16, 17, 18, 19, 20 |
 
 ## Definition of Done
 
@@ -744,6 +856,9 @@ test" route only in that the shape changes, never the assertion):
 - [ ] The guard is red on every one of the eight classes, on `owner-blind` without a tracer in Rust source, on an
       unregistered or foreign token and on a scan of nothing; CI fetches the rules it reads (S4).
 - [ ] `research/architecture.md` and `research/module_inference.md` describe the helper and the guard.
+- [ ] The Windows owner was MEASURED before the helper was coded (S2 step 0): the owner SID of a new `%TEMP%` file and
+      the caller's SID on the dml runner and on the developer's shell, and whether each shell is elevated, recorded in
+      the PR and in § *Notes for the parent*.
 - [ ] S2–S4 merged as ONE squash-merged PR, only after the merge condition of § *Order* held and was recorded in the
       PR (the R6 entry and the machine records cited).
 - [ ] When that PR merges, this document's status becomes `E4 shipped, <date>; promotes with its parent` — never
@@ -779,6 +894,45 @@ Rejected (still rejected):
   about a developer machine, and a planted violation in CI is a permanent defect the family forbids.
 - Using a known-exited child's pid as the dead owner — the unmatchable-pid method is measured; pid reuse is the
   defect the contract bans.
+
+## Plan-gate round 2 (2026-10-31)
+
+The coai plan gate's round over the re-split, and the Opus judge's findings. All accepted and applied above; none
+rejected:
+
+1. (gate) The caller's SID on Windows comes from the THREAD token first, `OpenThreadToken(GetCurrentThread(),
+   TOKEN_QUERY, true)`, and from the process token only on `ERROR_NO_TOKEN` — D3, S2 sc. 20.
+2. (gate) Every stderr diagnostic takes `stderr().lock()` and writes each line in ONE `write_all`, so parallel tests
+   never interleave — D4.3, D5, S2 sc. 19.
+3. (gate) The guard scans its own file: detectors and fixtures are built from pieces, the frozen exclusion list is
+   EMPTY and pinned — D7, S4 *Discovery*, sc. 1, 5, 6.
+4. (judge, blocker) The Windows owner on an elevated runner is measured BEFORE the helper is coded (S2 step 0);
+   `read_claim` takes `mine` as a seam; one Windows scenario asserts the measured answer; teardown needs no `is_mine`
+   — D4, S2 sc. 0, 3, 8, 16, 20, DoD.
+5. (judge, blocker) A candidate is a real directory, never a link or junction; the Windows handle is opened with
+   `FILE_FLAG_OPEN_REPARSE_POINT` and a reparse point is never the caller's — D3, D5, S2 sc. 17.
+6. (judge) A quarantine is restored exclusively — S's placeholder on Linux, Windows' refusal of a rename onto a
+   directory asserted; while taken it stays listed with its command and every run retries — D5, S2 sc. 18.
+7. (judge) `TestScratch` carries its state and the claim bytes it wrote; after the squatter path it is `Released`, and
+   a `Claimed` value's `Drop` removes the claim only while it still holds those bytes — D4, S2 sc. 5.
+8. (judge) The API block carries every seam the scenarios use (`Seams`, `Facts`, `Hooks`, `run_record_from`,
+   `guarded`); the unobservable "the `Once` is not poisoned" claim is replaced by testing `guarded` directly — S2.
+9. (judge) A refused quarantine rename is specified (kept, nothing moved); a removal that gives up in quarantine is
+   renamed BACK, a recorded deviation from S — D5, S2 sc. 17.
+10. (judge) The Windows unmatchable pid is measured first (`probe(own + 2)`), then taken from a ToolHelp snapshot
+    (`Win32_System_Diagnostics_ToolHelp`); a pid above `u32::MAX` is `Unknown` there — D3, S2 sc. 14.
+11. (judge) The grammar uses `[0-9]` and `(?-u:\s)`, never Unicode `\d`/`\s` — D3, S2 sc. 12 (vector r-i25).
+12. (judge) The identity carries ctime; sc. 17 injects `now` instead of an mtime set back — D5, S2 sc. 17.
+13. (judge) The fail-closed edges are stated: an unreadable identity never compares equal, the Linux probe is
+    `Unknown` on any error but `NotFound`, the reader's own missing `ns` is unknown — D3, D5.
+14. (judge) D7 no longer contradicts S4: only `docker-run` refuses any occurrence; `docker-name` and `shared-store`
+    accept the owner form and the `lock:` exemption — D7.
+15. (judge) 148 tests, not 147 — § *Facts*, S2 DoD, S3 sc. 4.
+16. (judge) Workflows are scanned whole, line by line (no YAML parser — stricter); `#` comment skipping never applies
+    to `.rs`; `<what>` is measured in BYTES (stricter than the rule's characters, said so) — D2, D7, S4.
+17. (judge, trim taken) The script tracer reads only the languages this repository has (`.mjs`/`.js`/`.cjs`/`.ts` and
+    workflows); the first `.sh`, `.ps1` or `.py` makes discovery red until the guard is extended — S4 *Discovery*,
+    sc. 2, 5.
 
 ## Notes for the parent (`dew_flow_conventions · todo/PLAN_test_leftovers_rollout.md`, E4 entry)
 
