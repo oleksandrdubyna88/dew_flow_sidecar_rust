@@ -307,8 +307,8 @@ A third job checks the plan lifecycle from the shared rules submodule.
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
   `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
 - **No integration test suite** — testing is inline `#[cfg(test)]` beside what each module tests
-  (224 test attributes: 149 inline in the other modules, 31 in `src/test_scratch/` — 4 of them Windows-only and one an
-  `#[ignore]`d child process the others start — and 44 in `tests/`: 2 in `local_cpu_budget.rs` and 42 in the
+  (247 test attributes: 149 inline in the other modules, 47 in `src/test_scratch/` — 9 of them Windows-only and one an
+  `#[ignore]`d child process the others start — and 51 in `tests/`: 2 in `local_cpu_budget.rs` and 49 in the
   leftovers guard), with shared fixtures in `src/testing.rs`. Every folder a test creates is a `TestScratch` from
   `src/test_scratch.rs`; `tests/test_leftovers.rs` is the repository-text test that keeps it so (no `std::env::temp_dir()`
   and no hand-built temp path outside the helper), and reads the mounted shared rules, so `build-test` fetches them.

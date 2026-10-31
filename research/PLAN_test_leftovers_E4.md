@@ -989,8 +989,9 @@ line says what the plan said, what was built and the evidence.
    before the rename already compared it; the later check is the device, inode and the claim.
 7. *API additions the plan's block did not list:* `Hooks::after_remove`, a third argument of `remove_claim_if_still`,
    and `TestScratch::claim_id`.
-8. *The shared vectors file's `verdicts` section is not exercised* (`record`, `hostnames`, `names`, `scope` and
-   `windows-owner` are).
+8. *(Withdrawn in review round 1; the number stays so the others keep theirs.)* The shared vectors file's `verdicts`
+   section was not exercised at first; `the_shared_verdict_vectors_agree` now runs v01-v26 through `owner_state` with a
+   seam probe (item 35 below).
 
 **S2 — corrections found by the first CI run of the draft PR (this commit set)**
 
@@ -1041,7 +1042,13 @@ line says what the plan said, what was built and the evidence.
     word), AND the helper's prefix constant, AND — as `raw-temp` — the helper's temp-root accessor used outside the
     helper (`create_dir(<accessor>().join("x"))` is a raw-temp bypass). `{PREFIX}{REPO_TOKEN}`-style builds are
     `legacy-name`. Allowed: the owner form, the `exempt`/`quarantine` words, the `.owner` label key and an
-    upper-case `TESTSTODELETE_*` environment name.
+    upper-case `TESTSTODELETE_*` environment name. *Corrected in review round 1:* (a) "the helper's files" are
+    `src/test_scratch.rs` and `src/test_scratch/` WITHOUT `src/test_scratch/tests.rs` and `src/test_scratch/tests/` —
+    the helper's tests are its callers, and a first version let one of them make an unprefixed file in the raw temp
+    root; (b) a line is READ, not only matched (item 26): escapes, one-character classes and joined pieces are decoded
+    first, and a literal fragment of the word is a finding; (c) the second allowance is one pinned file,
+    `tests/test_leftovers/words.rs`; (d) the guard is still a SPELLING check — pieces on different lines, a macro, an
+    `include_str!` of a file it does not scan can hide the word.
 19. *`dropped-scratch` is wider than the two shapes in the plan and takes no exemption:* also a bare
     `TestScratch::new(..);` statement, `TestScratch::new(..).path()` (a temporary), and a `SeedScratch { .. }` destructuring that does
     not bind `scratch`. Three S2 scenarios that call a constructor expected to panic inside `catch_unwind` now bind the
@@ -1071,3 +1078,58 @@ line says what the plan said, what was built and the evidence.
 24. *Promotion.* The Definition of Done said the plan becomes `E4 shipped, <date>; promotes with its parent` and is
     never *implemented* while in `todo/`. It was promoted to `research/` with the producer PR on the lead's
     instruction, with the parent's E4 entry to carry the same sentence when the PR merges.
+
+**Review round 1 (E4), 2026-10-31 — what the first review of the producer PR changed**
+
+One line per fix; the contract (`common/test-leftovers.md`, `tools/lib/owned.mjs`, `leftovers-sweep.mjs`,
+`tools/janitor.sh`, `tools/fixtures/owner-vectors.json` at the pinned mount) won every disagreement. Every fix was
+watched failing first, except where its line says otherwise; the Windows lines are compiled for
+`x86_64-pc-windows-msvc` and run by the next `windows-latest` job only.
+
+25. *Quarantine suffix is hex.* `quarantine_path` drew `[a-z0-9]` (2 of 1000 names matched the `[0-9a-f]+` of its own
+    pattern, rule §4, `leftovers-sweep.mjs` and `janitor.sh`); it draws 4 random bytes as 8 lower-case hex characters
+    (`random_hex`). Sc. 18 gains the producer's real name over 5000 draws and a sweep killed after its rename.
+26. *The guard reads literals.* Three of twelve planted spellings were caught. `rustviews.rs` decodes escapes, spells a
+    one-character class as the character and joins the pieces of `concat!`/`format!`/`+`; `bypass.rs` judges the
+    decoded line, the joined pieces, literal fragments of the word (a whole literal of 5+ characters of it, or any
+    literal holding 7), `/tmp` and `/var/tmp` literals, `concat!` inside `env::var`/`var_os`, `drop(<constructor>(..))`
+    and a block whose tail is made from the path of the scratch it just bound. `bypass_fixtures.rs` plants every shape,
+    built from the pieces of `words.rs`; with the reading switched off five of its six tests are red. Limit: a spelling
+    check (item 18d). Three tests used `/tmp` or `/var/tmp` as text and one dropped a scratch at a block's end on
+    purpose; they changed text and an explicit `drop`.
+27. *The rename into quarantine never replaces.* `std::fs::rename` replaces an existing EMPTY directory on POSIX and on
+    Windows. New `rename.rs::move_without_replace`: `renameat2(RENAME_NOREPLACE)` by the raw system call on Linux; on
+    `EINVAL`/`ENOSYS` (a file system that does not know the flag) the name is RESERVED with an exclusive `mkdir` and the
+    folder renamed over that placeholder of our own, which is removed again only while it is still the directory
+    that call made (this is the choice for the no-flag case: a reservation, not a link); `MoveFileExW` with no flags on
+    Windows. A collision draws a new name (five draws). The restore uses the same move. `Hooks::quarantine_name` is the
+    seam; the test pre-creates an empty directory at the drawn name and finds it, the same one, afterwards.
+28. *`win::caller_sid` is read per call* (it was a process-wide `OnceLock`, so the first thread decided for all):
+    thread token first, process token on `ERROR_NO_TOKEN`. Windows test: a thread impersonating the anonymous logon
+    answers `S-1-5-7` while its neighbours stay the process user.
+29. *`ClaimPending`.* The squatter path set `Released` even when taking the claim back failed. It leaves
+    `ClaimPending`, whose `Drop` retries; every claim removal (the `Claimed` state's too) is the five tries 100 ms apart.
+30. *The quarantine pass applies `owner_state`'s pid checks* (0, a leading zero, past 2^53, Windows' pid 1, a Windows pid
+    past `u32::MAX`) before it probes: `pid_is_askable`, shared with `owner_state`.
+31. *Windows: one handle.* `is_mine` resolves the profile test with `GetFinalPathNameByHandleW` on the handle that was
+    judged (no second open by `canonicalize`); identity is `FILE_ID_INFO` (128 bits: ReFS, Dev Drive), not `nFileIndex`;
+    `read_limited` compares the opened handle's identity with the expected one (it ignored it) and requires
+    `GetFileType == FILE_TYPE_DISK` and neither a directory nor a reparse point before any read.
+32. *POSIX `read_limited`.* The `fstat` of the opened handle (`S_ISREG`, the expected device and inode) was already
+    there and untested; it is tested now (a swapped file, a FIFO that must not block) and the test fails without it.
+33. *`remove_claim_if_still` compares the whole identity* (device, inode, change time) between its read and its unlink.
+34. *The helper's tests are not the helper* (item 18a): Step 0 makes its probe file inside `TestScratch::new("step0")`.
+35. *The `verdicts` section runs* (replaces item 8): v01-v26 through `owner_state`, for a Linux and a Windows reader;
+    three mutants (pid 0 askable, Windows pid 1 askable, the 2 s tolerance widened) each turn it red. It passed at once.
+36. *Windows tests.* Scenario 20 asserts the helper against `measure_owner` (Step 0's own token, handle and
+    `GetSecurityInfo`, SIDs compared as strings), not `owner_sid_of`/`sid_equal` again; the POSITIVE real-SID case (the
+    owner of a folder and its claim set to the caller's user SID, then the real `is_mine` is true and the sweep removes
+    a dead owner's folder); a `share_mode(0)` file inside a folder refuses the rename (kept `could not remove`, nothing
+    moved) and the next sweep removes it; a 128-bit identity and final-path test; a junction is never mine; the
+    dead-pid pick repeats once with fresh ToolHelp snapshots.
+37. *The orphan-claim pass skips a claim whose folder sits in a quarantine* (a sibling quarantine in the listing, or a
+    `quarantine-conflict` of this sweep): kept `quarantined`. A killed sweep's claim was removed as an orphan's.
+38. *One listing.* The root is listed once and the three passes share the snapshot (a restore updates it; every
+    candidate is still re-checked with its own `symlink_metadata`); an entry this sweep removed is skipped, not an
+    `errors` entry.
+39. *`check_what`'s message* says "multi-byte characters count by bytes" (with the character count) when the two differ.

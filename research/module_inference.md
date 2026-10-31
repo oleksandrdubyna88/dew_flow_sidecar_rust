@@ -149,11 +149,23 @@ workflow. It refuses the rule's eight classes: `raw-temp` (and the helper's own 
 helper), `raw-worktree`, `docker-run` (ANY container start: there is none here, and the first one extends the guard
 to the carve-out of section 5), `docker-name`, `legacy-name`, `owner-blind`, `shared-store` and `ryuk-off`, plus
 `exemption` (a malformed `<prefix>exempt:` comment; `ryuk-off` and `owner-blind` take none) and this repository's
-own `dropped-scratch` (`let _ = TestScratch::new(..)` and the destructurings that leave a scratch unbound drop the
-folder at the end of the statement). `owner-blind` differs by language: in Rust it takes no binding tracer (owner
+own `dropped-scratch` (`let _ = TestScratch::new(..)`, the destructurings that leave a scratch unbound and
+`drop(TestScratch::new(..))` drop the folder at the end of the statement; a `let`-bound scratch whose block ends with a
+tail expression made from its path drops it at the closing brace while the path escapes). `owner-blind` differs by language: in Rust it takes no binding tracer (owner
 decision 3 of the E4 plan, a documented deviation from section 7's "a bare name in script code"): any spelling of the
-prefix outside `src/test_scratch.rs` and `src/test_scratch/` that is not followed by an owner segment is a finding,
-the helper's prefix constant included, because a Rust constant is the shape a tracer misses; in scripts and
+prefix outside the helper's files (`src/test_scratch.rs` and `src/test_scratch/`, EXCEPT its tests,
+`src/test_scratch/tests.rs` and `src/test_scratch/tests/`, which are the helper's callers and get no allowance) that is
+not followed by an owner segment is a finding, the helper's prefix constant included, because a Rust constant is the
+shape a tracer misses. A Rust line is READ, not only matched (`tests/test_leftovers/rustviews.rs`, review round 1):
+`\x..` and `\u{..}` escapes are decoded, a one-character regex class (`[T]`) is the character, and the literals of a
+line are joined (`concat!`, the positional arguments of `format!`, `+`), so the word is found behind them; a literal that
+IS five or more characters of the word, or holds seven, is a fragment and a finding; `/tmp` and `/var/tmp` as literals
+and an environment name built by `concat!` inside `env::var` are `raw-temp`. One file besides the helper is judged
+without the word and temp-in-pieces checks, by exact path and pinned by a test: the guard's own piece-builder,
+`tests/test_leftovers/words.rs`. **The limit, stated plainly: this is still a SPELLING check.** Pieces on different
+lines, a macro that builds the word, an `include_str!` of a file the guard does not scan, a constant from another crate
+can all hide it; the guard narrows the ways to write a raw temp path or a bare prefix by habit or by accident, it does not
+prove a tree clean (`the_limit_of_a_spelling_check_is_pinned` keeps that sentence true). In scripts and
 workflows it is the SHIPPED classifier's verdict (`classifyLines` of the mounted `tools/lib/sweeper-scan.mjs`, run
 through `node` with its path in `argv` and the text on stdin), whose answer is validated against what was sent and
 whose absence or malformation is one unjudged finding, never a clean scan. The token is checked against the mounted

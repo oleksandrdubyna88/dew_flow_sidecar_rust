@@ -9,6 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod claim_scenarios;
 mod owner_scenarios;
 mod scratch_scenarios;
 mod sweep_edges;

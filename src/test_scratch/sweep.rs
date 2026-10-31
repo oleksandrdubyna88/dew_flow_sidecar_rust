@@ -8,7 +8,9 @@
 //!
 //! Removal is by what identifies the folder at the moment of removal, never by a name read earlier: the identity and
 //! the claim are captured BEFORE the verdict, re-checked just before an atomic rename to a sibling quarantine, and
-//! checked again there; what changed in between is renamed back and kept. A candidate is a real directory — a link or
+//! checked again there; what changed in between is renamed back and kept. The rename is EXCLUSIVE (`rename.rs`): a
+//! quarantine name that is already taken, an empty directory included, is drawn again. The root is listed once and the
+//! three passes share the snapshot. A candidate is a real directory — a link or
 //! junction under one of this owner's names is kept `not a directory`, never opened, its target never touched.
 //!
 //! The sweep never panics and never fails the run: every I/O error is one `errors` entry and the next pass still runs.
