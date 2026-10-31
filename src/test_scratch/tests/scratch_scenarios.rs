@@ -287,6 +287,112 @@ fn a_taken_claim_draws_again_and_a_squatted_folder_is_never_adopted() {
     );
 }
 
+// ---------- 2 and 5, the claim's removal is retried ----------
+
+/// A directory that is read-only until this guard drops: its entries cannot be unlinked (a non-root user).
+#[cfg(unix)]
+struct ReadOnly(PathBuf);
+
+#[cfg(unix)]
+impl ReadOnly {
+    fn set(dir: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        ReadOnly::set(&self.0, 0o700);
+    }
+}
+
+/// Review round 1: the claim of a value in state `Claimed`, and the claim a squatter made us take back, are removed
+/// with the five tries of rule section 2 — and a squatter-path removal that gave up leaves the value `ClaimPending`,
+/// whose `Drop` tries the five again, never `Released` with the claim still on disk. The unlink is made to fail
+/// (a read-only parent) and the time the attempts take is the evidence: four back-offs of 100 ms per round of tries.
+#[cfg(unix)]
+#[test]
+fn a_claim_that_will_not_go_is_retried_in_both_states() {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root unlinks from a read-only directory");
+        return;
+    }
+    let private = TestScratch::new("claim-retry");
+    let parent = private.path();
+    let guard = ReadOnly(parent.to_path_buf());
+
+    // A squatter: the create says `AlreadyExists`, the parent turns read-only, our claim cannot be taken back. One
+    // round of five tries in the squatter path, one more in the Drop of the `ClaimPending` value; then the next
+    // draw (the parent is writable again by then) succeeds.
+    let first = parent.join(name_with("stuck", "a"));
+    let mut ids = {
+        let guard_dir = parent.to_path_buf();
+        let mut drawn = 0;
+        move || {
+            drawn += 1;
+            if drawn == 2 {
+                ReadOnly::set(&guard_dir, 0o700); // the second draw comes after the first value dropped
+            }
+            ["a", "b"][drawn - 1].to_string()
+        }
+    };
+    let mut calls = 0;
+    let mut create = |path: &Path| -> io::Result<()> {
+        calls += 1;
+        if calls == 1 {
+            ReadOnly::set(path.parent().unwrap(), 0o500);
+            Err(io::ErrorKind::AlreadyExists.into())
+        } else {
+            std::fs::create_dir(path)
+        }
+    };
+    let mut quiet = Vec::new();
+    let mut seams = Seams::real();
+    seams.ids = &mut ids;
+    seams.create_dir = &mut create;
+    seams.out = &mut quiet;
+    let started = std::time::Instant::now();
+    let scratch = TestScratch::new_with(parent, "stuck", &mut seams);
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(790),
+        "two rounds of five tries, 100 ms apart, took only {took:?}"
+    );
+    assert!(
+        claim_path(&first).is_file(),
+        "the claim that would not go is left for the sweep, not forgotten"
+    );
+    drop(scratch);
+    std::fs::remove_file(claim_path(&first)).unwrap();
+
+    // A value in state `Claimed` whose create fails for another reason: the unwind drops it, five tries.
+    let mut create = |path: &Path| -> io::Result<()> {
+        ReadOnly::set(path.parent().unwrap(), 0o500);
+        Err(io::ErrorKind::PermissionDenied.into())
+    };
+    let mut ids = sequence(&["c"]);
+    let mut seams = Seams::real();
+    seams.ids = &mut ids;
+    seams.create_dir = &mut create;
+    let started = std::time::Instant::now();
+    let text = panic_text(|| {
+        let _never_made = TestScratch::new_with(parent, "stuck", &mut seams);
+    });
+    let took = started.elapsed();
+    assert!(text.contains("could not create"), "{text}");
+    assert!(
+        took >= Duration::from_millis(390),
+        "five tries, 100 ms apart, took only {took:?}"
+    );
+    drop(guard);
+    let left = parent.join(format!("{}.owner", name_with("stuck", "c")));
+    assert!(left.is_file(), "left for the sweep");
+    std::fs::remove_file(left).unwrap();
+}
+
 // ---------- 6 ----------
 
 #[test]

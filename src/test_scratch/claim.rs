@@ -5,7 +5,7 @@
 
 use super::identity::{file_id, FileId};
 use super::owner::{parse_owner, Claim};
-use super::{write_line, StderrOut, MAX_CLAIM_BYTES};
+use super::{remove_with_retries, write_line, StderrOut, MAX_CLAIM_BYTES};
 use std::ffi::OsString;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
@@ -120,43 +120,54 @@ pub(crate) fn write_claim_exclusive(claim: &Path, bytes: &[u8]) -> io::Result<()
     Ok(())
 }
 
+/// One attempt to remove the claim: only while it still holds exactly `written` and, when `captured` is the identity
+/// the claim had right after this run wrote it, only while the file at the path is STILL that file. A claim that is
+/// not ours any more (another text, another file, gone) is `Ok`: there is nothing of ours to remove.
+fn remove_claim_once(claim: &Path, written: &[u8], captured: Option<FileId>) -> io::Result<()> {
+    let meta = std::fs::symlink_metadata(claim)?;
+    if !meta.is_file() {
+        return Ok(());
+    }
+    let before = file_id(claim);
+    if read_limited(claim, &meta)? != written {
+        return Ok(());
+    }
+    // The same file we read (and, when known, the file this run wrote), not a claim swapped in since.
+    let now = file_id(claim);
+    let ours = match (before, now) {
+        (Some(before), Some(now)) => before.same_inode(&now) && captured.is_none_or(|id| id == now),
+        _ => false,
+    };
+    if ours {
+        std::fs::remove_file(claim)?;
+    }
+    Ok(())
+}
+
 /// Remove the claim beside `dir` only while it still holds exactly `written` — a claim another run put there since
 /// is not ours to remove — and, when `captured` is the identity the claim had right after this run wrote it, only
 /// while the file at the path is STILL that file: a claim with the same text but another identity is another run's
-/// (siblings under one `TESTSTODELETE_RUN` write identical records). Never panics; a failure is ONE stderr line, the
-/// claim stays for the sweep.
-pub(crate) fn remove_claim_if_still(dir: &Path, written: &[u8], captured: Option<FileId>) {
+/// (siblings under one `TESTSTODELETE_RUN` write identical records). Five tries 100 ms apart (rule §2: the family's
+/// figure; a Windows scanner holds a fresh file for a moment). Never panics; `true` when nothing of ours is left to
+/// remove, `false` after ONE stderr line when it gave up — the claim stays for the sweep, and the caller decides
+/// whether to try again.
+pub(crate) fn remove_claim_if_still(dir: &Path, written: &[u8], captured: Option<FileId>) -> bool {
     let claim = claim_path(dir);
-    let outcome = (|| -> io::Result<()> {
-        let meta = std::fs::symlink_metadata(&claim)?;
-        if !meta.is_file() {
-            return Ok(());
+    match remove_with_retries(
+        &claim,
+        |claim| remove_claim_once(claim, written, captured),
+        |_| {},
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            write_line(
+                &mut StderrOut,
+                &format!(
+                    "test_scratch: could not remove the claim {} ({e}) — left for the start-of-run sweep",
+                    claim.display()
+                ),
+            );
+            false
         }
-        let before = file_id(&claim);
-        if read_limited(&claim, &meta)? != written {
-            return Ok(());
-        }
-        // The same file we read (and, when known, the file this run wrote), not a claim swapped in since.
-        let now = file_id(&claim);
-        let ours = match (before, now) {
-            (Some(before), Some(now)) => {
-                before.same_inode(&now) && captured.is_none_or(|id| id == now)
-            }
-            _ => false,
-        };
-        if ours {
-            std::fs::remove_file(&claim)?;
-        }
-        Ok(())
-    })();
-    match outcome {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => write_line(
-            &mut StderrOut,
-            &format!(
-                "test_scratch: could not remove the claim {} ({e}) — left for the start-of-run sweep",
-                claim.display()
-            ),
-        ),
-        _ => {}
     }
 }

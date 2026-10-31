@@ -22,11 +22,13 @@ pub(crate) const REMOVE_TRIES: u32 = 5;
 pub(crate) const REMOVE_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Where a value is on its way: `Claimed` (the claim is ours, the folder is not made), `Made` (both are ours),
-/// `Released` (the claim was taken back after a squatter — `Drop` touches nothing).
+/// `ClaimPending` (a squatter had the folder and taking our claim back failed after its five tries: `Drop` tries the
+/// removal again), `Released` (the claim was taken back — `Drop` touches nothing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScratchState {
     Claimed,
     Made,
+    ClaimPending,
     Released,
 }
 
@@ -147,8 +149,14 @@ impl TestScratch {
                             scratch.path.display()
                         ),
                     );
-                    remove_claim_if_still(&scratch.path, &scratch.written, scratch.claim_id);
-                    scratch.state = ScratchState::Released;
+                    scratch.state =
+                        if remove_claim_if_still(&scratch.path, &scratch.written, scratch.claim_id)
+                        {
+                            ScratchState::Released
+                        } else {
+                            // Not `Released`: the claim is still on disk. This value's Drop tries again.
+                            ScratchState::ClaimPending
+                        };
                 }
                 Err(e) => panic!(
                     "test_scratch: could not create {}: {e}",
@@ -180,8 +188,8 @@ impl Drop for TestScratch {
             ScratchState::Made => {
                 teardown(&self.path, &mut StderrOut);
             }
-            ScratchState::Claimed => {
-                remove_claim_if_still(&self.path, &self.written, self.claim_id)
+            ScratchState::Claimed | ScratchState::ClaimPending => {
+                remove_claim_if_still(&self.path, &self.written, self.claim_id);
             }
             ScratchState::Released => {}
         }));
