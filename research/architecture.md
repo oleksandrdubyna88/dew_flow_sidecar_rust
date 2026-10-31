@@ -307,7 +307,7 @@ A third job checks the plan lifecycle from the shared rules submodule.
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
   `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
 - **No integration test suite** — testing is inline `#[cfg(test)]` beside what each module tests
-  (177 test attributes: 148 beside what each of the other modules tests and 29 in `src/test_scratch/` — 4 of them
+  (179 test attributes: 148 beside what each of the other modules tests and 31 in `src/test_scratch/` — 4 of them
   Windows-only and one an `#[ignore]`d child process the others start), with shared fixtures in `src/testing.rs` and
   scratch folders from `src/test_scratch.rs`.
 - **No published release artefact yet.** `.github/workflows/release.yml` builds, tests and packages the
