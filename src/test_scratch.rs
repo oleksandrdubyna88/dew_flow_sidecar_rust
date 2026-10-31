@@ -1,150 +1,181 @@
 //! Test scratch folders (`common/test-leftovers.md`): named, claimed, removed, collected.
-//!
-//! Step 0 of the E4 plan lives here alone for now: the Windows kernel-owner question is MEASURED before any
-//! helper code is written, because the answer decides what the helper's second key can ever agree with.
 
 #![cfg(test)]
 
-#[cfg(test)]
-mod tests {
-    /// Step 0 of the E4 plan (`todo/PLAN_test_leftovers_E4.md`, S2): what does Windows say owns a file this
-    /// process just created in the temp root, who is the caller, and is the token elevated? The rule's second key
-    /// (the kernel owner is the caller) is only worth anything if a normal run's new files are the caller's; the
-    /// expectation that a hosted (elevated) runner's files belong to `BUILTIN\Administrators` (`S-1-5-32-544`) was
-    /// UNVERIFIED when the plan was written, so this prints the facts and never fails. Run it once with
-    /// `--nocapture` on the dml leg and once on a developer's shell; scenario 20 asserts whatever was measured.
-    #[cfg(windows)]
-    #[test]
-    fn the_windows_owner_of_a_new_temp_file_is_printed() {
-        use std::ffi::c_void;
-        use std::os::windows::fs::OpenOptionsExt;
-        use std::os::windows::io::AsRawHandle;
-        use windows::core::{HRESULT, PWSTR};
-        use windows::Win32::Foundation::{CloseHandle, LocalFree, ERROR_NO_TOKEN, HANDLE, HLOCAL};
-        use windows::Win32::Security::Authorization::{
-            ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
-        };
-        use windows::Win32::Security::{
-            EqualSid, GetTokenInformation, TokenElevation, TokenUser, OWNER_SECURITY_INFORMATION,
-            PSID, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
-        };
-        use windows::Win32::System::Threading::{
-            GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
-        };
+mod claim;
+mod identity;
+mod owner;
+mod scratch;
+mod tests;
+#[cfg(windows)]
+mod win;
 
-        fn sid_text(sid: PSID) -> String {
-            let mut text = PWSTR::null();
-            // SAFETY: `sid` points at a valid SID for the duration of the call; on success `text` is a
-            // LocalAlloc'd string that is read once and freed once below.
-            unsafe {
-                if ConvertSidToStringSidW(sid, &mut text).is_err() || text.is_null() {
-                    return "<ConvertSidToStringSidW failed>".to_string();
-                }
-                let shown = text
-                    .to_string()
-                    .unwrap_or_else(|_| "<not UTF-16>".to_string());
-                let _ = LocalFree(Some(HLOCAL(text.0.cast())));
-                shown
-            }
-        }
+use std::io::Write;
 
-        // SAFETY: every pointer handed to a Win32 call below is to a local that outlives the call; handles are
-        // closed exactly once; this test only reads and prints.
-        unsafe {
-            // The caller's token: the THREAD token first (an impersonating thread is the caller), the process
-            // token only when the thread has none (D3).
-            let mut token = HANDLE::default();
-            let source = match OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token) {
-                Ok(()) => "thread token",
-                Err(e) if e.code() == HRESULT::from_win32(ERROR_NO_TOKEN.0) => {
-                    match OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) {
-                        Ok(()) => "process token",
-                        Err(e) => {
-                            eprintln!("step0: OpenProcessToken failed: {e}");
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("step0: OpenThreadToken failed: {e}");
-                    return;
-                }
-            };
+pub(crate) use claim::*;
+pub(crate) use owner::*;
+pub(crate) use scratch::*;
 
-            let mut needed = 0u32;
-            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
-            // u64 elements: the buffer holds a TOKEN_USER, which carries a pointer and wants 8-byte alignment.
-            let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
-            let got = GetTokenInformation(
-                token,
-                TokenUser,
-                Some(buffer.as_mut_ptr().cast::<c_void>()),
-                needed,
-                &mut needed,
-            );
-            let caller_sid = if got.is_ok() {
-                (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid
-            } else {
-                PSID::default()
-            };
+pub(crate) const PREFIX: &str = "testsToDelete-";
+pub(crate) const REPO_TOKEN: &str = "sidecar";
+// Read by the guard (`tests/test_leftovers.rs`, S4) as TEXT of this file, never by code: it is the token's row in the
+// mounted rule's `## Tokens` table, `repository` column, which the guard compares this constant against.
+#[allow(dead_code)]
+pub(crate) const REPO_ROW: &str = "the embedding sidecar";
+pub(crate) const MAX_NAME: usize = 63;
+pub(crate) const ID_LENGTH: usize = 6;
+pub(crate) const START_TOLERANCE_S: u64 = 2;
+pub(crate) const MAX_CLAIM_BYTES: usize = 512;
 
-            let mut elevation = TOKEN_ELEVATION::default();
-            let mut returned = 0u32;
-            let elevated = GetTokenInformation(
-                token,
-                TokenElevation,
-                Some(std::ptr::from_mut(&mut elevation).cast::<c_void>()),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut returned,
-            )
-            .map(|()| elevation.TokenIsElevated != 0);
+/// A `Write` that is `std::io::stderr()` locked for ONE `write_all` at a time: libtest captures `eprintln!` and
+/// shows it only for a FAILED test, while a teardown that gives up usually does so in a passing one.
+pub(crate) struct StderrOut;
 
-            // The file: made like any test makes one, in the raw temp root, removed before this test returns.
-            // testsToDelete-exempt: raw-temp — step 0 measures the owner of a file in the raw temp root before any helper exists
-            let path = std::env::temp_dir()
-                .join(format!("bge-step0-owner-probe-{}.tmp", std::process::id()));
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .share_mode(7)
-                .open(&path);
-            match file {
-                Err(e) => eprintln!("step0: could not create {}: {e}", path.display()),
-                Ok(file) => {
-                    let mut owner = PSID::default();
-                    let mut descriptor = windows::Win32::Security::PSECURITY_DESCRIPTOR::default();
-                    let status = GetSecurityInfo(
-                        HANDLE(file.as_raw_handle()),
-                        SE_FILE_OBJECT,
-                        OWNER_SECURITY_INFORMATION,
-                        Some(&mut owner),
-                        None,
-                        None,
-                        None,
-                        Some(&mut descriptor),
-                    );
-                    if status.0 != 0 || owner.is_invalid() {
-                        eprintln!("step0: GetSecurityInfo failed with status {}", status.0);
-                    } else {
-                        let equal = !caller_sid.is_invalid() && EqualSid(owner, caller_sid).is_ok();
-                        eprintln!("step0: caller token      = {source}");
-                        eprintln!("step0: caller SID        = {}", sid_text(caller_sid));
-                        eprintln!("step0: file owner SID    = {}", sid_text(owner));
-                        eprintln!("step0: owner == caller   = {equal}");
-                        eprintln!("step0: token is elevated = {elevated:?}");
-                    }
-                    if !descriptor.0.is_null() {
-                        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-                    }
-                    drop(file);
-                }
-            }
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("step0: could not remove {}: {e}", path.display());
-                }
-            }
-            let _ = CloseHandle(token);
-        }
+impl Write for StderrOut {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::stderr().lock().write(buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        std::io::stderr().lock().write_all(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().lock().flush()
     }
 }
+
+/// One line, one `write_all`: eight test threads never interleave half-lines. A failing writer is ignored — a
+/// diagnostic must never be the reason a test run fails.
+pub(crate) fn write_line(out: &mut dyn Write, line: &str) {
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    let _ = out.write_all(&bytes);
+}
+
+/// The room for `<what>`, in BYTES, under `owner`: 63 less the prefix, the owner, the token, the three separators
+/// and the id — derived, never a constant, because the owner differs from `u1` to `w4294967295`.
+pub(crate) fn what_room(owner: &str) -> usize {
+    MAX_NAME - PREFIX.len() - owner.len() - 1 - REPO_TOKEN.len() - 1 - 1 - ID_LENGTH
+}
+
+/// What a name says about its version, read from its ONE second segment against the owner grammar.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NameForm {
+    Owner {
+        owner: String,
+        token: Option<String>,
+    },
+    Legacy {
+        token: String,
+    },
+    None,
+}
+
+/// Read `name` against the prefix in every case and either separator: the segment after the prefix is the OWNER when
+/// it is of the owner grammar (the segment after that is then the token), anything else is a LEGACY name's token —
+/// never by counting separators. Anything not prefixed, or with nothing after the prefix, is `None`.
+pub(crate) fn classify_name(name: &str) -> NameForm {
+    let word = &PREFIX[..PREFIX.len() - 1];
+    let bytes = name.as_bytes();
+    let separator = |b: &u8| *b == b'-' || *b == b'_';
+    let Some(head) = bytes.get(..word.len()) else {
+        return NameForm::None;
+    };
+    if !head.eq_ignore_ascii_case(word.as_bytes()) || !bytes.get(word.len()).is_some_and(separator)
+    {
+        return NameForm::None;
+    }
+    let mut segments = bytes[word.len() + 1..]
+        .split(separator)
+        .map(|segment| String::from_utf8_lossy(segment).to_ascii_lowercase());
+    let second = segments.next().filter(|segment| !segment.is_empty());
+    let Some(second) = second else {
+        return NameForm::None;
+    };
+    if owner::is_owner_token(&second) {
+        let token = segments.next().filter(|segment| !segment.is_empty());
+        NameForm::Owner {
+            owner: second,
+            token,
+        }
+    } else {
+        NameForm::Legacy { token: second }
+    }
+}
+
+/// The one `temp_dir()` call of the crate's tests: every scratch is made here.
+pub(crate) fn temp_root() -> std::path::PathBuf {
+    // testsToDelete-exempt: raw-temp — the helper's own temp root; every scratch is made here
+    std::env::temp_dir()
+}
+
+/// `<what>` obeys the file system and the budget: non-empty, no path separator, NUL or control character, no leading
+/// `-`, and no more BYTES than `what_room` leaves (stricter than the rule's characters for non-ASCII, never laxer than
+/// any reader). The owner is budgeted BEFORE `what`; a finished name is never truncated.
+pub(crate) fn check_what(what: &str) -> Result<(), String> {
+    if what.is_empty() {
+        return Err("`what` is empty".to_string());
+    }
+    if what
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(format!(
+            "`what` may not hold a path separator or a control character: {what:?}"
+        ));
+    }
+    if what.starts_with('-') {
+        return Err(format!("`what` may not start with `-`: {what:?}"));
+    }
+    let owner = owner_token();
+    let room = what_room(owner);
+    if what.len() > room {
+        return Err(format!(
+            "the whole name would pass {MAX_NAME} bytes — `what` is {} bytes, the most is {room} under the owner `{owner}`: {what:?}",
+            what.len()
+        ));
+    }
+    Ok(())
+}
+
+/// `<prefix><owner>-<token>-<what>-<id>`: the name of a scratch, from a validated `what` and a drawn id.
+pub(crate) fn name_for(what: &str, id: &str) -> String {
+    format!("{PREFIX}{}-{REPO_TOKEN}-{what}-{id}", owner_token())
+}
+
+/// A name with a fresh random id. Panics on an invalid `what`.
+pub(crate) fn owned_name(what: &str) -> String {
+    if let Err(problem) = check_what(what) {
+        panic!("test_scratch: {problem}");
+    }
+    name_for(what, &random_id())
+}
+
+/// Six characters of `[A-Za-z0-9]`. Std seeds `RandomState` from the OS; each id is a hasher fed a per-process
+/// counter and the clock, so two ids never come from the same input, and a byte is taken only below 248 (4 x 62) so
+/// the alphabet is drawn without modulo bias.
+pub(crate) fn random_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut id = String::with_capacity(ID_LENGTH);
+    while id.len() < ID_LENGTH {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        hasher.write_u128(now);
+        for byte in hasher.finish().to_le_bytes() {
+            if byte < 248 && id.len() < ID_LENGTH {
+                id.push(char::from(ALPHABET[usize::from(byte) % ALPHABET.len()]));
+            }
+        }
+    }
+    id
+}
+
+/// The start-of-run sweep (group C wires it here).
+pub(crate) fn sweep_at_start() {}
