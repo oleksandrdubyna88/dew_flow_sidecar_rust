@@ -188,6 +188,74 @@ fn orphan_claims_are_judged_by_their_owner() {
     assert!(root.join(&stranger).is_file());
 }
 
+/// Review round 1: a sweep killed after its rename leaves the folder's claim next to a quarantine. The orphan pass
+/// saw "a claim whose folder is absent" and removed it — the claim of a folder that is merely in quarantine.
+#[test]
+fn an_orphan_claim_beside_a_quarantine_is_kept() {
+    let scratch = TestScratch::new("orphan-quarantine");
+    let root = scratch.path();
+    let name = name_with("held", "abc123");
+    let original = folder(root, &name, Some(&gone_claim()));
+    let killed = catch_unwind(AssertUnwindSafe(|| {
+        let mut die = |_: &Path, _: &Path| panic!("killed after the rename");
+        let mut hooks = Hooks::default();
+        hooks.after_rename = Some(&mut die);
+        run_sweep(root, later(), &mut hooks)
+    }));
+    assert!(killed.is_err() && !original.exists());
+
+    // The renamer is THIS process, alive: the quarantine is not restored, and its claim is not an orphan.
+    let report = run_sweep(root, later(), &mut Hooks::default());
+    assert!(
+        claim_path(&original).is_file(),
+        "the claim of a quarantined folder stays: {report:?}"
+    );
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert_eq!(
+        kept(&report, &claim_path(&original)),
+        Some("quarantined"),
+        "{report:?}"
+    );
+
+    // Once the quarantine is restored and the folder removed with its claim, nothing is left to be an orphan.
+    let left = entries(root)
+        .into_iter()
+        .find(|entry| quarantine_pattern().is_match(entry))
+        .unwrap();
+    std::fs::remove_dir_all(root.join(left)).unwrap();
+    let report = run_sweep(root, later(), &mut Hooks::default());
+    assert_eq!(
+        report.removed,
+        vec![claim_path(&original)],
+        "a true orphan goes: {report:?}"
+    );
+}
+
+/// Review round 1: the root is listed ONCE and the passes share the snapshot; every candidate is still re-checked, so
+/// an entry this very sweep removed (a folder's claim) is skipped, not an `errors` entry.
+#[test]
+fn the_passes_share_one_listing_of_the_root() {
+    let scratch = TestScratch::new("one-listing");
+    let root = scratch.path();
+    let doomed = folder(root, &name_with("doomed", "abc123"), Some(&gone_claim()));
+    let late = claim_path(&root.join(name_with("late", "abc123")));
+
+    // A claim that appears after the listing was taken: this sweep never sees it, the next one does.
+    let mut appear = |_: &Path| std::fs::write(&late, gone_claim()).unwrap();
+    let mut hooks = Hooks::default();
+    hooks.after_capture = Some(&mut appear);
+    let report = run_sweep(root, later(), &mut hooks);
+    assert_eq!(report.removed, vec![doomed.clone()], "{report:?}");
+    assert!(
+        report.errors.is_empty(),
+        "a claim the sweep removed is not an error: {report:?}"
+    );
+    assert!(late.is_file(), "the snapshot predates it: {report:?}");
+
+    let report = run_sweep(root, later(), &mut Hooks::default());
+    assert_eq!(report.removed, vec![late.clone()], "{report:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_removal_that_teardown_gives_up_on_is_in_kept_and_nothing_is_lost() {

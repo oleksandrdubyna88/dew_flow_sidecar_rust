@@ -23,7 +23,7 @@ use super::{
 };
 use regex::Regex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -177,6 +177,16 @@ struct Sweeper<'a, 'h> {
     mine: &'a dyn Fn(&Path) -> bool,
     hooks: &'a mut Hooks<'h>,
     report: SweepReport,
+    /// The root listed ONCE (review round 1): every pass reads this snapshot, and every candidate is still
+    /// re-checked with its own `symlink_metadata`. A restore updates it, so the next pass sees what the first did.
+    listing: Option<Listing>,
+}
+
+/// The one `read_dir` of the root: its entries, and what could not be listed (each pass reports those under its own
+/// name, as it did when every pass listed for itself).
+struct Listing {
+    entries: Vec<(String, PathBuf)>,
+    problems: Vec<String>,
 }
 
 impl Sweeper<'_, '_> {
@@ -203,32 +213,59 @@ impl Sweeper<'_, '_> {
         ));
     }
 
-    /// The entries of the root, once per pass; the failure to list is ONE `errors` entry naming the root.
-    fn entries(&mut self, pass: &str) -> Vec<(String, PathBuf)> {
-        let listing = match std::fs::read_dir(self.root) {
-            Ok(listing) => listing,
+    fn list_root(&self) -> Listing {
+        let mut listing = Listing {
+            entries: Vec::new(),
+            problems: Vec::new(),
+        };
+        let reader = match std::fs::read_dir(self.root) {
+            Ok(reader) => reader,
             Err(e) => {
-                self.report
-                    .errors
-                    .push(format!("{pass}: cannot list {} ({e})", self.root.display()));
-                return Vec::new();
+                listing
+                    .problems
+                    .push(format!("cannot list {} ({e})", self.root.display()));
+                return listing;
             }
         };
-        let mut found = Vec::new();
-        for entry in listing {
+        for entry in reader {
             match entry {
                 Ok(entry) => {
                     if let Some(name) = entry.file_name().to_str() {
-                        found.push((name.to_string(), entry.path()));
+                        listing.entries.push((name.to_string(), entry.path()));
                     }
                 }
-                Err(e) => self.report.errors.push(format!(
-                    "{pass}: cannot read an entry of {} ({e})",
+                Err(e) => listing.problems.push(format!(
+                    "cannot read an entry of {} ({e})",
                     self.root.display()
                 )),
             }
         }
-        found
+        listing
+    }
+
+    /// The entries of the root: listed on the first call, the same snapshot after; a failure to list is one `errors`
+    /// entry per pass, naming the root.
+    fn entries(&mut self, pass: &str) -> Vec<(String, PathBuf)> {
+        if self.listing.is_none() {
+            self.listing = Some(self.list_root());
+        }
+        let listing = self.listing.as_ref().expect("the snapshot was just taken");
+        let problems: Vec<String> = listing
+            .problems
+            .iter()
+            .map(|problem| format!("{pass}: {problem}"))
+            .collect();
+        let entries = listing.entries.clone();
+        self.report.errors.extend(problems);
+        entries
+    }
+
+    /// A restore moved `quarantine` back to `original`: the snapshot says so.
+    fn note_restored(&mut self, quarantine: &Path, original_name: &str, original: PathBuf) {
+        if let Some(listing) = self.listing.as_mut() {
+            listing.entries.retain(|(_, path)| path != quarantine);
+            listing.entries.push((original_name.to_string(), original));
+        }
     }
 
     /// Is the entry as old as the window? A time that cannot be read is not old.
@@ -267,6 +304,7 @@ impl Sweeper<'_, '_> {
             }
             let original = self.root.join(&original_name);
             if exclusive_restore(&path, &original, self.mine) {
+                self.note_restored(&path, &original_name, original);
                 self.report.listed.push(format!(
                     "notice: restored {original_name} from a quarantine a killed sweep left"
                 ));
@@ -287,6 +325,8 @@ impl Sweeper<'_, '_> {
             }
             let meta = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
+                // Listed once, judged later: something this very sweep removed (a folder and its claim) is gone.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     self.report
                         .errors
@@ -464,8 +504,31 @@ impl Sweeper<'_, '_> {
 
     // ---------- pass 3: claims whose folder is absent ----------
 
+    /// The names (lower-cased) that have a quarantine beside them: in the snapshot, or reported `quarantine-conflict`
+    /// by this very sweep. The claim of such a folder is not an orphan's — the folder is in the quarantine.
+    fn quarantined_originals(&self, listing: &[(String, PathBuf)]) -> HashSet<String> {
+        let leaf = |path: &Path| path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let from_kept = self
+            .report
+            .kept
+            .iter()
+            .filter(|(_, reason)| reason == "quarantine-conflict")
+            .filter_map(|(path, _)| leaf(path));
+        let from_listing = listing.iter().map(|(name, _)| name.clone());
+        from_listing
+            .chain(from_kept)
+            .filter_map(|name| {
+                quarantine_pattern()
+                    .captures(&name)
+                    .map(|found| found[1].to_lowercase())
+            })
+            .collect()
+    }
+
     fn sweep_orphan_claims(&mut self, probe: &dyn Fn(u64) -> Probe) {
-        for (name, claim_file) in self.entries("claims") {
+        let listing = self.entries("claims");
+        let quarantined = self.quarantined_originals(&listing);
+        for (name, claim_file) in listing {
             let Some(stem) = name.strip_suffix(".owner") else {
                 continue;
             };
@@ -495,6 +558,12 @@ impl Sweeper<'_, '_> {
                     self.report
                         .listed
                         .push(format!("legacy: claim {name} — remove with: {command}"));
+                }
+                Relation::Own { .. } if quarantined.contains(&stem.to_lowercase()) => {
+                    // A sweep killed after its rename left the folder in a quarantine and its claim here: the
+                    // folder is not absent, it waits for a restore. The claim is its record — never removed as an
+                    // orphan's.
+                    self.keep(&claim_file, "quarantined");
                 }
                 Relation::Own { name_owner } => {
                     self.judge_orphan(&name, &claim_file, &folder, &name_owner, probe)
@@ -564,6 +633,7 @@ pub(crate) fn sweep(
         mine: &mine,
         hooks,
         report: SweepReport::default(),
+        listing: None,
     };
     sweeper.restore_quarantines(&cached);
     sweeper.sweep_folders(&cached);
