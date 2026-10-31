@@ -100,6 +100,21 @@ migraphx = ["ort/migraphx", "ort/load-dynamic", "dep:libloading"]
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 
+# `src/test_scratch.rs` (the test-only scratch-folder helper, `common/test-leftovers.md`) asks Windows who owns a
+# file, which process lives, and what the caller's SID is — read through the same `windows` crate the product links for
+# DXGI, so the lock gains only features, never a package. A `[target.'cfg(windows)'.dev-dependencies]` entry keeps
+# these features out of a release build (resolver 2 does not unify dev-dependency features into it).
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
 [profile.release]
 lto = true
 strip = true

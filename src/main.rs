@@ -52,6 +52,8 @@ mod preflight;
 mod provider;
 mod recipes;
 mod state;
+#[cfg(test)]
+mod test_scratch;
 mod testing;
 mod tokens;
 mod vram;
