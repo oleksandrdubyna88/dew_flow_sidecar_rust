@@ -14,6 +14,7 @@
 //!   not followed by an owner segment is a finding.
 //! - `scripts` — `owner-blind` in scripts and workflows is the SHIPPED classifier's verdict, validated, fail closed.
 //! - `token` — `REPO_TOKEN`/`REPO_ROW` against the rule's table and against an identity from outside the helper.
+//! - `rustviews` — what a Rust line says once its literals are read: escapes, joined pieces, one-character classes.
 //! - `words` — the words, in pieces: the guard scans its own files, and the machine-wide barrier scan reads them.
 //!
 //! No test here creates a folder or runs a generated script: this is an integration test of a binary crate and
@@ -21,12 +22,16 @@
 
 // The parts sit beside this file in `test_leftovers/`; `#[path]` because a test target's root file looks for its
 // children next to itself, not in a folder of its own name (and the target keeps the file name the plan gives it).
+#[path = "test_leftovers/bypass.rs"]
+mod bypass;
 #[path = "test_leftovers/classes.rs"]
 mod classes;
 #[path = "test_leftovers/discovery.rs"]
 mod discovery;
 #[path = "test_leftovers/repo.rs"]
 mod repo;
+#[path = "test_leftovers/rustviews.rs"]
+mod rustviews;
 #[path = "test_leftovers/scripts.rs"]
 mod scripts;
 #[path = "test_leftovers/token.rs"]
@@ -34,6 +39,9 @@ mod token;
 #[path = "test_leftovers/words.rs"]
 mod words;
 
+#[cfg(test)]
+#[path = "test_leftovers/bypass_fixtures.rs"]
+mod bypass_fixtures;
 #[cfg(test)]
 #[path = "test_leftovers/class_fixtures.rs"]
 mod class_fixtures;

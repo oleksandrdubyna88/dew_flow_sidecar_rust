@@ -44,8 +44,9 @@ fn a_prefix_bound_on_one_workflow_line_and_swept_nine_lines_later_is_one_finding
 fn a_name_from_elsewhere_and_a_prefix_split_in_two_bind_nothing() {
     let elsewhere = "      - run: |\n          P=\"$OTHER\"\n          rm -rf \"$P\"*\n";
     assert!(judge(".github/workflows/x.yml", Lang::Workflow, elsewhere).is_empty());
-    let split = "      - run: |\n          P='teststo''delete-'\n          rm -rf \"$P\"*\n";
-    assert!(judge(".github/workflows/x.yml", Lang::Workflow, split).is_empty());
+    let (a, b) = WORD.split_at(7);
+    let split = format!("      - run: |\n          P='{a}''{b}-'\n          rm -rf \"$P\"*\n");
+    assert!(judge(".github/workflows/x.yml", Lang::Workflow, &split).is_empty());
 }
 
 #[test]
@@ -57,16 +58,16 @@ fn a_script_constant_holding_the_prefix_and_used_as_a_filter_is_one_finding() {
 
 #[test]
 fn a_literal_glob_is_a_finding_and_the_owner_form_and_comments_are_not() {
-    let glob = format!("      - run: rm -rf /tmp/{WORD_CASED}-*\n");
+    let glob = format!("      - run: rm -rf /srv/{WORD_CASED}-*\n");
     assert_eq!(
         lines_of(&judge(".github/workflows/x.yml", Lang::Workflow, &glob)),
         vec![1]
     );
 
-    let owner = format!("      - run: rm -rf /tmp/{PREFIX_TEXT}u1000-sidecar-*\n");
+    let owner = format!("      - run: rm -rf /srv/{PREFIX_TEXT}u1000-sidecar-*\n");
     assert!(judge(".github/workflows/x.yml", Lang::Workflow, &owner).is_empty());
 
-    let comment = format!("      # rm -rf /tmp/{WORD_CASED}-*\n      - run: echo ok\n");
+    let comment = format!("      # rm -rf /srv/{WORD_CASED}-*\n      - run: echo ok\n");
     assert!(judge(".github/workflows/x.yml", Lang::Workflow, &comment).is_empty());
 
     let js_comment =

@@ -119,7 +119,10 @@ fn the_helpers_temp_root_accessor_is_a_raw_temp_bypass_outside_the_helper() {
     only(&scan("src/tokens.rs", &bypass), RAW_TEMP, 1);
     only(&scan("tests/other.rs", &bypass), RAW_TEMP, 1);
     none(&scan("src/test_scratch.rs", &bypass));
-    none(&scan("src/test_scratch/tests/x.rs", &bypass));
+    none(&scan("src/test_scratch/sweep.rs", &bypass));
+    // the helper's own tests are its callers: no allowance (review round 1)
+    only(&scan("src/test_scratch/tests/x.rs", &bypass), RAW_TEMP, 1);
+    only(&scan("src/test_scratch/tests.rs", &bypass), RAW_TEMP, 1);
     // only the whole word is the accessor
     none(&scan("src/x.rs", "let other_temp_root_name = 1;\n"));
 }
@@ -299,9 +302,14 @@ fn a_legacy_name_is_refused_and_an_exemption_clears_only_that_class() {
         "the owner-blind line remains: {found:?}"
     );
 
-    // the legacy class is read in the helper's own files too; owner-blind is not
-    let found = scan("src/test_scratch/tests/x.rs", &literal);
+    // the legacy class is read in the helper's own files too; owner-blind is not — but the helper's TESTS are not
+    // the helper (review round 1): both classes read them
+    let found = scan("src/test_scratch/sweep.rs", &literal);
     only(&found, LEGACY_NAME, 1);
+    let found = scan("src/test_scratch/tests/x.rs", &literal);
+    assert_eq!(count(&found, LEGACY_NAME), 1, "{found:?}");
+    assert_eq!(count(&found, OWNER_BLIND), 1, "{found:?}");
+    assert_eq!(found.len(), 2);
 }
 
 #[test]

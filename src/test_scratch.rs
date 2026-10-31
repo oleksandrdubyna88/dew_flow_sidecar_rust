@@ -188,6 +188,34 @@ pub(crate) fn check_what(what: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `<prefix><owner>-<token>-<what>-<id>` for ANY owner and token: a stranger's name, another repository's. The
+/// helper's tests build the names they need from here and never spell the prefix (S4's guard reads them as the helper's
+/// callers, review round 1).
+pub(crate) fn compose_name(owner: &str, token: &str, what: &str, id: &str) -> String {
+    format!("{PREFIX}{owner}-{token}-{what}-{id}")
+}
+
+/// A LEGACY name of this repository: `<prefix><token>-<what>-<id>`, no owner segment. Only a sweep's scenario needs one.
+pub(crate) fn legacy_name_for(what: &str, id: &str) -> String {
+    // testsToDelete-exempt: legacy-name — builds the legacy form for the sweep's scenarios; no code path writes one
+    format!("{PREFIX}{REPO_TOKEN}-{what}-{id}")
+}
+
+/// What follows the prefix, or none when `name` does not start with it.
+pub(crate) fn after_prefix(name: &str) -> Option<&str> {
+    name.strip_prefix(PREFIX)
+}
+
+/// The prefix in lower case, with its separator: what a quarantine's name carries before `quarantine-`.
+pub(crate) fn prefix_lowercase() -> String {
+    PREFIX.to_ascii_lowercase()
+}
+
+/// The leaf of the quarantine of `name`: `.<name>.<prefix, lower-case>quarantine-<pid>-<suffix>`.
+pub(crate) fn quarantine_leaf(name: &str, pid: impl std::fmt::Display, suffix: &str) -> String {
+    format!(".{name}.{}quarantine-{pid}-{suffix}", prefix_lowercase())
+}
+
 /// `<prefix><owner>-<token>-<what>-<id>`: the name of a scratch, from a validated `what` and a drawn id.
 pub(crate) fn name_for(what: &str, id: &str) -> String {
     format!("{PREFIX}{}-{REPO_TOKEN}-{what}-{id}", owner_token())

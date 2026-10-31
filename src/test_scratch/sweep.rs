@@ -105,11 +105,11 @@ pub(crate) fn quarantine_path(dir: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let token = super::random_hex(4); // 4 random bytes, 8 lower-case hex characters, as the reference sweeps draw
-    dir.with_file_name(format!(
-        ".{name}.{}quarantine-{}-{token}",
-        PREFIX.to_ascii_lowercase(),
-        std::process::id()
+    // 4 random bytes, 8 lower-case hex characters, as the reference sweeps draw
+    dir.with_file_name(super::quarantine_leaf(
+        &name,
+        std::process::id(),
+        &super::random_hex(4),
     ))
 }
 

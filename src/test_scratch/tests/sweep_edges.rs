@@ -177,7 +177,10 @@ fn orphan_claims_are_judged_by_their_owner() {
         "a young orphan is not considered: {young:?}"
     );
 
-    let stranger = format!("{PREFIX}{}-{REPO_TOKEN}-orphan-abc123.owner", other_owner());
+    let stranger = format!(
+        "{}.owner",
+        compose_name(other_owner(), REPO_TOKEN, "orphan", "abc123")
+    );
     std::fs::write(root.join(&stranger), gone_claim()).unwrap();
     let report = run_sweep(root, later(), &mut Hooks::default());
     assert!(
@@ -198,8 +201,10 @@ fn an_orphan_claim_beside_a_quarantine_is_kept() {
     let original = folder(root, &name, Some(&gone_claim()));
     let killed = catch_unwind(AssertUnwindSafe(|| {
         let mut die = |_: &Path, _: &Path| panic!("killed after the rename");
-        let mut hooks = Hooks::default();
-        hooks.after_rename = Some(&mut die);
+        let mut hooks = Hooks {
+            after_rename: Some(&mut die),
+            ..Hooks::default()
+        };
         run_sweep(root, later(), &mut hooks)
     }));
     assert!(killed.is_err() && !original.exists());
@@ -242,8 +247,10 @@ fn the_passes_share_one_listing_of_the_root() {
 
     // A claim that appears after the listing was taken: this sweep never sees it, the next one does.
     let mut appear = |_: &Path| std::fs::write(&late, gone_claim()).unwrap();
-    let mut hooks = Hooks::default();
-    hooks.after_capture = Some(&mut appear);
+    let mut hooks = Hooks {
+        after_capture: Some(&mut appear),
+        ..Hooks::default()
+    };
     let report = run_sweep(root, later(), &mut hooks);
     assert_eq!(report.removed, vec![doomed.clone()], "{report:?}");
     assert!(
@@ -268,7 +275,7 @@ fn the_quarantine_pass_never_asks_about_a_pid_that_cannot_be_a_process() {
     let beyond = (1u64 << 53).to_string();
     let mut quarantines = Vec::new();
     for pid in ["0", "007", &beyond, "99999999999999999999999"] {
-        let quarantine = root.join(quarantine_name(&name, 0).replace("-0-", &format!("-{pid}-")));
+        let quarantine = root.join(quarantine_leaf(&name, pid, "abcd"));
         std::fs::create_dir(&quarantine).unwrap();
         quarantines.push(quarantine);
     }
@@ -331,8 +338,10 @@ fn the_rename_into_quarantine_never_replaces_an_existing_entry() {
             free.clone()
         }
     };
-    let mut hooks = Hooks::default();
-    hooks.quarantine_name = Some(&mut draw);
+    let mut hooks = Hooks {
+        quarantine_name: Some(&mut draw),
+        ..Hooks::default()
+    };
     let report = run_sweep(root, later(), &mut hooks);
     assert_eq!(report.removed, vec![doomed.clone()], "{report:?}");
     assert!(
@@ -440,10 +449,7 @@ fn a_removal_that_teardown_gives_up_on_is_in_kept_and_nothing_is_lost() {
 // ---------- 18 ----------
 
 fn quarantine_name(name: &str, pid: u64) -> String {
-    format!(
-        ".{name}.{}quarantine-{pid}-abcd",
-        PREFIX.to_ascii_lowercase()
-    )
+    quarantine_leaf(name, pid, "abcd")
 }
 
 #[test]
@@ -581,7 +587,7 @@ fn the_quarantine_name_the_producer_draws_is_the_one_every_sweeper_reads() {
         // The same pattern as the other sweepers, written out here, independent of `quarantine_pattern`.
         let shared = regex::Regex::new(&format!(
             r"(?i)^\.(.+)\.{}quarantine-(\d+)-([0-9a-f]+)$",
-            PREFIX.to_ascii_lowercase()
+            prefix_lowercase()
         ))
         .unwrap();
         assert!(shared.is_match(&leaf), "{leaf}");
@@ -599,8 +605,10 @@ fn a_sweep_killed_after_its_rename_leaves_a_quarantine_the_next_sweep_restores()
     // The REAL producer names the quarantine; the sweep dies right after the rename (a panic stands for SIGKILL).
     let killed = catch_unwind(AssertUnwindSafe(|| {
         let mut die = |_: &Path, _: &Path| panic!("killed after the rename");
-        let mut hooks = Hooks::default();
-        hooks.after_rename = Some(&mut die);
+        let mut hooks = Hooks {
+            after_rename: Some(&mut die),
+            ..Hooks::default()
+        };
         run_sweep(root, later(), &mut hooks)
     }));
     assert!(killed.is_err());

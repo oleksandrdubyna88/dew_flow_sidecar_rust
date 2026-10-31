@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 use std::io;
 
 fn name_with(what: &str, id: &str) -> String {
-    format!("{PREFIX}{}-{REPO_TOKEN}-{what}-{id}", owner_token())
+    name_for(what, id)
 }
 
 /// The names in `dir`, sorted — what a scenario means by "the parent is empty".

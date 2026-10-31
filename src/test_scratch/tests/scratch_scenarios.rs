@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn a_scratch_is_named_with_the_owner_the_token_and_a_random_id() {
     let name = owned_name("seed");
-    let rest = name.strip_prefix(PREFIX).expect("the prefix");
+    let rest = after_prefix(&name).expect("the prefix");
     let rest = rest
         .strip_prefix(owner_token())
         .expect("the owner follows the prefix")
@@ -27,9 +27,11 @@ fn a_scratch_is_named_with_the_owner_the_token_and_a_random_id() {
         .and_then(|n| n.to_str())
         .expect("a UTF-8 leaf");
     assert!(
-        leaf.starts_with(&format!(
-            "{PREFIX}{}-sidecar-unicode пробел-",
-            owner_token()
+        leaf.starts_with(&compose_name(
+            owner_token(),
+            "sidecar",
+            "unicode пробел",
+            ""
         )),
         "{leaf}"
     );
@@ -47,13 +49,13 @@ fn a_scratch_is_named_with_the_owner_the_token_and_a_random_id() {
     );
 
     assert_eq!(
-        classify_name(&format!("{PREFIX}sidecar-x-abc123")),
+        classify_name(&legacy_name_for("x", "abc123")),
         NameForm::Legacy {
             token: "sidecar".into()
         }
     );
     assert_eq!(
-        classify_name(&format!("{PREFIX}u7-mcp-x-abc123")),
+        classify_name(&compose_name("u7", "mcp", "x", "abc123")),
         NameForm::Owner {
             owner: "u7".into(),
             token: Some("mcp".into())

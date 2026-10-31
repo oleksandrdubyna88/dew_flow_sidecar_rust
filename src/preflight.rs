@@ -273,18 +273,17 @@ mod tests {
             "{denied}"
         );
 
-        let ok = cache_dir_verdict("/var/tmp/mgx", |_| Ok(())).expect("a writable path passes");
-        assert!(ok.contains("/var/tmp/mgx"), "{ok}");
+        let ok = cache_dir_verdict("/srv/cache/mgx", |_| Ok(())).expect("a writable path passes");
+        assert!(ok.contains("/srv/cache/mgx"), "{ok}");
     }
 
     /// A scratch tree is the test's own: once the test ends nothing of it remains on disk. (Before the move to
     /// `TestScratch` the helper pre-cleaned and never cleaned after, so every passing run left a folder behind.)
     #[test]
     fn a_seed_scratch_is_gone_once_its_test_ends() {
-        let base = {
-            let seed = seed_scratch("gone");
-            seed.scratch.path().to_path_buf()
-        };
+        let seed = seed_scratch("gone");
+        let base = seed.scratch.path().to_path_buf();
+        drop(seed);
 
         assert!(
             !base.exists(),

@@ -185,14 +185,13 @@ fn the_sweep_removes_only_what_a_gone_owner_left_and_lists_the_rest() {
     let swapped = folder(root, &named("swapped"), Some(&gone_claim()));
     let into_quarantine = folder(root, &named("raced"), Some(&gone_claim()));
 
-    let foreign = format!("{PREFIX}{}-{REPO_TOKEN}-x-abc123", other_owner());
+    let foreign = compose_name(other_owner(), REPO_TOKEN, "x", "abc123");
     let foreign_dir = folder(root, &foreign, Some(&gone_claim()));
-    // testsToDelete-exempt: legacy-name — a legacy name the sweep must only list, built at run time
-    let legacy = format!("{PREFIX}{REPO_TOKEN}-x-abc123");
+    let legacy = legacy_name_for("x", "abc123");
     let legacy_dir = folder(root, &legacy, Some("devbox@linux:1\n"));
     let other_token = folder(
         root,
-        &format!("{PREFIX}{}-mcp-x-abc123", other_owner()),
+        &compose_name(other_owner(), "mcp", "x", "abc123"),
         None,
     );
     let not_ours = folder(root, "bge-log-1-first", None);

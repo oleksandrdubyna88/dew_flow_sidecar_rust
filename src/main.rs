@@ -375,10 +375,10 @@ mod tests {
     #[test]
     fn an_explicit_path_is_taken() {
         let target = canary_reference_target(
-            ["bge-sidecar", "--write-canary-reference", "/tmp/new.f32le"].map(String::from),
+            ["bge-sidecar", "--write-canary-reference", "/srv/new.f32le"].map(String::from),
         );
 
-        assert_eq!(target, Some(std::path::PathBuf::from("/tmp/new.f32le")));
+        assert_eq!(target, Some(std::path::PathBuf::from("/srv/new.f32le")));
     }
 
     /// A following FLAG is not a path. Without this, `--write-canary-reference --verbose` would write the

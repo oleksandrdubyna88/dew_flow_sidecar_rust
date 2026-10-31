@@ -41,3 +41,33 @@ pub fn owner_name() -> String {
 pub fn legacy_name() -> String {
     format!("{PREFIX_TEXT}sidecar-x-abc123")
 }
+
+// ---------- the planted spellings of review round 1 (E4): built here, so no other file spells them ----------
+
+/// The first five and the rest of the cased word (`tests` / `ToDelete`): two pieces that are not the word.
+pub fn halves() -> (&'static str, &'static str) {
+    WORD_CASED.split_at(5)
+}
+
+/// Every character of `text` as `\xNN` (ASCII only): the word as a string literal's escapes.
+pub fn hex_escaped(text: &str) -> String {
+    text.bytes().map(|b| format!("\\x{b:02x}")).collect()
+}
+
+/// `text` with its character at `index` as `\u{..}`.
+pub fn with_unicode_escape(text: &str, index: usize) -> String {
+    text.chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i == index {
+                format!("\\u{{{:x}}}", u32::from(c))
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// A shared temp directory, as a literal's content: `/tmp` and `/var/tmp`.
+pub const SLASH_TMP: &str = concat!("/t", "mp");
+pub const VAR_TMP: &str = concat!("/var", "/t", "mp");

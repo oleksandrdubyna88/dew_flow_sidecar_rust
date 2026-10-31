@@ -17,6 +17,8 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use crate::bypass::{block_escape_hits, drop_call_hits, legacy_hits, temp_hits, word_hits};
+use crate::rustviews::views;
 use crate::words::{MARK, WORD};
 
 pub const RAW_TEMP: &str = "raw-temp";
@@ -92,10 +94,18 @@ pub fn language_of(file: &str) -> Option<Lang> {
 }
 
 /// The helper's own files: where the prefix may be spelled, the temp root is made and used. Everything else is
-/// judged without these allowances.
+/// judged without these allowances — and that includes the helper's own TESTS (`src/test_scratch/tests.rs` and
+/// `src/test_scratch/tests/`): they are its callers, not the helper (review round 1: Step 0 made an unprefixed file
+/// in the raw temp root from there, and the allowance covered it).
 pub fn is_helper_file(file: &str) -> bool {
-    file == "src/test_scratch.rs" || file.starts_with("src/test_scratch/")
+    let tests = file == "src/test_scratch/tests.rs" || file.starts_with("src/test_scratch/tests/");
+    (file == "src/test_scratch.rs" || file.starts_with("src/test_scratch/")) && !tests
 }
+
+/// The ONE other allowance, pinned by exact path: the guard's own piece-builder. It holds the pieces the fixtures are
+/// made of — the word in two halves, a temp path in two halves — so it is not judged for the word or for a temp path
+/// in pieces. Every other file of the guard builds its words from this one.
+pub const WORDS_FILE: &str = "tests/test_leftovers/words.rs";
 
 /// The lines of a text, `\r` dropped, a trailing empty piece kept — the numbering the shipped classifier uses.
 pub fn split_lines(text: &str) -> Vec<&str> {
@@ -405,7 +415,7 @@ fn docker_name_hits(line: &str) -> Vec<String> {
     hits
 }
 
-fn legacy_name_hits(line: &str) -> Vec<String> {
+pub(crate) fn legacy_name_hits(line: &str) -> Vec<String> {
     let d = detectors();
     let mut hits = Vec::new();
     for caught in d.legacy_literal.captures_iter(line) {
@@ -433,7 +443,17 @@ fn legacy_name_hits(line: &str) -> Vec<String> {
 
 /// Every spelling of the prefix word in Rust source outside the helper that is not followed by an owner segment —
 /// and the helper's prefix constant, which would carry the same prefix into a sweep without spelling it.
-fn rust_owner_blind_hits(line: &str) -> Vec<String> {
+pub(crate) fn rust_owner_blind_hits(line: &str) -> Vec<String> {
+    let mut hits = rust_word_hits(line);
+    if detectors().prefix_const.is_match(line) {
+        hits.push("the helper's prefix constant".to_string());
+    }
+    hits
+}
+
+/// The prefix WORD alone, every spelling not followed by an owner segment (the part of the judgement the decoded and
+/// the joined views of a line repeat; the constant is a name in code, not a piece of a literal).
+pub(crate) fn rust_word_hits(line: &str) -> Vec<String> {
     let d = detectors();
     let mut hits = Vec::new();
     for found in d.word.find_iter(line) {
@@ -448,9 +468,6 @@ fn rust_owner_blind_hits(line: &str) -> Vec<String> {
         }
         let tail: String = rest.chars().take(6).collect();
         hits.push(format!("`{}{tail}`", found.as_str()));
-    }
-    if d.prefix_const.is_match(line) {
-        hits.push("the helper's prefix constant".to_string());
     }
     hits
 }
@@ -495,6 +512,7 @@ pub fn scan_text(file: &str, text: &str) -> Vec<Finding> {
     let lines = split_lines(text);
     let exemptions = read_exemptions(file, &lines);
     let helper = is_helper_file(file);
+    let guard_words = file == WORDS_FILE;
     let d = detectors();
     let mut found = exemptions.findings.clone();
     for (index, line) in lines.iter().enumerate() {
@@ -519,11 +537,23 @@ pub fn scan_text(file: &str, text: &str) -> Vec<Finding> {
             }
         };
 
+        // Rust is READ, not only matched: the literals decoded, their pieces joined (review round 1).
+        let read = (lang == Lang::Rust).then(|| views(line));
         let mut temp: Vec<String> = d
             .raw_temp
             .iter()
             .filter_map(|p| p.find(line).map(|m| m.as_str().trim().to_string()))
             .collect();
+        if let Some(read) = &read {
+            temp.extend(
+                d.raw_temp
+                    .iter()
+                    .filter_map(|p| p.find(&read.decoded).map(|m| m.as_str().trim().to_string())),
+            );
+            if !guard_words {
+                temp.extend(temp_hits(read));
+            }
+        }
         if lang == Lang::Workflow {
             temp.extend(
                 d.raw_temp_workflow
@@ -563,7 +593,11 @@ pub fn scan_text(file: &str, text: &str) -> Vec<Finding> {
                 .collect(),
         );
         add(DOCKER_NAME, docker_name_hits(line));
-        add(LEGACY_NAME, legacy_name_hits(line));
+        let mut legacy = legacy_name_hits(line);
+        if let Some(read) = read.as_ref().filter(|_| !helper && !guard_words) {
+            legacy.extend(legacy_hits(read));
+        }
+        add(LEGACY_NAME, legacy);
         add(SHARED_STORE, shared_store_hit(line));
         add(
             RYUK_OFF,
@@ -574,13 +608,24 @@ pub fn scan_text(file: &str, text: &str) -> Vec<Finding> {
                 .collect(),
         );
         if lang == Lang::Rust {
-            if !helper {
-                add(OWNER_BLIND, rust_owner_blind_hits(line));
+            if !helper && !guard_words {
+                let mut blind = rust_owner_blind_hits(line);
+                blind.extend(read.iter().flat_map(word_hits));
+                add(OWNER_BLIND, blind);
             }
-            add(
+            let mut dropped: Vec<String> = dropped_scratch_hit(line).into_iter().collect();
+            dropped.extend(read.iter().flat_map(drop_call_hits));
+            add(DROPPED_SCRATCH, dropped);
+        }
+    }
+    if lang == Lang::Rust {
+        for (number, text) in block_escape_hits(text) {
+            found.push(finding(
+                file,
+                number,
                 DROPPED_SCRATCH,
-                dropped_scratch_hit(line).into_iter().collect(),
-            );
+                format!("`{text}` — the scratch is dropped at the end of its block while its path escapes"),
+            ));
         }
     }
     found
