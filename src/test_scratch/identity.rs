@@ -9,7 +9,7 @@ use std::time::SystemTime;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FileId {
     dev: u64,
-    ino: u64,
+    ino: u128,
     changed: (i64, i64),
 }
 
@@ -34,7 +34,7 @@ pub(crate) fn file_id(path: &Path) -> Option<FileId> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     Some(FileId {
         dev: meta.dev(),
-        ino: meta.ino(),
+        ino: u128::from(meta.ino()),
         changed: (meta.ctime(), meta.ctime_nsec()),
     })
 }
@@ -52,6 +52,50 @@ pub(crate) fn file_id(path: &Path) -> Option<FileId> {
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn file_id(_path: &Path) -> Option<FileId> {
     None
+}
+
+/// The identity of an OPEN file, read on its handle (`fstat`; Windows `FILE_ID_INFO`).
+#[cfg(unix)]
+pub(crate) fn handle_id(file: &std::fs::File) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata().ok()?;
+    Some(FileId {
+        dev: meta.dev(),
+        ino: u128::from(meta.ino()),
+        changed: (meta.ctime(), meta.ctime_nsec()),
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn handle_id(file: &std::fs::File) -> Option<FileId> {
+    let (dev, ino, changed) = super::win::handle_identity(file)?;
+    Some(FileId {
+        dev,
+        ino,
+        changed: (changed, 0),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn handle_id(_file: &std::fs::File) -> Option<FileId> {
+    None
+}
+
+/// Is the open handle a regular file — POSIX `S_ISREG`; Windows `FILE_TYPE_DISK`, and neither a directory nor a
+/// reparse point? A FIFO, a socket, a device, a pipe or a directory is not.
+#[cfg(unix)]
+pub(crate) fn is_plain_file(file: &std::fs::File) -> bool {
+    file.metadata().is_ok_and(|meta| meta.is_file())
+}
+
+#[cfg(windows)]
+pub(crate) fn is_plain_file(file: &std::fs::File) -> bool {
+    super::win::is_plain_file(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn is_plain_file(_file: &std::fs::File) -> bool {
+    false
 }
 
 /// When the entry's inode last changed (a rename counts): the age of a quarantine is its rename, not its content.

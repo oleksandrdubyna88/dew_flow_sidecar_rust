@@ -3,11 +3,11 @@
 //! The claim sits BESIDE the folder (`<folder>.owner`), never inside it: a test that makes a git repository at the
 //! folder, or asserts the exact listing of the folder, must see exactly what it made (rule §3).
 
-use super::identity::{file_id, FileId};
+use super::identity::{file_id, handle_id, is_plain_file, FileId};
 use super::owner::{parse_owner, Claim};
 use super::{remove_with_retries, write_line, StderrOut, MAX_CLAIM_BYTES};
 use std::ffi::OsString;
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -36,9 +36,12 @@ pub(crate) struct ClaimSnapshot {
 }
 
 /// Open `path` without following a link (POSIX `O_NOFOLLOW`; a Windows reparse point is opened ITSELF) and without
-/// ever blocking on a FIFO swapped in after the type test, and read at most `MAX_CLAIM_BYTES + 1` bytes — one past
-/// the limit, to see it. The opened file must be the regular file `expected` described.
-fn read_limited(path: &Path, expected: &Metadata) -> io::Result<Vec<u8>> {
+/// ever blocking on a FIFO or a named pipe swapped in after the type test, and read at most `MAX_CLAIM_BYTES + 1`
+/// bytes — one past the limit, to see it. The OPENED HANDLE is judged, not the path: it must be a regular file
+/// (POSIX `fstat` `S_ISREG`; Windows `GetFileType` is `FILE_TYPE_DISK` and the handle is neither a directory nor a
+/// reparse point) and the file `expected` named (device and inode; Windows the 128-bit file id). No identity to
+/// compare with, or one that differs, is an error: the entry was swapped, and nothing is read.
+pub(crate) fn read_limited(path: &Path, expected: Option<FileId>) -> io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -52,20 +55,17 @@ fn read_limited(path: &Path, expected: &Metadata) -> io::Result<Vec<u8>> {
         options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
     }
     let file: File = options.open(path)?;
-    let opened = file.metadata()?;
-    if !opened.is_file() {
+    if !is_plain_file(&file) {
         return Err(io::Error::other("not a regular file"));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if (opened.dev(), opened.ino()) != (expected.dev(), expected.ino()) {
+    match (handle_id(&file), expected) {
+        (Some(opened), Some(expected)) if opened.same_inode(&expected) => {}
+        _ => {
             return Err(io::Error::other(
                 "the file was replaced while it was opened",
-            ));
+            ))
         }
     }
-    let _ = expected;
     let mut bytes = Vec::new();
     file.take(MAX_CLAIM_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
@@ -83,7 +83,7 @@ pub(crate) fn snapshot_claim(dir: &Path, mine: &dyn Fn(&Path) -> bool) -> ClaimS
         Err(_) => RawClaim::Unreadable { foreign_uid: false },
         Ok(meta) if !meta.is_file() => RawClaim::Unreadable { foreign_uid: false },
         Ok(_) if !mine(&claim) => RawClaim::Unreadable { foreign_uid: true },
-        Ok(meta) => match read_limited(&claim, &meta) {
+        Ok(_) => match read_limited(&claim, id) {
             Ok(bytes) => RawClaim::Text(bytes),
             Err(_) => RawClaim::Unreadable { foreign_uid: false },
         },
@@ -134,7 +134,7 @@ fn remove_claim_once(
         return Ok(());
     }
     let before = file_id(claim);
-    if read_limited(claim, &meta)? != written {
+    if read_limited(claim, before)? != written {
         return Ok(());
     }
     between(); // a seam: what happens between the read and the unlink

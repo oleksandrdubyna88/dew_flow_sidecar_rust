@@ -247,6 +247,74 @@ fn the_caller_is_the_threads_token_first_on_every_call() {
     assert_eq!(later, process_user, "a fresh thread is the process user");
 }
 
+// ---------- 7, one handle, 128-bit ids ----------
+
+/// Review round 1: the identity of an entry is `FILE_ID_INFO`'s 128 bits (ReFS and a Dev Drive have ids the 64-bit
+/// `nFileIndex` cannot tell apart), read on the handle; and the profile test of `is_mine` resolves the path ON THE SAME
+/// HANDLE (`GetFinalPathNameByHandleW`), which agrees with the resolved path a second open would give.
+#[test]
+fn an_entry_has_a_128_bit_identity_and_one_handle_gives_its_final_path() {
+    let scratch = TestScratch::new("handle-identity");
+    let (a, b) = (scratch.path().join("a"), scratch.path().join("b"));
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+    let (id_a, id_b) = (file_id(&a), file_id(&b));
+    assert!(
+        id_a.is_some() && id_b.is_some(),
+        "FileIdInfo answers on a local volume"
+    );
+    assert!(same_id(id_a, file_id(&a)), "stable for one entry");
+    assert!(!same_id(id_a, id_b), "two entries differ");
+    let opened = std::fs::File::open(&a).unwrap();
+    assert!(id_a.is_some_and(|id| handle_id(&opened).is_some_and(|h| h.same_inode(&id))));
+    assert!(is_plain_file(&opened));
+    let directory = std::fs::File::open(scratch.path());
+    assert!(
+        directory.map_or(true, |d| !is_plain_file(&d)),
+        "a directory is not a plain file"
+    );
+
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(7)
+        .open(&a)
+        .unwrap();
+    let from_handle = win::final_path_of(&handle).expect("a final path");
+    let from_name = std::fs::canonicalize(&a).unwrap();
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+    assert_eq!(lower(&from_handle), lower(&from_name));
+}
+
+/// An entry reached THROUGH a junction whose target is outside the profile is not the caller's, whoever owns it; the
+/// junction itself is a reparse point and never is.
+#[test]
+fn a_junction_is_never_mine_and_nothing_reached_through_one_outside_the_profile_is() {
+    let scratch = TestScratch::new("junction");
+    let link = scratch.path().join("link");
+    let target = std::path::PathBuf::from(
+        std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()),
+    )
+    .join("System32");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .expect("cmd runs");
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stdout)
+    );
+    assert!(!is_mine(&link), "a reparse point is never mine");
+    assert!(
+        !is_mine(&link.join("drivers")),
+        "its target is outside the profile: not mine, whoever owns it"
+    );
+    // `rmdir` removes the junction itself and never what it points at.
+    std::fs::remove_dir(&link).unwrap();
+}
+
 // ---------- 0 ----------
 
 /// Step 0 of the E4 plan (`research/PLAN_test_leftovers_E4.md`, S2): what does Windows say owns a file this

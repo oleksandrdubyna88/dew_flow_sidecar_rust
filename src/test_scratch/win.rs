@@ -26,9 +26,11 @@ use windows::Win32::Security::{
     TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MoveFileExW,
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, MOVE_FILE_FLAGS,
+    FileBasicInfo, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetFileType, GetFinalPathNameByHandleW, MoveFileExW, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_NAME_NORMALIZED,
+    FILE_TYPE_DISK, GETFINALPATHNAMEBYHANDLE_FLAGS, MOVE_FILE_FLAGS, VOLUME_NAME_DOS,
 };
 use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows::Win32::System::Threading::{
@@ -284,27 +286,76 @@ fn information(file: &File) -> Option<BY_HANDLE_FILE_INFORMATION> {
     Some(info)
 }
 
-/// The volume serial, the file index and the `ChangeTime` (FILETIME ticks) of the entry itself.
-pub(super) fn file_identity(path: &Path) -> Option<(u64, u64, i64)> {
-    let file = open_entry(path).ok()?;
-    let info = information(&file)?;
+/// The volume serial, the 128-bit file id and the `ChangeTime` (FILETIME ticks) of the entry itself.
+pub(super) fn file_identity(path: &Path) -> Option<(u64, u128, i64)> {
+    handle_identity(&open_entry(path).ok()?)
+}
+
+/// The same three on an open handle. The id is `FILE_ID_INFO`'s 128 bits (`GetFileInformationByHandleEx`,
+/// `FileIdInfo`), NOT `nFileIndexHigh/Low`: ReFS and a Dev Drive hand out 128-bit ids, and the 64-bit index of a
+/// volume that has them can collide. A file system that cannot answer `FileIdInfo` gives NO identity — which never
+/// compares equal (rule §4) and so preserves.
+pub(super) fn handle_identity(file: &File) -> Option<(u64, u128, i64)> {
+    let mut id = FILE_ID_INFO::default();
     let mut basic = FILE_BASIC_INFO::default();
-    // SAFETY: a live handle and a buffer of exactly the size of the class asked for.
+    // SAFETY: a live handle and buffers of exactly the size of the classes asked for.
     unsafe {
         GetFileInformationByHandleEx(
-            handle_of(&file),
+            handle_of(file),
+            FileIdInfo,
+            std::ptr::from_mut(&mut id).cast::<c_void>(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+        .ok()?;
+        GetFileInformationByHandleEx(
+            handle_of(file),
             FileBasicInfo,
             std::ptr::from_mut(&mut basic).cast::<c_void>(),
             std::mem::size_of::<FILE_BASIC_INFO>() as u32,
         )
+        .ok()?;
     }
-    .ok()?;
-    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
     Some((
-        u64::from(info.dwVolumeSerialNumber),
-        index,
+        id.VolumeSerialNumber,
+        u128::from_le_bytes(id.FileId.Identifier),
         basic.ChangeTime,
     ))
+}
+
+/// Is the open handle a plain disk file: `GetFileType` says `FILE_TYPE_DISK` (not a pipe, a device or a socket — checked
+/// before any read, so nothing can block), and it is neither a directory nor a reparse point.
+pub(super) fn is_plain_file(file: &File) -> bool {
+    // SAFETY: a live handle.
+    if unsafe { GetFileType(handle_of(file)) } != FILE_TYPE_DISK {
+        return false;
+    }
+    information(file).is_some_and(|info| {
+        info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0) == 0
+    })
+}
+
+/// The final path of the entry the handle is open on, as the system resolves it (`GetFinalPathNameByHandleW`, DOS
+/// volume name, normalised): every link in the path resolved ON THIS HANDLE, so the answer is about the object that
+/// was judged and not about a name opened a second time. Begins `\\?\`.
+pub(super) fn final_path_of(file: &File) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
+    let mut buffer = vec![0u16; 512];
+    for _ in 0..3 {
+        // SAFETY: a live handle and a writable buffer whose length the call is told.
+        let length =
+            unsafe { GetFinalPathNameByHandleW(handle_of(file), &mut buffer, flags) } as usize;
+        if length == 0 {
+            return None;
+        }
+        if length < buffer.len() {
+            return Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                &buffer[..length],
+            )));
+        }
+        buffer = vec![0u16; length + 1];
+    }
+    None
 }
 
 /// The owner SID of the entry on `file`'s handle, copied out; none when it cannot be read.
@@ -346,8 +397,9 @@ fn inside(child: &Path, parent: &Path) -> bool {
     child.len() > parent.len() && child[..parent.len()] == parent[..]
 }
 
-/// Owner decision 2 of the E4 plan: BOTH keys, on one handle — the entry is not a reparse point, its resolved path is
-/// inside the resolved `%USERPROFILE%`, and its owner SID is the caller's user SID. Either unreadable → `false`.
+/// Owner decision 2 of the E4 plan: BOTH keys, on one handle — the entry is not a reparse point, its final path
+/// (`GetFinalPathNameByHandleW` on THAT handle, not a second open by name) is inside the resolved `%USERPROFILE%`, and
+/// its owner SID is the caller's user SID. Either unreadable → `false`.
 pub(super) fn is_mine(path: &Path) -> bool {
     let sid = caller_sid();
     if sid.is_empty() {
@@ -366,7 +418,7 @@ pub(super) fn is_mine(path: &Path) -> bool {
     if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return false;
     }
-    let Ok(resolved) = std::fs::canonicalize(path) else {
+    let Some(resolved) = final_path_of(&file) else {
         return false;
     };
     inside(&resolved, &profile)
