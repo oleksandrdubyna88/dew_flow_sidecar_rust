@@ -246,6 +246,91 @@ fn an_owner_round_trips_and_the_shared_vectors_agree() {
     }
 }
 
+// ---------- 12, the `verdicts` section ----------
+
+/// The shared `verdicts` vectors (v01-v26 of `owner-vectors.json`) through `owner_state` with a seam probe, as the Node
+/// side runs them: the vector's facts become a record (`host`, `pidText`/`generated pid`, `startDelta` against a live
+/// start the probe reports only when `liveStart`) and a probe (`pid`: absent = gone, present = alive, refused =
+/// unknown); `ownerText` is raw text behind the caller's owner field, `{HOST}` this machine's `<name>@<os>` and
+/// `{NAME}` its name. A vector that is refused before any liveness query must not have asked one. Two readers: a Linux
+/// one (its pid namespace readable, the record's the same) and a Windows one (no namespace).
+#[test]
+fn the_shared_verdict_vectors_agree() {
+    const LIVE_START: u64 = 1_790_000_000;
+    let vectors = vectors();
+    let rows = rows(&vectors, "verdicts");
+    assert!(rows.len() >= 26, "v01-v26: {} vectors", rows.len());
+    for tag in ["linux", "windows"] {
+        let me = Owner {
+            host: format!("box@{tag}"),
+            start: Some(LIVE_START),
+            ns: (tag == "linux").then_some(4_242),
+            ..owner("u1000", "", 50)
+        };
+        for row in &rows {
+            let id = row["id"].as_str().expect("id");
+            let host = match row["host"].as_str().expect("host") {
+                "same" => format!("box@{tag}"),
+                "same-case" => format!("BOX@{tag}"),
+                "foreign-name" => format!("other-box.example.invalid@{tag}"),
+                "foreign-os" => format!("box@{}", if tag == "linux" { "windows" } else { "linux" }),
+                other => panic!("{id}: unknown host fact {other}"),
+            };
+            let pid = row["pidText"].as_str().unwrap_or("4000000");
+            let text = match row["ownerText"].as_str() {
+                Some(raw) => raw
+                    .replace("{HOST}", &format!("box@{tag}"))
+                    .replace("{NAME}", "box"),
+                None => match row["startDelta"].as_i64() {
+                    Some(delta) => {
+                        format!("{host}:{pid}:{}", LIVE_START.saturating_add_signed(delta))
+                    }
+                    None => format!("{host}:{pid}"),
+                },
+            };
+            // The Node harness reads the legacy form and gives it the caller's owner and namespace; so here.
+            let claim = match parse_owner(format!("{}:{text}", me.owner).as_bytes()) {
+                Claim::Owner(record) => Claim::Owner(Owner {
+                    ns: me.ns,
+                    ..record
+                }),
+                other => other,
+            };
+            let asked = std::cell::RefCell::new(Vec::new());
+            let live_start = row["liveStart"].as_bool().expect("liveStart");
+            let probe = |pid: u64| {
+                asked.borrow_mut().push(pid);
+                match row["pid"].as_str().expect("pid") {
+                    "absent" => Probe::Gone,
+                    "refused" => Probe::Unknown,
+                    _ => Probe::Alive {
+                        start: live_start.then_some(LIVE_START),
+                    },
+                }
+            };
+            let got = owner_state(&claim, None, true, &me, &Facts { hidepid: false }, probe);
+            let want = match row["expected"].as_str().expect("expected") {
+                "gone" => OwnerState::Gone,
+                "live" => OwnerState::Live,
+                _ => OwnerState::Unknown,
+            };
+            assert_eq!(got, want, "{id} as a {tag} reader {text:?}: {}", row["why"]);
+            let refused_first = row.get("ownerText").is_some()
+                || row.get("pidText").is_some()
+                || row["host"]
+                    .as_str()
+                    .is_some_and(|h| h.starts_with("foreign"));
+            if refused_first {
+                assert!(
+                    asked.borrow().is_empty(),
+                    "{id}: asked {:?} before refusing",
+                    asked.borrow()
+                );
+            }
+        }
+    }
+}
+
 // ---------- 13 ----------
 
 #[test]
