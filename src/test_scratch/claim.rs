@@ -179,7 +179,7 @@ pub(crate) fn remove_claim_with_hook(
             write_line(
                 &mut StderrOut,
                 &format!(
-                    "test_scratch: could not remove the claim {} ({e}) — left for the start-of-run sweep",
+                    "test_scratch: could not remove the claim {} ({e}) — not fatal: the next run's start-of-run sweep collects it",
                     claim.display()
                 ),
             );

@@ -1133,3 +1133,7 @@ watched failing first, except where its line says otherwise; the Windows lines a
     candidate is still re-checked with its own `symlink_metadata`); an entry this sweep removed is skipped, not an
     `errors` entry.
 39. *`check_what`'s message* says "multi-byte characters count by bytes" (with the character count) when the two differ.
+
+**Review round 2 (E4), 2026-10-31**
+
+40. *Review round 2: 3 small fixes; 5 findings rejected with reasons in the gate record.* The sweep's passes hold the one snapshot by handle instead of cloning it; the claim-removal stderr line says it is not fatal and that the next run's sweep collects it; the quarantine suffix and `random_id` share one random-bytes helper.

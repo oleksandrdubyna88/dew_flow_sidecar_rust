@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Once, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -181,7 +182,9 @@ struct Sweeper<'a, 'h> {
 /// The one `read_dir` of the root: its entries, and what could not be listed (each pass reports those under its own
 /// name, as it did when every pass listed for itself).
 struct Listing {
-    entries: Vec<(String, PathBuf)>,
+    /// Shared with the pass that iterates it: a pass holds a handle, not a copy, and a restore made during the pass
+    /// copies on write, so the pass keeps the snapshot it started from.
+    entries: Rc<Vec<(String, PathBuf)>>,
     problems: Vec<String>,
 }
 
@@ -210,38 +213,40 @@ impl Sweeper<'_, '_> {
     }
 
     fn list_root(&self) -> Listing {
-        let mut listing = Listing {
-            entries: Vec::new(),
-            problems: Vec::new(),
-        };
+        let mut entries = Vec::new();
+        let mut problems = Vec::new();
         let reader = match std::fs::read_dir(self.root) {
             Ok(reader) => reader,
             Err(e) => {
-                listing
-                    .problems
-                    .push(format!("cannot list {} ({e})", self.root.display()));
-                return listing;
+                problems.push(format!("cannot list {} ({e})", self.root.display()));
+                return Listing {
+                    entries: Rc::new(entries),
+                    problems,
+                };
             }
         };
         for entry in reader {
             match entry {
                 Ok(entry) => {
                     if let Some(name) = entry.file_name().to_str() {
-                        listing.entries.push((name.to_string(), entry.path()));
+                        entries.push((name.to_string(), entry.path()));
                     }
                 }
-                Err(e) => listing.problems.push(format!(
+                Err(e) => problems.push(format!(
                     "cannot read an entry of {} ({e})",
                     self.root.display()
                 )),
             }
         }
-        listing
+        Listing {
+            entries: Rc::new(entries),
+            problems,
+        }
     }
 
     /// The entries of the root: listed on the first call, the same snapshot after; a failure to list is one `errors`
     /// entry per pass, naming the root.
-    fn entries(&mut self, pass: &str) -> Vec<(String, PathBuf)> {
+    fn entries(&mut self, pass: &str) -> Rc<Vec<(String, PathBuf)>> {
         if self.listing.is_none() {
             self.listing = Some(self.list_root());
         }
@@ -251,7 +256,7 @@ impl Sweeper<'_, '_> {
             .iter()
             .map(|problem| format!("{pass}: {problem}"))
             .collect();
-        let entries = listing.entries.clone();
+        let entries = Rc::clone(&listing.entries);
         self.report.errors.extend(problems);
         entries
     }
@@ -259,8 +264,9 @@ impl Sweeper<'_, '_> {
     /// A restore moved `quarantine` back to `original`: the snapshot says so.
     fn note_restored(&mut self, quarantine: &Path, original_name: &str, original: PathBuf) {
         if let Some(listing) = self.listing.as_mut() {
-            listing.entries.retain(|(_, path)| path != quarantine);
-            listing.entries.push((original_name.to_string(), original));
+            let entries = Rc::make_mut(&mut listing.entries);
+            entries.retain(|(_, path)| path != quarantine);
+            entries.push((original_name.to_string(), original));
         }
     }
 
@@ -274,15 +280,16 @@ impl Sweeper<'_, '_> {
     // ---------- pass 1: quarantines a killed sweep left ----------
 
     fn restore_quarantines(&mut self, probe: &dyn Fn(u64) -> Probe) {
-        for (name, path) in self.entries("quarantines") {
-            let Some(found) = quarantine_pattern().captures(&name) else {
+        let entries = self.entries("quarantines");
+        for (name, path) in entries.iter() {
+            let Some(found) = quarantine_pattern().captures(name) else {
                 continue;
             };
             let original_name = found[1].to_string();
             if matches!(relation_of(&original_name, &self.me.owner), Relation::Other) {
                 continue;
             }
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
                 continue;
             };
             // `owner_state`'s checks come first: a pid that cannot be a process (0, a leading zero, past 2^53 or
@@ -292,22 +299,22 @@ impl Sweeper<'_, '_> {
             // Another uid's, or its renamer may still be working, or too young by either stamp (a renamer in another
             // pid namespace has a pid this process cannot see: it is "gone" here and may be mid-delete).
             if !is_real_dir(&meta)
-                || !(self.mine)(&path)
+                || !(self.mine)(path)
                 || !renamer_is_gone
                 || !self.old_enough(meta.modified().ok())
-                || !self.old_enough(changed_at(&path))
+                || !self.old_enough(changed_at(path))
             {
                 continue;
             }
             let original = self.root.join(&original_name);
-            if exclusive_restore(&path, &original) {
-                self.note_restored(&path, &original_name, original);
+            if exclusive_restore(path, &original) {
+                self.note_restored(path, &original_name, original);
                 self.report.listed.push(format!(
                     "notice: restored {original_name} from a quarantine a killed sweep left"
                 ));
             } else {
-                self.keep(&path, "quarantine-conflict");
-                self.list_conflict(&path, &original);
+                self.keep(path, "quarantine-conflict");
+                self.list_conflict(path, &original);
             }
         }
     }
@@ -315,12 +322,13 @@ impl Sweeper<'_, '_> {
     // ---------- pass 2: folders ----------
 
     fn sweep_folders(&mut self, probe: &dyn Fn(u64) -> Probe) {
-        for (name, path) in self.entries("folders") {
-            let relation = relation_of(&name, &self.me.owner);
+        let entries = self.entries("folders");
+        for (name, path) in entries.iter() {
+            let relation = relation_of(name, &self.me.owner);
             if matches!(relation, Relation::Other) {
                 continue;
             }
-            let meta = match std::fs::symlink_metadata(&path) {
+            let meta = match std::fs::symlink_metadata(path) {
                 Ok(meta) => meta,
                 // Listed once, judged later: something this very sweep removed (a folder and its claim) is gone.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -334,7 +342,7 @@ impl Sweeper<'_, '_> {
             if meta.file_type().is_symlink() {
                 // A link (a junction too) under one of this owner's names: never opened, its target never touched.
                 if matches!(relation, Relation::Own { .. }) {
-                    self.keep(&path, "not a directory");
+                    self.keep(path, "not a directory");
                 }
                 continue;
             }
@@ -342,19 +350,19 @@ impl Sweeper<'_, '_> {
                 continue; // a claim file, or noise
             }
             match relation {
-                Relation::Foreign { name_owner } => self.list_foreign("folder", &name, &name_owner),
+                Relation::Foreign { name_owner } => self.list_foreign("folder", name, &name_owner),
                 Relation::Legacy => {
                     let command = if cfg!(windows) {
                         format!(
                             "Remove-Item -Recurse -Force {}, {}",
-                            shell_quote(&path),
-                            shell_quote(&claim_path(&path))
+                            shell_quote(path),
+                            shell_quote(&claim_path(path))
                         )
                     } else {
                         format!(
                             "rm -rf -- {} {}",
-                            shell_quote(&path),
-                            shell_quote(&claim_path(&path))
+                            shell_quote(path),
+                            shell_quote(&claim_path(path))
                         )
                     };
                     self.report
@@ -364,7 +372,7 @@ impl Sweeper<'_, '_> {
                 Relation::Own { name_owner } => {
                     // Younger than the window: not considered, silently — age SELECTS, never authorises.
                     if self.old_enough(meta.modified().ok()) {
-                        self.judge_folder(&name, &path, &name_owner, probe);
+                        self.judge_folder(name, path, &name_owner, probe);
                     }
                 }
                 Relation::Other => {}
@@ -542,7 +550,7 @@ impl Sweeper<'_, '_> {
     fn sweep_orphan_claims(&mut self, probe: &dyn Fn(u64) -> Probe) {
         let listing = self.entries("claims");
         let quarantined = self.quarantined_originals(&listing);
-        for (name, claim_file) in listing {
+        for (name, claim_file) in listing.iter() {
             let Some(stem) = name.strip_suffix(".owner") else {
                 continue;
             };
@@ -551,7 +559,7 @@ impl Sweeper<'_, '_> {
                 continue;
             }
             let folder = self.root.join(stem);
-            let Ok(meta) = std::fs::symlink_metadata(&claim_file) else {
+            let Ok(meta) = std::fs::symlink_metadata(claim_file) else {
                 continue;
             };
             if !meta.is_file()
@@ -561,14 +569,14 @@ impl Sweeper<'_, '_> {
                 continue;
             }
             match relation {
-                Relation::Foreign { name_owner } => self.list_foreign("claim", &name, &name_owner),
+                Relation::Foreign { name_owner } => self.list_foreign("claim", name, &name_owner),
                 Relation::Legacy => {
                     let command = if cfg!(windows) {
-                        format!("Remove-Item -Force {}", shell_quote(&claim_file))
+                        format!("Remove-Item -Force {}", shell_quote(claim_file))
                     } else {
-                        format!("rm -f -- {}", shell_quote(&claim_file))
+                        format!("rm -f -- {}", shell_quote(claim_file))
                     };
-                    self.keep(&claim_file, "legacy");
+                    self.keep(claim_file, "legacy");
                     self.report
                         .listed
                         .push(format!("legacy: claim {name} — remove with: {command}"));
@@ -577,10 +585,10 @@ impl Sweeper<'_, '_> {
                     // A sweep killed after its rename left the folder in a quarantine and its claim here: the
                     // folder is not absent, it waits for a restore. The claim is its record — never removed as an
                     // orphan's.
-                    self.keep(&claim_file, "quarantined");
+                    self.keep(claim_file, "quarantined");
                 }
                 Relation::Own { name_owner } => {
-                    self.judge_orphan(&name, &claim_file, &folder, &name_owner, probe)
+                    self.judge_orphan(name, claim_file, &folder, &name_owner, probe)
                 }
                 Relation::Other => {}
             }

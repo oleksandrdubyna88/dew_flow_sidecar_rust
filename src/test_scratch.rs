@@ -229,24 +229,31 @@ pub(crate) fn owned_name(what: &str) -> String {
     name_for(what, &random_id())
 }
 
-/// `bytes` random bytes as `2 x bytes` lower-case hex characters (`[0-9a-f]`): the suffix of a quarantine name, which
-/// every sweeper of the family reads with `[0-9a-f]+` (rule section 4). Same entropy source as `random_id`.
-pub(crate) fn random_hex(bytes: usize) -> String {
+/// Eight random bytes: the one entropy source of the helper. Std seeds `RandomState` from the OS; each draw is a
+/// hasher fed a per-process counter and the clock, so two draws never come from the same input. `random_hex` and
+/// `random_id` only encode what this returns.
+fn random_bytes() -> [u8; 8] {
     use std::collections::hash_map::RandomState;
-    use std::fmt::Write as _;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    hasher.write_u128(now);
+    hasher.finish().to_le_bytes()
+}
+
+/// `bytes` random bytes as `2 x bytes` lower-case hex characters (`[0-9a-f]`): the suffix of a quarantine name, which
+/// every sweeper of the family reads with `[0-9a-f]+` (rule section 4).
+pub(crate) fn random_hex(bytes: usize) -> String {
+    use std::fmt::Write as _;
     let mut hex = String::with_capacity(bytes * 2);
     let mut drawn = 0;
     while drawn < bytes {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        hasher.write_u128(now);
-        for byte in hasher.finish().to_le_bytes() {
+        for byte in random_bytes() {
             if drawn < bytes {
                 let _ = write!(hex, "{byte:02x}");
                 drawn += 1;
@@ -256,24 +263,13 @@ pub(crate) fn random_hex(bytes: usize) -> String {
     hex
 }
 
-/// Six characters of `[A-Za-z0-9]`. Std seeds `RandomState` from the OS; each id is a hasher fed a per-process
-/// counter and the clock, so two ids never come from the same input, and a byte is taken only below 248 (4 x 62) so
-/// the alphabet is drawn without modulo bias.
+/// Six characters of `[A-Za-z0-9]`: a byte of `random_bytes` is taken only below 248 (4 x 62) so the alphabet is
+/// drawn without modulo bias.
 pub(crate) fn random_id() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
     const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut id = String::with_capacity(ID_LENGTH);
     while id.len() < ID_LENGTH {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        hasher.write_u128(now);
-        for byte in hasher.finish().to_le_bytes() {
+        for byte in random_bytes() {
             if byte < 248 && id.len() < ID_LENGTH {
                 id.push(char::from(ALPHABET[usize::from(byte) % ALPHABET.len()]));
             }
