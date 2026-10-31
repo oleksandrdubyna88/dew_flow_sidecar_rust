@@ -29,7 +29,7 @@ ort = { version = "=2.0.0-rc.12", default-features = false }
 # beside it. RustCrypto rather than a hand-rolled digest, and computed in-process from current_exe()
 # rather than handed in by the launcher — an environment variable describes the binary somebody
 # INTENDED to start, which is exactly the mismatch these hashes exist to catch.
-sha2 = "0.10"
+sha2 = "0.11"
 # The BGE-M3 tokenizer, loaded straight from the model cache so /embed can report how many tokens each
 # text REALLY cost and whether the cap discarded its tail. fastembed owns a tokenizer internally but
 # never surfaces the count, and that count is the only thing that can turn "nothing was lost" from a
