@@ -1,4 +1,4 @@
-//! The scenarios of the E4 plan, S2 (`todo/PLAN_test_leftovers_E4.md`), numbered as the plan numbers them.
+//! The scenarios of the E4 plan, S2 (`research/PLAN_test_leftovers_E4.md`), numbered as the plan numbers them.
 //!
 //! Every scenario that counts or lists entries does so in a PRIVATE parent made with `new_in`, because eight test
 //! threads create scratches in the temp root at once. A legacy or foreign name a scenario needs is built at run time

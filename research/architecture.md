@@ -307,9 +307,11 @@ A third job checks the plan lifecycle from the shared rules submodule.
   uses `try_lock` so it never queues behind model work — which also means it cannot report the depth.
   `in_flight[]` names what *holds* each engine, which is a different question from how many wait.
 - **No integration test suite** — testing is inline `#[cfg(test)]` beside what each module tests
-  (179 test attributes: 148 beside what each of the other modules tests and 31 in `src/test_scratch/` — 4 of them
-  Windows-only and one an `#[ignore]`d child process the others start), with shared fixtures in `src/testing.rs` and
-  scratch folders from `src/test_scratch.rs`.
+  (224 test attributes: 149 inline in the other modules, 31 in `src/test_scratch/` — 4 of them Windows-only and one an
+  `#[ignore]`d child process the others start — and 44 in `tests/`: 2 in `local_cpu_budget.rs` and 42 in the
+  leftovers guard), with shared fixtures in `src/testing.rs`. Every folder a test creates is a `TestScratch` from
+  `src/test_scratch.rs`; `tests/test_leftovers.rs` is the repository-text test that keeps it so (no `std::env::temp_dir()`
+  and no hand-built temp path outside the helper), and reads the mounted shared rules, so `build-test` fetches them.
 - **No published release artefact yet.** `.github/workflows/release.yml` builds, tests and packages the
   CPU flavour for Windows and Linux on a `v*` tag — with LICENSE, NOTICE, THIRD-PARTY-NOTICES.md and
   build-recipes.json inside every archive — and no tag has been cut, so nothing has been published. Only

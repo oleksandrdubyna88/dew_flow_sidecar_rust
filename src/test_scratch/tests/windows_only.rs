@@ -196,7 +196,7 @@ fn the_kernel_owner_answer_matches_what_was_measured() {
 
 // ---------- 0 ----------
 
-/// Step 0 of the E4 plan (`todo/PLAN_test_leftovers_E4.md`, S2): what does Windows say owns a file this
+/// Step 0 of the E4 plan (`research/PLAN_test_leftovers_E4.md`, S2): what does Windows say owns a file this
 /// process just created in the temp root, who is the caller, and is the token elevated? The rule's second key
 /// (the kernel owner is the caller) is only worth anything if a normal run's new files are the caller's; the
 /// expectation that a hosted (elevated) runner's files belong to `BUILTIN\Administrators` (`S-1-5-32-544`) was
