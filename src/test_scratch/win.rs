@@ -12,7 +12,6 @@ use std::fs::{File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path};
-use std::sync::OnceLock;
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_INVALID_PARAMETER, ERROR_NO_TOKEN, FILETIME, HANDLE, HLOCAL,
@@ -205,10 +204,12 @@ pub(crate) fn process_user_sid() -> Option<Vec<u8>> {
     user_sid_of(token)
 }
 
-/// The caller's user SID, read once. Empty when it could not be read — which makes every `is_mine` answer `false`.
-pub(crate) fn caller_sid() -> &'static [u8] {
-    static SID: OnceLock<Vec<u8>> = OnceLock::new();
-    SID.get_or_init(|| read_caller_sid().unwrap_or_default())
+/// The caller's user SID, read on EVERY call: the thread token first, the process token only on `ERROR_NO_TOKEN`
+/// (`caller_token`). A thread that impersonates is the caller for as long as it does, and another thread of the same
+/// process may not be — so the answer is never kept process-wide (review round 1: a `OnceLock` kept the first
+/// thread's SID for every later thread). Empty when it could not be read — which makes every `is_mine` answer `false`.
+pub(crate) fn caller_sid() -> Vec<u8> {
+    read_caller_sid().unwrap_or_default()
 }
 
 /// Is the caller's token elevated? `None` when it cannot be read.
@@ -369,5 +370,5 @@ pub(super) fn is_mine(path: &Path) -> bool {
         return false;
     };
     inside(&resolved, &profile)
-        && owner_sid_of_handle(&file).is_some_and(|owner| sid_equal(&owner, sid))
+        && owner_sid_of_handle(&file).is_some_and(|owner| sid_equal(&owner, &sid))
 }

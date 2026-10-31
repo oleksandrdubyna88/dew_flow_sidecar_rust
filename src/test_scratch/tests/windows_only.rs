@@ -129,7 +129,7 @@ fn the_kernel_owner_answer_matches_what_was_measured() {
         win::process_user_sid(),
         "no impersonation is active in a test: the thread token is the process token"
     );
-    let equal = win::sid_equal(&owner, caller);
+    let equal = win::sid_equal(&owner, &caller);
     let profile = std::env::var_os("USERPROFILE").and_then(|p| std::fs::canonicalize(p).ok());
     let inside = profile.is_some_and(|profile| {
         std::fs::canonicalize(path).is_ok_and(|real| {
@@ -140,7 +140,7 @@ fn the_kernel_owner_answer_matches_what_was_measured() {
     println!(
         "measured: owner {} / caller {} / equal {equal} / inside the profile {inside} / elevated {:?}",
         win::sid_text(&owner),
-        win::sid_text(caller),
+        win::sid_text(&caller),
         win::is_elevated()
     );
     assert_eq!(
@@ -192,6 +192,59 @@ fn the_kernel_owner_answer_matches_what_was_measured() {
     let again_path = again.path().to_path_buf();
     drop(again);
     assert!(!again_path.exists() && !claim_path(&again_path).exists());
+}
+
+// ---------- 4, the caller is read per call ----------
+
+/// Reverts the impersonation of this thread when dropped, so a failed assertion cannot leave it anonymous.
+struct Anonymous;
+
+impl Anonymous {
+    fn begin() -> Anonymous {
+        use windows::Win32::Security::ImpersonateAnonymousToken;
+        use windows::Win32::System::Threading::GetCurrentThread;
+        // SAFETY: the pseudo-handle of the current thread has every access; it needs no closing.
+        unsafe { ImpersonateAnonymousToken(GetCurrentThread()) }
+            .expect("a thread may impersonate the anonymous logon");
+        Anonymous
+    }
+}
+
+impl Drop for Anonymous {
+    fn drop(&mut self) {
+        // SAFETY: no arguments; it only removes this thread's impersonation token.
+        let _ = unsafe { windows::Win32::Security::RevertToSelf() };
+    }
+}
+
+/// Review round 1: `caller_sid` was a process-wide `OnceLock`, so the first thread to ask decided for every later one
+/// and "the thread token first" was only ever true for that thread. A thread that impersonates the anonymous logon
+/// (S-1-5-7) is that user for as long as it does; its neighbours, and this thread afterwards, are still the process
+/// user. Two threads asking in turn must each get their own answer.
+#[test]
+fn the_caller_is_the_threads_token_first_on_every_call() {
+    let process_user = win::process_user_sid().expect("the process token's user");
+    assert_eq!(win::caller_sid(), process_user, "no impersonation yet");
+
+    let anonymous = std::thread::spawn(|| {
+        let _impersonating = Anonymous::begin();
+        win::sid_text(&win::caller_sid())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        anonymous, "S-1-5-7",
+        "an impersonating thread is the anonymous logon"
+    );
+
+    // The thread that asked first before is not what a later thread inherits, whichever of them asks first.
+    assert_eq!(
+        win::caller_sid(),
+        process_user,
+        "this thread was never impersonating"
+    );
+    let later = std::thread::spawn(win::caller_sid).join().unwrap();
+    assert_eq!(later, process_user, "a fresh thread is the process user");
 }
 
 // ---------- 0 ----------
