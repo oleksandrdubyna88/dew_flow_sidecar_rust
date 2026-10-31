@@ -18,8 +18,8 @@ use super::identity::{changed_at, file_id, same_id, FileId};
 use super::owner::{owner_state, parse_owner, Claim, Facts, Owner, OwnerState, Probe};
 use super::scratch::remove_with_retries;
 use super::{
-    classify_name, is_mine, probe, temp_root, this_owner, write_line, NameForm, StderrOut, PREFIX,
-    REPO_TOKEN,
+    classify_name, is_mine, move_without_replace, probe, temp_root, this_owner, write_line,
+    NameForm, StderrOut, PREFIX, REPO_TOKEN,
 };
 use regex::Regex;
 use std::cell::RefCell;
@@ -53,9 +53,12 @@ pub(crate) struct Hooks<'a> {
     pub after_rename: Option<RenameHook<'a>>,
     /// With the folder's original path, once the quarantine is removed and before its claim is.
     pub after_remove: Option<PathHook<'a>>,
+    /// The quarantine name to try for a folder, in place of the random draw (a scenario pre-creates it).
+    pub quarantine_name: Option<NameHook<'a>>,
 }
 
 pub(crate) type PathHook<'a> = &'a mut dyn FnMut(&Path);
+pub(crate) type NameHook<'a> = &'a mut dyn FnMut(&Path) -> PathBuf;
 pub(crate) type RenameHook<'a> = &'a mut dyn FnMut(&Path, &Path);
 
 /// What a name says about whose it is, for THIS repository's token.
@@ -125,38 +128,17 @@ fn same_claim(now: &ClaimSnapshot, captured: &ClaimSnapshot) -> bool {
     now.raw == captured.raw && same_id(now.id, captured.id)
 }
 
-/// Put `quarantined` back under `original` ONLY if that name is free — never over an existing entry (rule §4). POSIX:
-/// a placeholder of our own is created exclusively and the quarantine is renamed over that EMPTY directory (a plain
-/// `rename(2)` of a directory onto an empty directory REPLACES it, so it is never tried against a name that may be
-/// taken); when the rename fails the placeholder goes with `remove_dir`, which refuses anything non-empty. Windows:
-/// `MoveFileExW` with no flags, which refuses any existing entry — NOT `std::fs::rename`, which replaces an existing
-/// EMPTY directory there (measured on the windows-latest runner: the plan's "a plain rename refuses" was wrong).
-fn exclusive_restore(quarantined: &Path, original: &Path, mine: &dyn Fn(&Path) -> bool) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        if std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(original)
-            .is_err()
-        {
-            return false;
-        }
-        if std::fs::rename(quarantined, original).is_ok() {
-            return true;
-        }
-        let ours = std::fs::symlink_metadata(original).is_ok_and(|m| is_real_dir(&m));
-        if ours && mine(original) {
-            let _ = std::fs::remove_dir(original);
-        }
-        false
-    }
-    #[cfg(windows)]
-    {
-        let _ = mine;
-        super::win::move_without_replace(quarantined, original)
-    }
+/// Put `quarantined` back under `original` ONLY if that name is free — never over an existing entry (rule §4): the
+/// move is exclusive (`rename::move_without_replace`: `renameat2(RENAME_NOREPLACE)` on Linux, a `mkdir`-reserved name
+/// where the file system lacks the flag, `MoveFileExW` with no flags on Windows — NOT `std::fs::rename`, which
+/// replaces an existing EMPTY directory on every platform; measured on the windows-latest runner).
+fn exclusive_restore(quarantined: &Path, original: &Path) -> bool {
+    move_without_replace(quarantined, original).is_ok()
 }
+
+/// Draws for a quarantine name that is free: the collision of two 32-bit draws is a coincidence, five in a row is a
+/// directory listing that is not.
+const QUARANTINE_DRAWS: u32 = 5;
 
 enum Verdict {
     Keep(String),
@@ -303,7 +285,7 @@ impl Sweeper<'_, '_> {
                 continue;
             }
             let original = self.root.join(&original_name);
-            if exclusive_restore(&path, &original, self.mine) {
+            if exclusive_restore(&path, &original) {
                 self.note_restored(&path, &original_name, original);
                 self.report.listed.push(format!(
                     "notice: restored {original_name} from a quarantine a killed sweep left"
@@ -455,10 +437,27 @@ impl Sweeper<'_, '_> {
         if !same_id(file_id(dir), Some(id)) || !same_claim(&snapshot_claim(dir, self.mine), claim) {
             return kept("replaced".into());
         }
-        let quarantine = quarantine_path(dir);
-        if let Err(e) = std::fs::rename(dir, &quarantine) {
-            return kept(format!("could not remove: {e}")); // refused: nothing moved
+        let mut moved = None;
+        for _ in 0..QUARANTINE_DRAWS {
+            let quarantine = match self.hooks.quarantine_name.as_deref_mut() {
+                Some(name) => name(dir),
+                None => quarantine_path(dir),
+            };
+            match move_without_replace(dir, &quarantine) {
+                Ok(()) => {
+                    moved = Some(quarantine);
+                    break;
+                }
+                // The name is taken (an empty directory would have been REPLACED by a plain rename): draw again.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return kept(format!("could not remove: {e}")), // refused: nothing moved
+            }
         }
+        let Some(quarantine) = moved else {
+            return kept(format!(
+                "could not remove: no free quarantine name after {QUARANTINE_DRAWS} draws"
+            ));
+        };
         if let Some(hook) = self.hooks.after_rename.as_deref_mut() {
             hook(dir, &quarantine);
         }
@@ -488,7 +487,7 @@ impl Sweeper<'_, '_> {
     }
 
     fn put_back(&mut self, quarantine: &Path, original: &Path, reason: String) -> Outcome {
-        if exclusive_restore(quarantine, original, self.mine) {
+        if exclusive_restore(quarantine, original) {
             Outcome::Kept {
                 path: original.to_path_buf(),
                 reason,

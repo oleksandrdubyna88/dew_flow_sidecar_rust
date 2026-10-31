@@ -256,6 +256,68 @@ fn the_passes_share_one_listing_of_the_root() {
     assert_eq!(report.removed, vec![late.clone()], "{report:?}");
 }
 
+/// Review round 1: the rename INTO quarantine must not replace anything. POSIX `rename(2)` of a directory onto an EMPTY
+/// directory replaces it (and so does Windows' `MoveFileEx` with replace semantics): an empty directory somebody made
+/// at the drawn quarantine name would be gone with no trace. The name is drawn again instead.
+#[test]
+fn the_rename_into_quarantine_never_replaces_an_existing_entry() {
+    let scratch = TestScratch::new("no-replace");
+    let root = scratch.path();
+    let doomed = folder(root, &name_with("doomed", "abc123"), Some(&gone_claim()));
+    std::fs::write(doomed.join("inside"), b"x").unwrap();
+    let taken = root.join(".taken-quarantine-name");
+    let free = root.join(".free-quarantine-name");
+    std::fs::create_dir(&taken).unwrap();
+    let identity = file_id(&taken);
+    assert!(identity.is_some());
+
+    let mut drawn = Vec::new();
+    let mut draw = |dir: &Path| {
+        assert_eq!(dir, doomed);
+        drawn.push(());
+        if drawn.len() == 1 {
+            taken.clone()
+        } else {
+            free.clone()
+        }
+    };
+    let mut hooks = Hooks::default();
+    hooks.quarantine_name = Some(&mut draw);
+    let report = run_sweep(root, later(), &mut hooks);
+    assert_eq!(report.removed, vec![doomed.clone()], "{report:?}");
+    assert!(
+        taken.is_dir() && entries(&taken).is_empty() && same_id(file_id(&taken), identity),
+        "the empty directory at the drawn name is still there, the same one: {report:?}"
+    );
+    assert_eq!(drawn.len(), 2, "a collision draws again, once");
+    assert!(!doomed.exists() && !free.exists());
+}
+
+/// The fallback where a file system refuses the no-replace flag: a name is RESERVED with an exclusive `mkdir`, so a
+/// taken one is never touched, and the same placeholder is what the rename then lands on.
+#[cfg(unix)]
+#[test]
+fn the_placeholder_fallback_reserves_a_name_and_refuses_a_taken_one() {
+    let scratch = TestScratch::new("placeholder");
+    let root = scratch.path();
+    let from = root.join("from");
+    std::fs::create_dir(&from).unwrap();
+    std::fs::write(from.join("inside"), b"x").unwrap();
+    let identity = file_id(&from);
+
+    let taken = root.join("taken");
+    std::fs::create_dir(&taken).unwrap();
+    let taken_id = file_id(&taken);
+    let refused = move_via_placeholder(&from, &taken).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists);
+    assert!(same_id(file_id(&taken), taken_id) && from.join("inside").is_file());
+
+    let free = root.join("free");
+    move_via_placeholder(&from, &free).unwrap();
+    assert!(free.join("inside").is_file() && !from.exists());
+    assert!(file_id(&free).is_some_and(|id| identity.is_some_and(|before| id.same_inode(&before))));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_removal_that_teardown_gives_up_on_is_in_kept_and_nothing_is_lost() {

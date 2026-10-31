@@ -39,9 +39,10 @@ use windows::Win32::System::Threading::{
 
 /// Move `from` to `to` ONLY if `to` does not exist: `MoveFileExW` with no flags, which — unlike `std::fs::rename`,
 /// whose Windows implementation replaces an existing EMPTY directory (it asks for replace-if-exists semantics) —
-/// fails with `ERROR_ALREADY_EXISTS` on any existing entry. A restore that replaced an empty directory would put a
-/// quarantined folder over a name somebody else made, which rule §4 forbids.
-pub(super) fn move_without_replace(from: &Path, to: &Path) -> bool {
+/// fails with `ERROR_ALREADY_EXISTS` on any existing entry (`ErrorKind::AlreadyExists`). A move that replaced an empty
+/// directory would put a folder over a name somebody else made, which rule §4 forbids; the callers (a restore, the
+/// rename into quarantine) answer the refusal with a fresh name.
+pub(super) fn move_without_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     let wide =
         |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
@@ -54,7 +55,16 @@ pub(super) fn move_without_replace(from: &Path, to: &Path) -> bool {
             MOVE_FILE_FLAGS(0),
         )
     }
-    .is_ok()
+    .map_err(|e| {
+        // HRESULT_FROM_WIN32 puts the Win32 code in the low 16 bits of 0x8007xxxx.
+        let code = e.code().0 as u32;
+        let win32 = if code >> 16 == 0x8007 {
+            code & 0xFFFF
+        } else {
+            code
+        };
+        std::io::Error::from_raw_os_error(win32 as i32)
+    })
 }
 
 const READ_CONTROL: u32 = 0x0002_0000;

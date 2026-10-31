@@ -229,6 +229,7 @@ fn the_sweep_removes_only_what_a_gone_owner_left_and_lists_the_rest() {
         after_capture: Some(&mut after_capture),
         after_rename: Some(&mut after_rename),
         after_remove: None,
+        quarantine_name: None,
     };
     let report = sweep(
         root,

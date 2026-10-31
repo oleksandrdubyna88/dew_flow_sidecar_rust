@@ -44,6 +44,7 @@
 mod claim;
 mod identity;
 mod owner;
+mod rename;
 mod scratch;
 mod sweep;
 mod tests;
@@ -55,6 +56,7 @@ use std::io::Write;
 pub(crate) use claim::*;
 pub(crate) use identity::*;
 pub(crate) use owner::*;
+pub(crate) use rename::*;
 pub(crate) use scratch::*;
 pub(crate) use sweep::*;
 
