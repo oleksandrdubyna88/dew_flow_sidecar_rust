@@ -84,7 +84,7 @@ fn relation_of(name: &str, owner: &str) -> Relation {
 }
 
 /// `.<name>.<prefix, lower-case>quarantine-<pid>-<hex>`: a leading `.` so no prefix match ever reaches it.
-fn quarantine_pattern() -> &'static Regex {
+pub(crate) fn quarantine_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         let word = PREFIX.to_ascii_lowercase();
@@ -95,12 +95,12 @@ fn quarantine_pattern() -> &'static Regex {
     })
 }
 
-fn quarantine_path(dir: &Path) -> PathBuf {
+pub(crate) fn quarantine_path(dir: &Path) -> PathBuf {
     let name = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let token = super::random_id().to_ascii_lowercase();
+    let token = super::random_hex(4); // 4 random bytes, 8 lower-case hex characters, as the reference sweeps draw
     dir.with_file_name(format!(
         ".{name}.{}quarantine-{}-{token}",
         PREFIX.to_ascii_lowercase(),

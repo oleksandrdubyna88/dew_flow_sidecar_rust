@@ -3,6 +3,7 @@
 
 use super::sweeping::*;
 use super::*;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::SystemTime;
 
 #[test]
@@ -371,6 +372,92 @@ fn a_quarantine_a_killed_sweep_left_is_restored_or_listed() {
     );
     assert!(quarantine.is_dir() && !original.exists());
     assert!(kept(&report, &quarantine).is_none(), "{report:?}");
+}
+
+// ---------- 18, the producer's own names ----------
+
+/// The pattern every sweeper of the family reads (`leftovers-sweep.mjs`, `janitor.sh`, rule §4): `<hex>` is
+/// `[0-9a-f]+`. Review round 1: the producer drew `[a-z0-9]` and 2 of 1000 names matched.
+#[test]
+fn the_quarantine_name_the_producer_draws_is_the_one_every_sweeper_reads() {
+    let name = name_with("quar", "abc123");
+    let dir = Path::new("/somewhere").join(&name);
+    for _ in 0..5000 {
+        let made = quarantine_path(&dir);
+        let leaf = made.file_name().unwrap().to_string_lossy().into_owned();
+        let found = quarantine_pattern().captures(&leaf).unwrap_or_else(|| {
+            panic!("the producer's quarantine name {leaf} is invisible to the pattern")
+        });
+        assert_eq!(&found[1], name);
+        assert_eq!(found[2].parse::<u32>().unwrap(), std::process::id());
+        let hex = &found[3];
+        assert!(
+            hex.len() == 8
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "the suffix is 8 lower-case hex characters: {hex}"
+        );
+        // The same pattern as the other sweepers, written out here, independent of `quarantine_pattern`.
+        let shared = regex::Regex::new(&format!(
+            r"(?i)^\.(.+)\.{}quarantine-(\d+)-([0-9a-f]+)$",
+            PREFIX.to_ascii_lowercase()
+        ))
+        .unwrap();
+        assert!(shared.is_match(&leaf), "{leaf}");
+    }
+}
+
+#[test]
+fn a_sweep_killed_after_its_rename_leaves_a_quarantine_the_next_sweep_restores() {
+    let scratch = TestScratch::new("quarantine-real");
+    let root = scratch.path();
+    let name = name_with("kill", "abc123");
+    let original = folder(root, &name, Some(&gone_claim()));
+    std::fs::write(original.join("kept-file"), b"x").unwrap();
+
+    // The REAL producer names the quarantine; the sweep dies right after the rename (a panic stands for SIGKILL).
+    let killed = catch_unwind(AssertUnwindSafe(|| {
+        let mut die = |_: &Path, _: &Path| panic!("killed after the rename");
+        let mut hooks = Hooks::default();
+        hooks.after_rename = Some(&mut die);
+        run_sweep(root, later(), &mut hooks)
+    }));
+    assert!(killed.is_err());
+    assert!(!original.exists(), "the folder was renamed away");
+    let left: Vec<String> = entries(root)
+        .into_iter()
+        .filter(|name| quarantine_pattern().is_match(name))
+        .collect();
+    assert_eq!(
+        left.len(),
+        1,
+        "the killed sweep's quarantine is visible to the pattern: {:?}",
+        entries(root)
+    );
+
+    // Its renamer is dead: the pid in the REAL name is replaced by a gone one, nothing else is touched.
+    let found = quarantine_pattern().captures(&left[0]).unwrap();
+    let gone_name = left[0].replacen(
+        &format!("quarantine-{}-", &found[2]),
+        &format!("quarantine-{GONE_PID}-"),
+        1,
+    );
+    std::fs::rename(root.join(&left[0]), root.join(&gone_name)).unwrap();
+    // The folder is judged again once it is back: its owner is a live one now, so it is kept, not collected again.
+    std::fs::write(
+        claim_path(&original),
+        record_text(&record_for(this_owner().pid)),
+    )
+    .unwrap();
+    let report = run_sweep(root, later(), &mut Hooks::default());
+    assert!(original.join("kept-file").is_file(), "{report:?}");
+    assert!(
+        listed(&report, &format!("notice: restored {name}")),
+        "{:?}",
+        report.listed
+    );
+    assert_eq!(kept(&report, &original), Some("live"), "{report:?}");
 }
 
 // ---------- 19 ----------
