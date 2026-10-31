@@ -21,6 +21,12 @@ impl FileId {
     }
 }
 
+/// Two identities are the same only when both could be read and agree on everything, the change time included: one
+/// that cannot be read never compares equal (rule §4), not even to another that cannot.
+pub(crate) fn same_id(a: Option<FileId>, b: Option<FileId>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a == b)
+}
+
 /// The identity of `path` itself, or none when it cannot be read — which never compares equal to anything (rule §4).
 #[cfg(unix)]
 pub(crate) fn file_id(path: &Path) -> Option<FileId> {

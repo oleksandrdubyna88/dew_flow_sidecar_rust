@@ -8,6 +8,7 @@ use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 
+mod sweeping;
 mod windows_only;
 
 // ---------- helpers ----------
@@ -503,6 +504,40 @@ fn the_real_probe_sees_this_process_and_not_an_impossible_pid() {
     }
 }
 
+// ---------- identity (beyond the plan's list: the lessons of the C# port) ----------
+
+#[test]
+fn an_identity_carries_the_change_time_and_an_unreadable_one_never_compares() {
+    let private = TestScratch::new("identity-parent");
+    let file = private.path().join("entry");
+    std::fs::write(&file, b"x").unwrap();
+    let first = file_id(&file).expect("an identity");
+    std::thread::sleep(Duration::from_millis(30));
+    // A change of the inode (not of its name or number) moves the change time: a freed inode number that is reused at
+    // once on some file systems still carries another change time, so a swapped entry never matches.
+    let original = std::fs::metadata(&file).unwrap().permissions();
+    let mut readonly = original.clone();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&file, readonly).unwrap();
+    let second = file_id(&file).expect("an identity");
+    std::fs::set_permissions(&file, original).unwrap();
+    assert!(first.same_inode(&second), "the same inode");
+    assert!(
+        !same_id(Some(first), Some(second)),
+        "but not the same identity: the change time moved"
+    );
+    assert!(same_id(Some(first), Some(first)));
+    assert!(
+        !same_id(None, None),
+        "an identity that cannot be read never compares equal"
+    );
+    assert_eq!(
+        file_id(&private.path().join("missing")),
+        None,
+        "an identity that cannot be read is none"
+    );
+}
+
 // ---------- 15 ----------
 
 #[test]
@@ -880,6 +915,7 @@ fn child_scratch() {
     let scratch = TestScratch::new_in(&parent, "child");
     // A leading newline: libtest has already printed `test ... ` on this line.
     println!("\nSCRATCH {}", scratch.path().display());
+    println!("PID {}", std::process::id());
     match mode.as_str() {
         "assert" => assert!(mode != "assert", "the child fails a real assertion"),
         "abort" => std::process::abort(),
@@ -887,8 +923,17 @@ fn child_scratch() {
     }
 }
 
-/// Run `child_scratch` as its own test process in `mode`; returns its exit status and the scratch path it printed.
-fn run_child(mode: &str, parent: &Path) -> (std::process::ExitStatus, PathBuf) {
+/// Run `child_scratch` as its own test process in `mode`; returns its exit status, the scratch path it printed and its pid.
+fn run_child(mode: &str, parent: &Path) -> (std::process::ExitStatus, PathBuf, u64) {
+    run_child_with(mode, parent, &[])
+}
+
+/// `run_child` with extra environment variables for the child (a shared `TESTSTODELETE_RUN`, say).
+fn run_child_with(
+    mode: &str,
+    parent: &Path,
+    envs: &[(&str, &str)],
+) -> (std::process::ExitStatus, PathBuf, u64) {
     let output = std::process::Command::new(std::env::current_exe().expect("this test binary"))
         .args([
             "test_scratch::tests::child_scratch",
@@ -899,6 +944,7 @@ fn run_child(mode: &str, parent: &Path) -> (std::process::ExitStatus, PathBuf) {
         ])
         .env("TEST_SCRATCH_CHILD", mode)
         .env("TEST_SCRATCH_PARENT", parent)
+        .envs(envs.iter().copied())
         .output()
         .expect("the child runs");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -911,17 +957,98 @@ fn run_child(mode: &str, parent: &Path) -> (std::process::ExitStatus, PathBuf) {
                 String::from_utf8_lossy(&output.stderr)
             )
         });
-    (output.status, PathBuf::from(path))
+    let pid = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("PID "))
+        .and_then(|digits| digits.trim().parse().ok())
+        .expect("the child printed its pid");
+    (output.status, PathBuf::from(path), pid)
 }
 
 #[test]
 fn a_failed_assertion_in_a_real_test_still_removes_its_scratch() {
     let private = TestScratch::new("child-assert");
-    let (status, path) = run_child("assert", private.path());
+    let (status, path, _) = run_child("assert", private.path());
     assert!(!status.success(), "the child must fail");
     assert!(path.starts_with(private.path()));
     assert!(!path.exists(), "the folder survived a failed assertion");
     assert!(!claim_path(&path).exists(), "and so did its claim");
+}
+
+// ---------- the lessons of the C# port: records are shared, files are not ----------
+
+#[test]
+fn a_claim_with_the_same_text_but_another_identity_is_not_ours_to_remove() {
+    let private = TestScratch::new("same-text-parent");
+    let parent = private.path();
+    let squat = parent.join(name_with("same", "a"));
+    std::fs::create_dir(&squat).unwrap();
+    let swapped = claim_path(&squat);
+    let aside = parent.join("claim-aside");
+    let mut ids = sequence(&["a", "b"]);
+    let mut swap = |dir: &Path| {
+        if dir.ends_with(name_with("same", "a")) {
+            // Another run's claim with IDENTICAL text (siblings under one TESTSTODELETE_RUN write identical
+            // records); ours is kept alive beside, so the new file cannot reuse its inode number.
+            let text = std::fs::read(claim_path(dir)).unwrap();
+            std::fs::rename(claim_path(dir), &aside).unwrap();
+            std::fs::write(claim_path(dir), text).unwrap();
+        }
+    };
+    let mut quiet = Vec::new();
+    let mut seams = Seams::real();
+    seams.ids = &mut ids;
+    seams.after_claim = &mut swap;
+    seams.out = &mut quiet;
+    let scratch = TestScratch::new_with(parent, "same", &mut seams);
+    assert!(
+        swapped.is_file(),
+        "the claim now at that path is not the file this run wrote: it stays"
+    );
+    drop(scratch);
+    assert!(swapped.is_file());
+}
+
+#[test]
+fn siblings_sharing_one_run_record_never_remove_each_others_folders() {
+    let private = TestScratch::new("shared-run");
+    let record = format_owner(this_owner());
+    let sibling = TestScratch::new_in(private.path(), "sibling");
+    let envs = [("TESTSTODELETE_RUN", record.as_str())];
+
+    // The child's Drop removes ITS folder and claim, by its own path — never "the folders of the run record".
+    let (status, path, _) = run_child_with("assert", private.path(), &envs);
+    assert!(!status.success());
+    assert!(
+        !path.exists() && !claim_path(&path).exists(),
+        "the child's own folder is gone"
+    );
+    assert!(
+        sibling.path().is_dir() && claim_path(sibling.path()).is_file(),
+        "a sibling holding the very same record is untouched"
+    );
+
+    // A killed child leaves a claim carrying the RUN's record (the parent's pid), so the run's liveness governs it:
+    // while the run lives both are kept, and nothing is ever removed because two folders share one record.
+    let (_, killed, _) = run_child_with("abort", private.path(), &envs);
+    let Claim::Owner(theirs) = read_claim(&killed, &|_| true) else {
+        panic!("the killed child's claim is readable");
+    };
+    assert_eq!(
+        &theirs,
+        this_owner(),
+        "the claim carries the run's record, not the child's"
+    );
+    let report = sweep(
+        private.path(),
+        std::time::SystemTime::now() + Duration::from_secs(11 * 60),
+        SWEEP_MIN_AGE,
+        probe,
+        |_| true,
+        &mut Hooks::default(),
+    );
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert!(killed.is_dir() && sibling.path().is_dir());
 }
 
 // ---------- 9 ----------

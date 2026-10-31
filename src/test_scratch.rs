@@ -1,4 +1,43 @@
-//! Test scratch folders (`common/test-leftovers.md`): named, claimed, removed, collected.
+//! Every folder a test of this crate creates comes from here, and every one of them is owned.
+//!
+//! What it owns. A `TestScratch` is a folder named with the shared prefix, the caller's owner token, this
+//! repository's token, a `<what>` the test chooses and a random id (`common/test-leftovers.md` §1), claimed by a
+//! sibling `<folder>.owner` that carries the run's record (§3), removed by its `Drop`, and — when the run was killed
+//! and `Drop` never ran — collected by the next run of the same OS user (§4). The shared rule is the contract; this
+//! file is its Rust encoding, and `tools/lib/owned.mjs` and `leftovers-sweep.mjs` in the mounted rules are its
+//! reference.
+//!
+//! Why the claim goes FIRST. Between "the folder exists" and "the folder says whose it is" a kill leaves a folder
+//! nobody can judge. So the claim is written before the folder, exclusively; the value that will clean up exists in
+//! state `Claimed` before the folder does (the cleanup is registered as the very next statement); and only then is the
+//! folder made, with `create_dir`, never a create that succeeds on an existing one. A folder already there under the
+//! claimed name is somebody else's: never adopted, never removed, our claim taken back only while it still holds our
+//! bytes. Nothing this helper made ever exists unclaimed.
+//!
+//! Why the claim sits BESIDE the folder. `log_segments.rs` asserts the exact listing of the folders under its root,
+//! and a test that makes a git repository at its folder must see exactly what it made: an owner file inside would show.
+//!
+//! Why the kernel owner and not the name authorises. The owner segment of a name and the owner in a record are text
+//! anyone can type into a shared temp root; a sweep that believed either would delete another user's folders. So the
+//! name SELECTS, and the entry must be the caller's by the file system's own account of it (the real uid; on Windows
+//! the profile AND the owner SID) before a record is even read. An elevated Windows run's files belong to
+//! `BUILTIN\Administrators`, so they fail closed: listed, never touched.
+//!
+//! Why `Drop` never panics. A panic in `Drop` during the unwind of a failed assertion aborts the process and hides the
+//! assertion. Every step has its own failure path: five tries 100 ms apart, then ONE line and a folder that stays
+//! prefixed AND claimed, so the next run's sweep can judge it. The folder goes first and its claim last, so a leftover
+//! is never an unclaimed folder.
+//!
+//! Why its lines bypass libtest's capture. libtest captures `eprintln!` and shows it only for a FAILED test, while a
+//! teardown that gave up usually did so in a passing one. Lines go to `std::io::stderr()` directly, each in one
+//! `write_all` under the lock, so eight test threads never interleave half-lines.
+//!
+//! Why the sweep runs from the first constructor. libtest has no global setup; the first `TestScratch` of a test
+//! process is the earliest code that runs once. The sweep deletes on two keys (scope: name, record and caller agree and
+//! the kernel owner is the caller; abandonment: the record's process is `gone`), lets age only select, removes by the
+//! identity captured before the verdict through a quarantine rename, and never fails the run.
+//!
+//! No `std::process::Command` outside the test modules: the writer and the probe never spawn (rule §3).
 
 #![cfg(test)]
 
@@ -6,6 +45,7 @@ mod claim;
 mod identity;
 mod owner;
 mod scratch;
+mod sweep;
 mod tests;
 #[cfg(windows)]
 mod win;
@@ -13,8 +53,10 @@ mod win;
 use std::io::Write;
 
 pub(crate) use claim::*;
+pub(crate) use identity::*;
 pub(crate) use owner::*;
 pub(crate) use scratch::*;
+pub(crate) use sweep::*;
 
 pub(crate) const PREFIX: &str = "testsToDelete-";
 pub(crate) const REPO_TOKEN: &str = "sidecar";
@@ -176,6 +218,3 @@ pub(crate) fn random_id() -> String {
     }
     id
 }
-
-/// The start-of-run sweep (group C wires it here).
-pub(crate) fn sweep_at_start() {}

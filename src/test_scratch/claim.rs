@@ -121,8 +121,11 @@ pub(crate) fn write_claim_exclusive(claim: &Path, bytes: &[u8]) -> io::Result<()
 }
 
 /// Remove the claim beside `dir` only while it still holds exactly `written` — a claim another run put there since
-/// is not ours to remove. Never panics; a failure is ONE stderr line, the claim stays for the sweep.
-pub(crate) fn remove_claim_if_still(dir: &Path, written: &[u8]) {
+/// is not ours to remove — and, when `captured` is the identity the claim had right after this run wrote it, only
+/// while the file at the path is STILL that file: a claim with the same text but another identity is another run's
+/// (siblings under one `TESTSTODELETE_RUN` write identical records). Never panics; a failure is ONE stderr line, the
+/// claim stays for the sweep.
+pub(crate) fn remove_claim_if_still(dir: &Path, written: &[u8], captured: Option<FileId>) {
     let claim = claim_path(dir);
     let outcome = (|| -> io::Result<()> {
         let meta = std::fs::symlink_metadata(&claim)?;
@@ -133,11 +136,15 @@ pub(crate) fn remove_claim_if_still(dir: &Path, written: &[u8]) {
         if read_limited(&claim, &meta)? != written {
             return Ok(());
         }
-        // The same inode we read, not a claim swapped in since.
-        let (Some(before), Some(now)) = (before, file_id(&claim)) else {
-            return Ok(());
+        // The same file we read (and, when known, the file this run wrote), not a claim swapped in since.
+        let now = file_id(&claim);
+        let ours = match (before, now) {
+            (Some(before), Some(now)) => {
+                before.same_inode(&now) && captured.is_none_or(|id| id == now)
+            }
+            _ => false,
         };
-        if before.same_inode(&now) {
+        if ours {
             std::fs::remove_file(&claim)?;
         }
         Ok(())

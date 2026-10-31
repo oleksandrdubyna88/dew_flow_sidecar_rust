@@ -5,6 +5,7 @@
 //! does), and only then is the folder made, exclusively too. So nothing this helper made ever exists unclaimed.
 
 use super::claim::{claim_path, remove_claim_if_still, write_claim_exclusive};
+use super::identity::{file_id, FileId};
 use super::{
     check_what, format_owner, name_for, random_id, run_record, sweep_at_start, temp_root,
     write_line, StderrOut,
@@ -29,12 +30,18 @@ pub(crate) enum ScratchState {
     Released,
 }
 
-/// A folder `testsToDelete-<owner>-sidecar-<what>-<id>` and its sibling claim, removed when the value drops — on a
-/// return and on the unwind of a failed assertion. It is the FIRST binding of every test that uses one, so it drops
-/// LAST, after every handle into it (locals drop in reverse order of declaration).
+/// A folder named with the prefix, the caller's owner token, this repository's token, a `<what>` and a random id, and
+/// its sibling claim, removed when the value drops — on a return and on the unwind of a failed assertion. It is the
+/// FIRST binding of every test that uses one, so it drops LAST, after every handle into it (locals drop in reverse
+/// order of declaration).
 pub(crate) struct TestScratch {
     path: PathBuf,
     written: Vec<u8>,
+    /// The identity of the claim file right after this run wrote it: the claim is removed only while it is STILL
+    /// that file — siblings under one `TESTSTODELETE_RUN` write identical records, so the text alone proves nothing.
+    /// None when it could not be read: then the text and the inode between the read and the unlink are all that is
+    /// checked.
+    claim_id: Option<FileId>,
     state: ScratchState,
 }
 
@@ -119,6 +126,7 @@ impl TestScratch {
             }
             // The cleanup is registered by the value existing: its Drop removes the claim if the create never happens.
             let mut scratch = TestScratch {
+                claim_id: file_id(&claim_path(&path)),
                 path,
                 written: text.clone(),
                 state: ScratchState::Claimed,
@@ -139,7 +147,7 @@ impl TestScratch {
                             scratch.path.display()
                         ),
                     );
-                    remove_claim_if_still(&scratch.path, &scratch.written);
+                    remove_claim_if_still(&scratch.path, &scratch.written, scratch.claim_id);
                     scratch.state = ScratchState::Released;
                 }
                 Err(e) => panic!(
@@ -172,7 +180,9 @@ impl Drop for TestScratch {
             ScratchState::Made => {
                 teardown(&self.path, &mut StderrOut);
             }
-            ScratchState::Claimed => remove_claim_if_still(&self.path, &self.written),
+            ScratchState::Claimed => {
+                remove_claim_if_still(&self.path, &self.written, self.claim_id)
+            }
             ScratchState::Released => {}
         }));
     }
