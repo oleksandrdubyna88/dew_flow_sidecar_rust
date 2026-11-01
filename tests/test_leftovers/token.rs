@@ -6,6 +6,8 @@
 //! trusted the row from the same file would pass there. The crate's package name in `Cargo.toml` is outside the
 //! copied files, and `KNOWN` maps it to the one token and row it may use.
 
+use std::path::Path;
+
 use regex::Regex;
 
 use crate::classes::{finding, Finding, TOKEN};
@@ -14,8 +16,130 @@ use crate::classes::{finding, Finding, TOKEN};
 /// must hold and the `repository` column of that token's row. A package not listed is red.
 pub const KNOWN: [(&str, &str, &str); 1] = [("bge-sidecar", "sidecar", "the embedding sidecar")];
 
-/// Where the table lives in the mounted rules.
-pub const RULE: &str = ".claude/rules/shared/common/test-leftovers.md";
+/// The mounted rule file that holds the `## Tokens` table since the split of the rule into a core and a detail
+/// (release `105d53c`): the detail. It is the first one tried and the name every message carries when nothing is read.
+pub const RULE_DETAIL: &str = ".claude/rules/shared/common/test-leftovers-detail.md";
+
+/// The core of the rule: it held the whole text, table included, before the split, so a mount from before it is read
+/// here, after the detail.
+pub const RULE_CORE: &str = ".claude/rules/shared/common/test-leftovers.md";
+
+/// One rule file as the mount holds it: absent, present but not readable (permission, I/O, not UTF-8), or its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleFile {
+    Missing,
+    Unreadable(String),
+    Text(String),
+}
+
+impl RuleFile {
+    /// Read `root/relative`: a file that is not there is `Missing`; any other failure is `Unreadable` with its message.
+    fn read(root: &Path, relative: &str) -> Self {
+        match std::fs::read_to_string(root.join(relative)) {
+            Ok(text) => Self::Text(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(error) => Self::Unreadable(error.to_string()),
+        }
+    }
+}
+
+/// What the two files of the mount come to, decided once when `RuleFiles` is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The file that holds the `## Tokens` section, and its text.
+    Found { path: &'static str, text: String },
+    /// Neither file exists: the submodule is not checked out.
+    NotCheckedOut,
+    /// A candidate that could hold the table exists and cannot be read: fail closed, name the file and the error.
+    Unreadable { path: &'static str, error: String },
+    /// Both files that exist were read and neither has a `## Tokens` section.
+    NoSection,
+}
+
+/// The two rule files of the mount and the file the table is read from, chosen ONCE, by CONTENT: the detail when it has
+/// a `## Tokens` section, else the core when it has one (a mount from before the split). The choice is stored; the
+/// scan and every message read it, none resolves again. A candidate that is unreadable BEFORE a file with the section
+/// is found stops the choice (it could be the file that holds the table, and it would win): ONE finding, never a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleFiles {
+    outcome: Outcome,
+}
+
+impl RuleFiles {
+    /// Decide the outcome for the two files (the detail is tried first).
+    pub fn new(detail: RuleFile, core: RuleFile) -> Self {
+        let mut any = false;
+        for (path, file) in [(RULE_DETAIL, detail), (RULE_CORE, core)] {
+            match file {
+                RuleFile::Missing => {}
+                RuleFile::Unreadable(error) => {
+                    return Self::of(Outcome::Unreadable { path, error })
+                }
+                RuleFile::Text(text) => {
+                    any = true;
+                    if has_tokens_section(&text) {
+                        return Self::of(Outcome::Found { path, text });
+                    }
+                }
+            }
+        }
+        Self::of(if any {
+            Outcome::NoSection
+        } else {
+            Outcome::NotCheckedOut
+        })
+    }
+
+    fn of(outcome: Outcome) -> Self {
+        Self { outcome }
+    }
+
+    /// Both files from texts (`None` is a file that is not there).
+    pub fn from_texts(detail: Option<&str>, core: Option<&str>) -> Self {
+        let file =
+            |text: Option<&str>| text.map_or(RuleFile::Missing, |t| RuleFile::Text(t.to_string()));
+        Self::new(file(detail), file(core))
+    }
+
+    /// Read both files of the mount under `root`.
+    pub fn read(root: &Path) -> Self {
+        Self::new(
+            RuleFile::read(root, RULE_DETAIL),
+            RuleFile::read(root, RULE_CORE),
+        )
+    }
+
+    pub fn outcome(&self) -> &Outcome {
+        &self.outcome
+    }
+
+    /// The stored choice: the file that holds the table and its text, or None.
+    pub fn resolve(&self) -> Option<(&'static str, &str)> {
+        match &self.outcome {
+            Outcome::Found { path, text } => Some((path, text)),
+            _ => None,
+        }
+    }
+
+    /// The file a message names (`common/<file>`): the one the table is read from, else the detail (where it is meant
+    /// to be).
+    pub fn rule_name(&self) -> &'static str {
+        match &self.outcome {
+            Outcome::Found { path, .. } if *path == RULE_CORE => "common/test-leftovers.md",
+            _ => "common/test-leftovers-detail.md",
+        }
+    }
+}
+
+/// `## Tokens` on a line of its own — the heading `parse_table` reads, so a file the resolver picks is a file the
+/// parser finds a table in (prose that spells the words is not a heading).
+fn is_tokens_heading(line: &str) -> bool {
+    line.trim_end() == "## Tokens"
+}
+
+fn has_tokens_section(text: &str) -> bool {
+    text.lines().any(is_tokens_heading)
+}
 
 /// A token constant read from a source file: `REPO_TOKEN` or `REPO_ROW`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +216,7 @@ fn is_separator(line: &str) -> bool {
 /// The rule's `## Tokens` table: the heading's line, the header cells, the rows `(token, repository, line)`.
 fn parse_table(rule: &str) -> Table {
     let lines: Vec<&str> = rule.lines().collect();
-    let Some(start) = lines.iter().position(|l| l.trim_end() == "## Tokens") else {
+    let Some(start) = lines.iter().position(|l| is_tokens_heading(l)) else {
         return Table {
             heading: 0,
             header: None,
@@ -130,10 +254,11 @@ fn parse_table(rule: &str) -> Table {
     }
 }
 
-/// Findings (class `token`) for the constants, the mounted table and the crate's identity. `rule` is the mounted
-/// rule's text, or None when the file is missing (red with the submodule sentence: no table registers nothing).
+/// Findings (class `token`) for the constants, the mounted table and the crate's identity. `rules` is the two files
+/// of the mount: the table is read from the one `RuleFiles::resolve` picks; no file at all is red with the submodule
+/// sentence, files without a table are ONE finding naming both (no table registers nothing).
 pub fn token_findings(
-    rule: Option<&str>,
+    rules: &RuleFiles,
     constants: &[Constant],
     package: Option<&str>,
 ) -> Vec<Finding> {
@@ -212,32 +337,43 @@ pub fn token_findings(
         }
     }
 
-    let Some(rule) = rule else {
-        found.extend(at(
-            RULE,
-            1,
-            "the shared rules are not checked out — git submodule update --init .claude/rules/shared".to_string(),
-        ));
-        return found;
+    let (rule_path, rule) = match rules.outcome() {
+        Outcome::Found { path, text } => (*path, text.as_str()),
+        Outcome::NotCheckedOut => {
+            found.extend(at(
+                RULE_DETAIL,
+                1,
+                format!("the shared rules are not checked out — git submodule update --init .claude/rules/shared (neither {RULE_DETAIL} nor {RULE_CORE} can be read)"),
+            ));
+            return found;
+        }
+        Outcome::Unreadable { path, error } => {
+            found.extend(at(
+                path,
+                1,
+                format!("{path} exists and cannot be read ({error}) — the token `{}` cannot be proven registered (fails closed)", token.value),
+            ));
+            return found;
+        }
+        Outcome::NoSection => {
+            found.extend(at(
+                RULE_DETAIL,
+                1,
+                format!(
+                    "no `## Tokens` section in {RULE_DETAIL} or in {RULE_CORE} — the token `{}` is not registered",
+                    token.value
+                ),
+            ));
+            return found;
+        }
     };
     let table = parse_table(rule);
-    if table.heading == 0 {
-        found.extend(at(
-            RULE,
-            1,
-            format!(
-                "{RULE} has no `## Tokens` section — the token `{}` is not registered",
-                token.value
-            ),
-        ));
-        return found;
-    }
     let Some(header) = &table.header else {
         found.extend(at(
-            RULE,
+            rule_path,
             table.heading,
             format!(
-                "{RULE} has no table under `## Tokens` — the token `{}` is not registered",
+                "{rule_path} has no table under `## Tokens` — the token `{}` is not registered",
                 token.value
             ),
         ));
@@ -250,26 +386,26 @@ pub fn token_findings(
             .zip(header)
             .all(|(want, got)| got.eq_ignore_ascii_case(want))
     {
-        found.extend(at(RULE, table.heading, format!("the `## Tokens` table of {RULE} is not `| token | family | repository |` — the token `{}` is not registered", token.value)));
+        found.extend(at(rule_path, table.heading, format!("the `## Tokens` table of {rule_path} is not `| token | family | repository |` — the token `{}` is not registered", token.value)));
         return found;
     }
     let mut seen: Vec<&str> = Vec::new();
     for (name, _, line) in &table.rows {
         if seen.contains(&name.as_str()) {
             found.extend(at(
-                RULE,
+                rule_path,
                 *line,
-                format!("the token `{name}` is listed twice in {RULE}"),
+                format!("the token `{name}` is listed twice in {rule_path}"),
             ));
         }
         seen.push(name);
     }
     match table.rows.iter().find(|(name, _, _)| *name == token.value) {
         None => found.extend(at(
-            RULE,
+            rule_path,
             table.heading,
             format!(
-                "the token `{}` is not a row of the `## Tokens` table of {RULE}",
+                "the token `{}` is not a row of the `## Tokens` table of {rule_path}",
                 token.value
             ),
         )),
@@ -277,7 +413,7 @@ pub fn token_findings(
             if !row.value.trim().is_empty()
                 && !repository.trim().eq_ignore_ascii_case(row.value.trim())
             {
-                found.extend(at(RULE, *line, format!("the token `{}` belongs to `{repository}` in {RULE}, not to this repository (`{}`)", token.value, row.value)));
+                found.extend(at(rule_path, *line, format!("the token `{}` belongs to `{repository}` in {rule_path}, not to this repository (`{}`)", token.value, row.value)));
             }
         }
     }

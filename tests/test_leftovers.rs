@@ -1,4 +1,5 @@
-//! The structural guard of `common/test-leftovers.md` §7 for this crate: no test, script or workflow here creates a
+//! The structural guard of the rule's §7 (`common/test-leftovers-detail.md` since the split of release `105d53c`; the core
+//! `common/test-leftovers.md` before it) for this crate: no test, script or workflow here creates a
 //! temp folder, worktree, container or store resource outside `TestScratch` (or under a valid inline exemption), no
 //! source spells a legacy name or an owner-blind match, the helper's token is THIS repository's registered row, and
 //! a scan of nothing is red.
@@ -13,7 +14,12 @@
 //!   binding tracer (decision 3 of the E4 plan): any spelling of the prefix word outside the helper's files that is
 //!   not followed by an owner segment is a finding.
 //! - `scripts` — `owner-blind` in scripts and workflows is the SHIPPED classifier's verdict, validated, fail closed.
-//! - `token` — `REPO_TOKEN`/`REPO_ROW` against the rule's table and against an identity from outside the helper.
+//! - `token` — `REPO_TOKEN`/`REPO_ROW` against the rule's table and against an identity from outside the helper. The
+//!   table is read from the one rule file that holds it, resolved by CONTENT (`RuleFiles::resolve`: the detail when it
+//!   has a `## Tokens` section, else the core, else one finding naming both); every message names the file it read.
+//!   The same change lands in `dew_flow_mcp` PR #60.
+//! - `contract_fixtures` (tests) — the Rust choice of the rule file against the mount's own `resolveRule`, and a rule file
+//!   that cannot be read as one fail-closed finding.
 //! - `rustviews` — what a Rust line says once its literals are read: escapes, joined pieces, one-character classes.
 //! - `words` — the words, in pieces: the guard scans its own files, and the machine-wide barrier scan reads them.
 //!
@@ -46,6 +52,9 @@ mod bypass_fixtures;
 #[path = "test_leftovers/class_fixtures.rs"]
 mod class_fixtures;
 #[cfg(test)]
+#[path = "test_leftovers/contract_fixtures.rs"]
+mod contract_fixtures;
+#[cfg(test)]
 #[path = "test_leftovers/discovery_fixtures.rs"]
 mod discovery_fixtures;
 #[cfg(test)]
@@ -76,5 +85,9 @@ fn this_repository_creates_nothing_outside_test_scratch() {
         scan.scanned.join(", ")
     );
     println!("test_leftovers: {} finding(s)", scan.findings.len());
-    assert!(scan.findings.is_empty(), "{}", repo::render(&scan.findings));
+    assert!(
+        scan.findings.is_empty(),
+        "{}",
+        repo::render(&scan.findings, scan.rule_name)
+    );
 }

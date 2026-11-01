@@ -1137,3 +1137,31 @@ watched failing first, except where its line says otherwise; the Windows lines a
 **Review round 2 (E4), 2026-10-31**
 
 40. *Review round 2: 3 small fixes; 5 findings rejected with reasons in the gate record.* The sweep's passes hold the one snapshot by handle instead of cloning it; the claim-removal stderr line says it is not fatal and that the next run's sweep collects it; the quarantine suffix and `random_id` share one random-bytes helper.
+
+**The pin to release `105d53c`, 2026-11-01 (PR #66)**
+
+41. *The token table moved to the detail; the guard resolves the file by content.* Release `105d53c` split
+    `common/test-leftovers.md` into a core and `common/test-leftovers-detail.md`; the `## Tokens` table is now ONLY in
+    the detail, and the guard read the core. With the pin moved, four tests failed with the same message
+    (`…/test-leftovers.md has no `## Tokens` section — the token `sidecar` is not registered`):
+    `token_fixtures::the_real_mounted_rule_registers_this_repositorys_token`,
+    `wiring_fixtures::a_listed_file_that_is_gone_or_binary_is_skipped_not_fatal`,
+    `wiring_fixtures::a_tree_with_nothing_to_scan_is_red_and_a_clean_one_is_green` (both pass the real rule into the
+    scan) and the real-tree scan `this_repository_creates_nothing_outside_test_scratch`. The ONE resolver is
+    `RuleFiles::resolve` in `tests/test_leftovers/token.rs`: the detail when it has a `## Tokens` heading on a line of
+    its own (the line `parse_table` reads, so prose that spells the words does not count), else the core when it has
+    one (a mount from before the split), else ONE finding that names both files; neither file readable keeps the
+    submodule sentence. The finding, the report header and the cures name the file actually read. Fixtures: split
+    mount ⇒ detail; pre-split ⇒ core; detail without the section and a core with it ⇒ core; neither ⇒ one finding
+    naming both. Watched red twice by mutation: a core-only reader fails nine tests, a reader that checks only that a
+    file exists fails four. The reference `resolveRule` of the mount's `tools/leftovers-check.mjs` picks by existence;
+    this resolver picks by content, as the plan of this change orders. The choice is made ONCE when `RuleFiles` is built
+    and stored (the scan and every message read it). A candidate that exists and cannot be read (permission, I/O) is ONE
+    fail-closed finding naming the file and the error, never a panic, and it stops the choice when it comes before a
+    file that has the section (it could hold the table and would win). `contract_fixtures.rs` runs the mount's own
+    `resolveRule` (Node, the mount path and the cases through `process.argv`; the trees are made by the mount's
+    `ownedDir`) over the same trees: the Rust choice equals it where the file that exists is the file that has the
+    section, and the two differ, asserted by name, for a detail without the section beside a core with it (the guard
+    reads the core) and for no section anywhere (one finding); node missing fails the test with the reason; the chmod
+    000 case is skipped as root and on Windows. Boundary: the same change lands in
+    `dew_flow_mcp` PR #60 (its C# guard); this crate's PR #66 carries only the Rust side.
