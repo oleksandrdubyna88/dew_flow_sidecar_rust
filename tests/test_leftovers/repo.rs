@@ -10,12 +10,14 @@ use crate::classes::{
 };
 use crate::discovery::{discover, git_listing, scanned_nothing, unread_findings};
 use crate::scripts::{script_owner_blind, ScriptSource, CLASSIFIER};
-use crate::token::{constants_in, package_name, token_findings, RULE};
+use crate::token::{constants_in, package_name, token_findings, RuleFiles};
 
 /// What a scan of the real tree found, and what it read.
 pub struct Scan {
     pub scanned: Vec<String>,
     pub findings: Vec<Finding>,
+    /// The rule file the messages name (`common/<file>`): the one that holds the token table (see `RuleFiles`).
+    pub rule_name: &'static str,
 }
 
 /// A file with a NUL byte in its first 8 KiB is binary (git's own test): not text to be read for names.
@@ -29,7 +31,7 @@ pub struct Inputs<'a> {
     pub listing: Vec<String>,
     pub read: &'a dyn Fn(&str) -> Option<Vec<u8>>,
     pub classifier: PathBuf,
-    pub rule: Option<String>,
+    pub rules: RuleFiles,
     pub cargo_toml: Option<String>,
 }
 
@@ -71,7 +73,7 @@ pub fn scan_inputs(inputs: &Inputs<'_>) -> Scan {
         .collect();
     let package = inputs.cargo_toml.as_deref().and_then(package_name);
     findings.extend(token_findings(
-        inputs.rule.as_deref(),
+        &inputs.rules,
         &constants,
         package.as_deref(),
     ));
@@ -82,6 +84,7 @@ pub fn scan_inputs(inputs: &Inputs<'_>) -> Scan {
     Scan {
         scanned: discovered.scanned,
         findings,
+        rule_name: inputs.rules.rule_name(),
     }
 }
 
@@ -93,6 +96,7 @@ pub fn scan_repository(root: &Path) -> Scan {
             return Scan {
                 scanned: Vec::new(),
                 findings: vec![finding("git", 1, DISCOVERY, why)],
+                rule_name: RuleFiles::read(root).rule_name(),
             }
         }
     };
@@ -101,33 +105,33 @@ pub fn scan_repository(root: &Path) -> Scan {
         listing,
         read: &read,
         classifier: root.join(CLASSIFIER),
-        rule: std::fs::read_to_string(root.join(RULE)).ok(),
+        rules: RuleFiles::read(root),
         cargo_toml: std::fs::read_to_string(root.join("Cargo.toml")).ok(),
     })
 }
 
-/// The sentence that tells what to do about a class (one per class, naming the rule's section).
-fn cure(class: &str) -> &'static str {
+/// The sentence that tells what to do about a class (one per class, naming the rule's section, in the file `rule`).
+fn cure(class: &str, rule: &str) -> String {
     match class {
-        RAW_TEMP => "Make test folders with TestScratch (src/test_scratch.rs) — common/test-leftovers.md §7 (raw-temp), §2.",
-        RAW_WORKTREE => "Make worktrees through the helper that claims and removes them — common/test-leftovers.md §7 (raw-worktree), §3.",
-        DOCKER_RUN => "No container start exists in this repository's tests: the first one extends this guard to the complete carve-out of §5 in the same change — common/test-leftovers.md §5, §7 (docker-run).",
-        DOCKER_NAME => "Give the container, volume, network or compose project the owner form <prefix><owner>-<repo>-<what>-<id> — common/test-leftovers.md §1, §7 (docker-name).",
-        LEGACY_NAME => "Build every name with the owner segment through the helper; an exemption may clear this class, never owner-blind — common/test-leftovers.md §1, §7 (legacy-name).",
-        OWNER_BLIND => "Match the caller's owner after the prefix or delete the sweep and use the shipped janitor; this class takes no exemption — common/test-leftovers.md §7 (owner-blind), the barrier.",
-        SHARED_STORE => "Isolate the store per run, or add an exemption of this class with a reason that carries `lock: …` — common/test-leftovers.md §6, §7 (shared-store).",
-        RYUK_OFF => "Leave Testcontainers' reaper on; this class takes no exemption — common/test-leftovers.md §5, §7 (ryuk-off).",
-        DROPPED_SCRATCH => "Hold a TestScratch in a NAMED binding (`let scratch = …`, `let seed = …`): `let _ =` and a destructuring that leaves it unbound drop it at the end of the statement, and the folder is deleted before the test uses it — this repository's S3 trap, common/test-leftovers.md §2.",
-        EXEMPTION => "Write an exemption as the rule's comment form with a class of §7 (not ryuk-off, not owner-blind) and a real reason — common/test-leftovers.md §7 (the exemption grammar).",
-        TOKEN => "Register this repository's token and row in the rule's `## Tokens` table and write them once in the helper — common/test-leftovers.md §1, §7.",
-        _ => "The discovery of the files to read broke or met a language it does not read — common/test-leftovers.md §7 (a scan of nothing is red).",
+        RAW_TEMP => format!("Make test folders with TestScratch (src/test_scratch.rs) — {rule} §7 (raw-temp), §2."),
+        RAW_WORKTREE => format!("Make worktrees through the helper that claims and removes them — {rule} §7 (raw-worktree), §3."),
+        DOCKER_RUN => format!("No container start exists in this repository's tests: the first one extends this guard to the complete carve-out of §5 in the same change — {rule} §5, §7 (docker-run)."),
+        DOCKER_NAME => format!("Give the container, volume, network or compose project the owner form <prefix><owner>-<repo>-<what>-<id> — {rule} §1, §7 (docker-name)."),
+        LEGACY_NAME => format!("Build every name with the owner segment through the helper; an exemption may clear this class, never owner-blind — {rule} §1, §7 (legacy-name)."),
+        OWNER_BLIND => format!("Match the caller's owner after the prefix or delete the sweep and use the shipped janitor; this class takes no exemption — {rule} §7 (owner-blind), the barrier."),
+        SHARED_STORE => format!("Isolate the store per run, or add an exemption of this class with a reason that carries `lock: …` — {rule} §6, §7 (shared-store)."),
+        RYUK_OFF => format!("Leave Testcontainers' reaper on; this class takes no exemption — {rule} §5, §7 (ryuk-off)."),
+        DROPPED_SCRATCH => format!("Hold a TestScratch in a NAMED binding (`let scratch = …`, `let seed = …`): `let _ =` and a destructuring that leaves it unbound drop it at the end of the statement, and the folder is deleted before the test uses it — this repository's S3 trap, {rule} §2."),
+        EXEMPTION => format!("Write an exemption as the rule's comment form with a class of §7 (not ryuk-off, not owner-blind) and a real reason — {rule} §7 (the exemption grammar)."),
+        TOKEN => format!("Register this repository's token and row in the rule's `## Tokens` table and write them once in the helper — {rule} §1, §7."),
+        _ => format!("The discovery of the files to read broke or met a language it does not read — {rule} §7 (a scan of nothing is red)."),
     }
 }
 
 /// One line per finding, `<file>:<line> — <class> — <text>`, then one cure sentence per class that appeared.
-pub fn render(findings: &[Finding]) -> String {
+pub fn render(findings: &[Finding], rule: &str) -> String {
     let mut out = format!(
-        "test_leftovers: {} finding(s) — see common/test-leftovers.md §7\n",
+        "test_leftovers: {} finding(s) — see {rule} §7\n",
         findings.len()
     );
     for item in findings {
@@ -144,7 +148,7 @@ pub fn render(findings: &[Finding]) -> String {
     }
     out.push('\n');
     for class in seen {
-        out.push_str(&format!("  {class}: {}\n", cure(class)));
+        out.push_str(&format!("  {class}: {}\n", cure(class, rule)));
     }
     out
 }

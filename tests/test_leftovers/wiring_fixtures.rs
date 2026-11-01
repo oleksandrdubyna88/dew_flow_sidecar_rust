@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use crate::classes::*;
 use crate::repo::{scan_inputs, Inputs};
 use crate::scripts::CLASSIFIER;
-use crate::token::RULE;
+use crate::token::{RuleFiles, RULE_CORE, RULE_DETAIL};
 use crate::words::*;
 
-fn real_rule() -> Option<String> {
-    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(RULE)).ok()
+fn real_rule() -> RuleFiles {
+    RuleFiles::read(Path::new(env!("CARGO_MANIFEST_DIR")))
 }
 
 fn classifier() -> PathBuf {
@@ -20,7 +20,7 @@ fn classifier() -> PathBuf {
 
 const HELPER: &str = "pub(crate) const REPO_TOKEN: &str = \"sidecar\";\npub(crate) const REPO_ROW: &str = \"the embedding sidecar\";\n";
 
-fn scan_files(files: &[(&str, String)], rule: Option<String>, cargo: Option<&str>) -> Vec<Finding> {
+fn scan_files(files: &[(&str, String)], rules: RuleFiles, cargo: Option<&str>) -> Vec<Finding> {
     let map: HashMap<String, Vec<u8>> = files
         .iter()
         .map(|(path, text)| ((*path).to_string(), text.clone().into_bytes()))
@@ -30,7 +30,7 @@ fn scan_files(files: &[(&str, String)], rule: Option<String>, cargo: Option<&str
         listing: files.iter().map(|(path, _)| (*path).to_string()).collect(),
         read: &read,
         classifier: classifier(),
-        rule,
+        rules,
         cargo_toml: cargo.map(str::to_string),
     })
     .findings
@@ -107,8 +107,57 @@ fn a_tree_with_nothing_to_scan_is_red_and_a_clean_one_is_green() {
     assert!(found.is_empty(), "{found:?}");
 
     // a missing mount is red for the token even on a clean tree
-    let found = scan_files(&clean, None, Some("[package]\nname = \"bge-sidecar\"\n"));
+    let found = scan_files(
+        &clean,
+        RuleFiles::from_texts(None, None),
+        Some("[package]\nname = \"bge-sidecar\"\n"),
+    );
     assert_eq!(classes_of(&found), vec![TOKEN], "{found:?}");
+}
+
+const TABLE_RULE: &str = "# Rule\n\n## Tokens\n\n| token | family | repository |\n|---|---|---|\n| `sidecar` | dew_flow | the embedding sidecar |\n\n## Never\n";
+
+/// The wiring carries the resolved file to the finding and to the cure: a scan that reads a table names the file it
+/// read, and a scan that finds none names both and says so once.
+#[test]
+fn the_scan_reads_the_table_from_the_resolved_file_and_names_it() {
+    let clean = [
+        ("src/test_scratch.rs", HELPER.to_string()),
+        ("src/x.rs", "fn x() {}\n".to_string()),
+        ("tests/t.rs", "fn t() {}\n".to_string()),
+        (".github/workflows/ci.yml", "jobs: {}\n".to_string()),
+    ];
+    let cargo = Some("[package]\nname = \"bge-sidecar\"\n");
+    // the table only in the detail (the split mount), and only in the core (the mount from before the split): green
+    for rules in [
+        RuleFiles::from_texts(Some(TABLE_RULE), Some("# Core\n")),
+        RuleFiles::from_texts(None, Some(TABLE_RULE)),
+    ] {
+        let found = scan_files(&clean, rules, cargo);
+        assert!(found.is_empty(), "{found:?}");
+    }
+    // a table of another repository, in the core: the finding names the core, the file that was read
+    let other = TABLE_RULE.replace("the embedding sidecar", "the MCP server");
+    let found = scan_files(
+        &clean,
+        RuleFiles::from_texts(Some("# Detail, no table\n"), Some(other.as_str())),
+        cargo,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].file, RULE_CORE, "{found:?}");
+    assert!(!found[0].text.contains(RULE_DETAIL), "{found:?}");
+    // no table anywhere: ONE finding naming both files
+    let found = scan_files(
+        &clean,
+        RuleFiles::from_texts(Some("# Detail\n"), Some("# Core\n")),
+        cargo,
+    );
+    assert_eq!(classes_of(&found), vec![TOKEN], "{found:?}");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].text.contains(RULE_DETAIL) && found[0].text.contains(RULE_CORE),
+        "{found:?}"
+    );
 }
 
 #[test]
