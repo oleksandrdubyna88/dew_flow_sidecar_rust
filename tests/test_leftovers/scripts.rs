@@ -59,7 +59,7 @@ process.stdout.write(JSON.stringify({ findings }));
 "#;
 
 /// Where the classifier lives in the mounted rules.
-pub const CLASSIFIER: &str = ".claude/rules/shared/tools/lib/sweeper-scan.mjs";
+pub const CLASSIFIER: &str = ".agents/conventions/tools/lib/sweeper-scan.mjs";
 
 /// The ways an answer can fail to be one. Pure: no process is involved, so every shape is a fixture.
 pub fn validate_answer(
@@ -119,7 +119,7 @@ pub fn script_owner_blind(scripts: &[ScriptSource<'_>], classifier: &Path) -> Ve
     if !classifier.is_file() {
         return unjudged(
             first_name,
-            "the shared rules are not checked out — git submodule update --init .claude/rules/shared",
+            "the shared rules are not checked out — git submodule update --init .agents/conventions",
         );
     }
     let request = json!({

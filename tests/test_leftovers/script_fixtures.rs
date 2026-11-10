@@ -98,7 +98,7 @@ fn a_classifier_that_is_missing_is_one_unjudged_finding_naming_the_submodule() {
     assert!(
         found[0]
             .text
-            .contains("git submodule update --init .claude/rules/shared"),
+            .contains("git submodule update --init .agents/conventions"),
         "{found:?}"
     );
     assert!(found[0].text.contains("nothing was judged"), "{found:?}");

@@ -84,6 +84,8 @@ fn discovery_keeps_every_script_root_and_skips_every_target() {
         "vendor-fastembed/src/a.rs",
         ".claude/rules/shared/tools/t.mjs",
         ".claude/rules/shared/tools/t.sh",
+        ".agents/conventions/tools/t.mjs",
+        ".agents/conventions/tools/t.sh",
     ];
     let all: Vec<&str> = kept.iter().chain(dropped.iter()).copied().collect();
     let found = discover(&listing(&all));

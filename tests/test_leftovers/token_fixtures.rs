@@ -218,7 +218,7 @@ fn a_mount_that_is_not_checked_out_is_red_with_the_submodule_sentence() {
     let found = red(None, &good(), Some("bge-sidecar"));
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains(
-        "the shared rules are not checked out — git submodule update --init .claude/rules/shared"
+        "the shared rules are not checked out — git submodule update --init .agents/conventions"
     ));
 }
 

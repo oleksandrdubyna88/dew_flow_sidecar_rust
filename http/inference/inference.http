@@ -1,7 +1,7 @@
 # The four routes that do work: embed, rerank, tokenize, and the lever that hands the card back.
 #
 # WHAT THIS FILE DELIBERATELY DOES NOT DO: run a real inference. A non-empty /embed or /rerank builds
-# an engine on the GPU, and `.claude/rules/shared/common/gpu-lease.md` says the card is claimed
+# an engine on the GPU, and `.agents/conventions/common/gpu-lease.md` says the card is claimed
 # through a lease and never grabbed. A contract suite has to be runnable by anyone, at any time, in
 # CI — so it exercises the routing, the validation and the refusals, and leaves the card alone. That
 # is a smaller claim than "the sidecar embeds correctly", and it is the honest one: the quality of an

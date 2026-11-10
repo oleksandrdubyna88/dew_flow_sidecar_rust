@@ -1,5 +1,5 @@
 //! Local cargo builds and test runs take at most 8 workers and run at lowered CPU priority — the
-//! family rule `common.local-cpu-budget` (`.claude/rules/shared/common/local-cpu-budget.md`).
+//! family rule `common.local-cpu-budget` (`.agents/conventions/common/local-cpu-budget.md`).
 //!
 //! Measured 2026-10-10 on a 24-thread workstation running several agent sessions: a runner left at
 //! its default takes one worker per CPU and holds the machine at 100 %. Measured here 2026-10-11 with
@@ -52,7 +52,7 @@ fn assert_capped_and_lowered(file: &str, command: &str) {
     let lowered = if wsl {
         command.starts_with("nice -n 19 ")
     } else {
-        command.starts_with("node .claude/rules/shared/tools/low-priority.mjs ")
+        command.starts_with("node .agents/conventions/tools/low-priority.mjs ")
     };
     assert!(lowered, "{file}: `{command}` is not run at lowered priority (low-priority.mjs; `nice -n 19` inside WSL)");
     let jobs = flag(command, &["-j", "--jobs"]);
