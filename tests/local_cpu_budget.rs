@@ -73,7 +73,8 @@ fn assert_capped_and_lowered(file: &str, command: &str) {
 fn every_documented_cargo_build_and_test_is_capped_and_lowered() {
     let mut builds = 0;
     let mut tests = 0;
-    for file in ["CLAUDE.md", "README.md"] {
+    // `.agents/PROJECT.md` holds this repository's policy since story 3.R (2026-11-10); `CLAUDE.md` is only `@AGENTS.md`.
+    for file in [".agents/PROJECT.md", "README.md"] {
         for command in cargo_commands(file) {
             if command.contains("cargo test") {
                 tests += 1
