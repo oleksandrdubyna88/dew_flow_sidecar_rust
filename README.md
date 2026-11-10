@@ -25,6 +25,7 @@ work here: after the pull git no longer knows the old path.
 
 ```bash
 git -C .claude/rules/shared status --porcelain   # must print nothing; save anything it lists first
+ls -A .claude/rules                              # must print only: shared — move anything else to .agents/rules first
 rm -rf .claude/rules
 git submodule sync
 git submodule update --init .agents/conventions
