@@ -141,7 +141,7 @@ every test-created folder a `TestScratch` (`src/test_scratch.rs`: named `<prefix
 claimed first by a sibling `.owner`, removed by `Drop` on every unwinding path, swept after a kill on two keys). It
 scans whole files, its own included, from an inventory taken with `git ls-files --cached --others
 --exclude-standard`: Rust, workflows under `.github/workflows/` and the JavaScript family wherever they sit; every
-`target*` directory, `node_modules/`, `vendor-fastembed/` and `.claude/` are skipped FIRST, and no file is excluded by
+`target*` directory, `node_modules/`, `vendor-fastembed/`, `.claude/` and `.agents/conventions/` are skipped FIRST, and no file is excluded by
 name (the list is empty and a test pins it, so the detectors and fixtures are written in pieces and the file holds
 no prefix word, temp API or exemption marker whole). A `.sh`, `.ps1`, `.py` (also `.bash`, `.cmd`, `.bat`) is red
 until the guard reads that language, and so is a scan that finds no `.rs` under `src/`, none under `tests/` or no
