@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 // all: every later /embed queued on `.lock()` forever, /health reported the freeze exactly as it
 // reports a healthy multi-minute build, and the daemon's deliberately infinite sidecar HTTP timeout
 // composed the two into a system-wide freeze nobody could see (the four-repo reliability audit,
-// .claude/rules/shared/common/reliability.md § "Every wait has a ceiling").
+// .agents/conventions/common/reliability.md § "Every wait has a ceiling").
 //
 // The remedy is not cancellation — it cannot be — but VISIBILITY plus a ceiling: stamp what holds an
 // engine and since when, declare it wedged once that passes the phase's ceiling, refuse new requests

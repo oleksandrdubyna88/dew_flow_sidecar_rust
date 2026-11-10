@@ -18,11 +18,11 @@ pub const KNOWN: [(&str, &str, &str); 1] = [("bge-sidecar", "sidecar", "the embe
 
 /// The mounted rule file that holds the `## Tokens` table since the split of the rule into a core and a detail
 /// (release `105d53c`): the detail. It is the first one tried and the name every message carries when nothing is read.
-pub const RULE_DETAIL: &str = ".claude/rules/shared/common/test-leftovers-detail.md";
+pub const RULE_DETAIL: &str = ".agents/conventions/common/test-leftovers-detail.md";
 
 /// The core of the rule: it held the whole text, table included, before the split, so a mount from before it is read
 /// here, after the detail.
-pub const RULE_CORE: &str = ".claude/rules/shared/common/test-leftovers.md";
+pub const RULE_CORE: &str = ".agents/conventions/common/test-leftovers.md";
 
 /// One rule file as the mount holds it: absent, present but not readable (permission, I/O, not UTF-8), or its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,7 +343,7 @@ pub fn token_findings(
             found.extend(at(
                 RULE_DETAIL,
                 1,
-                format!("the shared rules are not checked out — git submodule update --init .claude/rules/shared (neither {RULE_DETAIL} nor {RULE_CORE} can be read)"),
+                format!("the shared rules are not checked out — git submodule update --init .agents/conventions (neither {RULE_DETAIL} nor {RULE_CORE} can be read)"),
             ));
             return found;
         }

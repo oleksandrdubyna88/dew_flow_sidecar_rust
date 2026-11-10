@@ -5,7 +5,7 @@
 //! a scan of nothing is red.
 //!
 //! It reads files through `CARGO_MANIFEST_DIR`, like `local_cpu_budget.rs`, so it runs on both CI legs; the mounted
-//! rules (`git submodule update --init .claude/rules/shared`) are read by two of its parts and a missing mount is
+//! rules (`git submodule update --init .agents/conventions`) are read by two of its parts and a missing mount is
 //! red, never a skipped check. The parts live beside this file in `test_leftovers/`:
 //!
 //! - `discovery` — an inventory from `git ls-files`, four path exclusions, a language it does not read is red, a

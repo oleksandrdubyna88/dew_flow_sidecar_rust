@@ -1,8 +1,9 @@
 //! Discovery: an inventory from git, never a hand-listed folder.
 //!
 //! `git ls-files -z --cached --others --exclude-standard` in the crate root lists every file git knows, tracked or
-//! untracked and not ignored. Four path exclusions come first (every Cargo `target*` directory, `node_modules/` at
-//! any depth, `vendor-fastembed/` — upstream's bytes — and `.claude/`, another repository). Of what is left the
+//! untracked and not ignored. Five path exclusions come first (every Cargo `target*` directory, `node_modules/` at
+//! any depth, `vendor-fastembed/` — upstream's bytes — and `.claude/` and `.agents/conventions/`, another
+//! repository). Of what is left the
 //! guard reads Rust, workflows and the JavaScript family wherever they sit, and a language it does NOT read is red:
 //! no tracer is written for a language the repository has no file in, and the first such file makes the guard say
 //! so until it is extended. No file is excluded by name — the list is empty and a test pins it.
@@ -62,9 +63,13 @@ pub fn parse_listing(bytes: &[u8]) -> Vec<String> {
 }
 
 /// Whether a path is outside the guard's reach: a `target*` directory on any segment, `node_modules/` at any depth,
-/// `vendor-fastembed/` and `.claude/` as prefixes. A FILE whose name starts with `target` is not a directory.
+/// `vendor-fastembed/`, `.claude/` and `.agents/conventions/` (the shared rules' mount since story 3.R, 2026-11-10)
+/// as prefixes. A FILE whose name starts with `target` is not a directory.
 pub fn is_excluded(path: &str) -> bool {
-    if path.starts_with("vendor-fastembed/") || path.starts_with(".claude/") {
+    if path.starts_with("vendor-fastembed/")
+        || path.starts_with(".claude/")
+        || path.starts_with(".agents/conventions/")
+    {
         return true;
     }
     let mut segments: Vec<&str> = path.split('/').collect();

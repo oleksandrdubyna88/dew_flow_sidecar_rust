@@ -141,7 +141,7 @@ every test-created folder a `TestScratch` (`src/test_scratch.rs`: named `<prefix
 claimed first by a sibling `.owner`, removed by `Drop` on every unwinding path, swept after a kill on two keys). It
 scans whole files, its own included, from an inventory taken with `git ls-files --cached --others
 --exclude-standard`: Rust, workflows under `.github/workflows/` and the JavaScript family wherever they sit; every
-`target*` directory, `node_modules/`, `vendor-fastembed/` and `.claude/` are skipped FIRST, and no file is excluded by
+`target*` directory, `node_modules/`, `vendor-fastembed/`, `.claude/` and `.agents/conventions/` are skipped FIRST, and no file is excluded by
 name (the list is empty and a test pins it, so the detectors and fixtures are written in pieces and the file holds
 no prefix word, temp API or exemption marker whole). A `.sh`, `.ps1`, `.py` (also `.bash`, `.cmd`, `.bat`) is red
 until the guard reads that language, and so is a scan that finds no `.rs` under `src/`, none under `tests/` or no
@@ -171,7 +171,7 @@ through `node` with its path in `argv` and the text on stdin), whose answer is v
 whose absence or malformation is one unjudged finding, never a clean scan. The token is checked against the mounted
 `## Tokens` table AND against an identity from outside the helper (the crate's package name in `Cargo.toml`), so a
 helper copied verbatim into another repository is red there. The mounted rules are required: `build-test` runs
-`git submodule update --init --depth 1 .claude/rules/shared` on both legs, and a missing mount is a failure naming that
+`git submodule update --init --depth 1 .agents/conventions` on both legs, and a missing mount is a failure naming that
 command.
 
 The wedge guards are tested with a held mutex and an `Instant` moved into the past — no GPU, no clock

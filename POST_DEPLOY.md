@@ -1,6 +1,6 @@
 # Post-deploy checks — bge-sidecar
 
-Per [`.claude/rules/shared/common/post-deploy-checks.md`](.claude/rules/shared/common/post-deploy-checks.md).
+Per [`.agents/conventions/common/post-deploy-checks.md`](.agents/conventions/common/post-deploy-checks.md).
 
 Nothing is deployed anywhere: this binary is **built and installed**, and the host that speaks to it
 spawns or connects to whatever is on the machine. So "prod" is the sidecar an operator actually has
@@ -27,7 +27,7 @@ Item 3 asserts the binary was **compiled** with something other than CPU — tha
 can answer before any model is loaded. Whether the accelerated provider actually *initialises* is
 `provider_ready` / `active_provider`, and both stay null until the first inference builds an engine.
 Asserting them here would mean taking the GPU from a checklist, which
-[`gpu-lease.md`](.claude/rules/shared/common/gpu-lease.md) says a tool does not do. So the
+[`gpu-lease.md`](.agents/conventions/common/gpu-lease.md) says a tool does not do. So the
 honest split: the checklist proves the build can, the first real pass proves it did — and the pass
 already logs which provider it got.
 
@@ -35,7 +35,7 @@ already logs which provider it got.
 
 ```bash
 export EXPECTED_EXE_SHA256=$(sha256sum target/release/bge-sidecar.exe | cut -d' ' -f1)
-node .claude/rules/shared/tools/post-deploy-check.mjs --target http://127.0.0.1:5320
+node .agents/conventions/tools/post-deploy-check.mjs --target http://127.0.0.1:5320
 ```
 
 Item 2 fails without that variable, deliberately: a check that cannot say **which** build you meant

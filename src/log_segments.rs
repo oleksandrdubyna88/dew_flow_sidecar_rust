@@ -99,7 +99,7 @@ fn day_folder_start(name: &str) -> Option<u64> {
 /// prevent.
 ///
 /// Matches `DailyRunFileSink` in the .NET repositories; the contract is
-/// `.claude/rules/shared/common/logging-serilog.md`.
+/// `.agents/conventions/common/logging-serilog.md`.
 pub(crate) struct DaySegments {
     dir_root: String,
     /// Everything between the day folder and the timestamp — `bge-sidecar-device0`.

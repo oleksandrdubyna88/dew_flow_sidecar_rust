@@ -13,27 +13,44 @@ retrieval product's side is `dew_flow_rag_qln · research/architecture.md`):
 ## Build (once per machine, like `tools/ts-parser` needs `npm install`)
 
 Requires Rust (rustup, MSVC toolchain) + VS Build Tools with C++, and Node.js for the shared rules'
-`low-priority.mjs` wrapper that the local commands below run through (`git submodule update --init` first).
+`low-priority.mjs` wrapper that the local commands below run through (`git submodule update --init` first, then
+`npm ci --ignore-scripts --prefix .agents/conventions` for the resolver's packages).
+
+**A clone from before 2026-11-10.** The shared rules moved from `.claude/rules/shared` to `.agents/conventions`.
+A pull does not remove the old folder, and the resolver then refuses the non-empty `.claude/rules` (instruction
+loading stays INCOMPLETE). Once, after the pull: check that the old copy holds no local change (the first command
+must print nothing), and move anything else you keep under `.claude/rules` to `.agents/rules` (the resolver reads
+local rules only there). Then remove the old folder and set up the new path. `git submodule deinit` does not
+work here: after the pull git no longer knows the old path.
+
+```bash
+git -C .claude/rules/shared status --porcelain   # must print nothing; save anything it lists first
+ls -A .claude/rules                              # must print only: shared — move anything else to .agents/rules first
+rm -rf .claude/rules
+git submodule sync
+git submodule update --init .agents/conventions
+npm ci --ignore-scripts --prefix .agents/conventions
+```
 
 ```bash
 # AMD GPU (DirectML — the default feature)
-node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8
+node .agents/conventions/tools/low-priority.mjs cargo build --release -j 8
 
 # NVIDIA GPU (CUDA)
-node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8 --no-default-features --features cuda
+node .agents/conventions/tools/low-priority.mjs cargo build --release -j 8 --no-default-features --features cuda
 
 # Both EPs in one binary
-node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8 --features cuda
+node .agents/conventions/tools/low-priority.mjs cargo build --release -j 8 --features cuda
 
 # CPU only
-node .claude/rules/shared/tools/low-priority.mjs cargo build --release -j 8 --no-default-features
+node .agents/conventions/tools/low-priority.mjs cargo build --release -j 8 --no-default-features
 
 # AMD on Linux/WSL (ROCm via the MIGraphX EP) — run INSIDE WSL, see the dedicated section below
 nice -n 19 cargo build --release -j 8 --no-default-features --features migraphx --target-dir target-wsl
 ```
 
 Local builds are capped at 8 jobs and run at lowered CPU priority (the shared rule
-`common.local-cpu-budget`): through `.claude/rules/shared/tools/low-priority.mjs` on Windows, under `nice -n 19`
+`common.local-cpu-budget`): through `.agents/conventions/tools/low-priority.mjs` on Windows, under `nice -n 19`
 inside WSL. On a machine with fewer than 8 threads, use its thread count. CI runs the bare commands.
 
 The Windows binary lands at `target/release/bge-sidecar.exe` (the WSL flavor at

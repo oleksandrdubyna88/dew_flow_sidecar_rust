@@ -7,10 +7,10 @@ use super::*;
 /// The conformance vectors of the mounted rule, read through the checkout. A missing file fails naming the cure.
 fn vectors() -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(".claude/rules/shared/tools/fixtures/owner-vectors.json");
+        .join(".agents/conventions/tools/fixtures/owner-vectors.json");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "the shared rules are not checked out ({}: {e}) — run: git submodule update --init .claude/rules/shared",
+            "the shared rules are not checked out ({}: {e}) — run: git submodule update --init .agents/conventions",
             path.display()
         )
     });

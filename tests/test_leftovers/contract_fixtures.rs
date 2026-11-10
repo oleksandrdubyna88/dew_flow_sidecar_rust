@@ -40,7 +40,7 @@ try {
   for (const item of JSON.parse(casesJson)) {
     if (item.needsUnreadable && !canUnreadable) continue;
     const root = owned.ownedDir(scope, "rule-pick");
-    const shared = path.join(root, ".claude", "rules", "shared");
+    const shared = path.join(root, ".agents", "conventions");
     fs.mkdirSync(path.join(shared, "common"), { recursive: true });
     for (const [name, file] of [["test-leftovers-detail.md", item.detail], ["test-leftovers.md", item.core]]) {
       if (file.kind === "missing") continue;
@@ -63,7 +63,7 @@ const PROSE: &str = "# Core\n\nThe `## Tokens` table of the detail registers it.
 const NO_TABLE: &str = "# Detail\n\nNo section here.\n";
 
 fn mount() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(".claude/rules/shared")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(".agents/conventions")
 }
 
 fn text(body: &str) -> Value {
